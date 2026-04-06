@@ -1,8 +1,8 @@
 # boltz-client
 
-Boltz Exchange client for cross-chain swaps.
+Boltz client for cross-chain swaps.
 
-Swaps between Lightning (sats) and USDT via [Boltz Exchange](https://boltz.exchange). Uses a two-hop architecture:
+Swaps between Lightning (sats) and USDT via [boltz.exchange](https://boltz.exchange). Uses a two-hop architecture:
 
 ```
 Lightning <-> tBTC (Boltz reverse swap) <-> USDT (DEX swap on Arbitrum)
