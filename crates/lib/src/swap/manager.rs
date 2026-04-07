@@ -131,11 +131,11 @@ impl SwapManager {
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => break,
-                update = ws_rx.recv() => {
-                    let Some(update) = update else { break };
+                should_break = async {
+                    let Some(update) = ws_rx.recv().await else { return true };
                     if !tracked_ids.contains(&update.swap_id) {
                         tracing::warn!(boltz_id = update.swap_id, "WS update for untracked swap");
-                        continue;
+                        return false;
                     }
                     Self::handle_ws_update(
                         &executor,
@@ -145,6 +145,9 @@ impl SwapManager {
                         &mut tracked_ids,
                         &update,
                     ).await;
+                    false
+                } => {
+                    if should_break { break; }
                 }
                 cmd = cmd_rx.recv() => {
                     match cmd {
