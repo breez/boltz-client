@@ -608,9 +608,9 @@ impl ReverseSwapExecutor {
                     }
                     // Exponential backoff: 1s, 2s, 4s, 8s, ...
                     let delay_secs = 2u64.pow(attempt);
-                    platform_utils::tokio::time::sleep(
-                        platform_utils::time::Duration::from_secs(delay_secs),
-                    )
+                    platform_utils::tokio::time::sleep(platform_utils::time::Duration::from_secs(
+                        delay_secs,
+                    ))
                     .await;
                 }
             }
