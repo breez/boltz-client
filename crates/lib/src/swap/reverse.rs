@@ -412,7 +412,7 @@ impl ReverseSwapExecutor {
 
     async fn fetch_tbtc_pair(&self) -> Result<ReversePairInfo, BoltzError> {
         let pairs = self.api_client.get_reverse_swap_pairs().await?;
-        pairs
+        let pair = pairs
             .0
             .get("BTC")
             .and_then(|m| m.get("TBTC"))
@@ -420,7 +420,17 @@ impl ReverseSwapExecutor {
             .ok_or_else(|| BoltzError::Api {
                 reason: "BTC/TBTC pair not found. Is referral header configured?".to_string(),
                 code: None,
-            })
+            })?;
+        if pair.limits.minimal > pair.limits.maximal {
+            return Err(BoltzError::Api {
+                reason: format!(
+                    "Invalid pair limits: minimal ({}) > maximal ({})",
+                    pair.limits.minimal, pair.limits.maximal,
+                ),
+                code: None,
+            });
+        }
+        Ok(pair)
     }
 
     async fn fetch_quote_out_tbtc(&self, usdt_amount: u64) -> Result<u128, BoltzError> {
