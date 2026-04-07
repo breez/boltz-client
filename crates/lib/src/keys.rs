@@ -14,6 +14,13 @@ use crate::error::BoltzError;
 /// All derivation levels are NON-HARDENED to match the Boltz web app's `@scure/bip32`
 /// derivation paths. This ensures key compatibility: the same mnemonic produces the
 /// same keys in both the web app and this SDK.
+///
+/// Non-hardened derivation is required for the Boltz backend's restore endpoint
+/// (`POST /v2/swap/restore`), which derives child public keys from the master xpub
+/// without access to private keys. Hardened derivation would make this impossible.
+/// As of 2026-04, restore only works for BTC/L-BTC swaps (the backend doesn't store
+/// `claimPublicKey` for EVM swaps), but there are no technical blockers preventing
+/// future support — the web app already sends `claimPublicKey` for EVM swaps.
 pub struct EvmKeyManager {
     master_key: XPrv,
 }
