@@ -871,6 +871,10 @@ impl ReverseSwapExecutor {
         }
 
         // ─── Slippage-adjusted OFT quote for transaction ─────────────
+        // Slippage is applied independently to each leg (DEX swap and OFT bridge)
+        // rather than splitting a single budget across both. Each leg has independent
+        // price risk, so protecting them separately is simpler. The effective compound
+        // slippage is ~(1-s)², e.g. ~1.99% when slippage_bps is 1%.
         #[expect(clippy::arithmetic_side_effects)]
         let slippage_factor = 10000 - u128::from(self.config.slippage_bps);
         #[expect(clippy::arithmetic_side_effects)]
