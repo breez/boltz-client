@@ -17,10 +17,7 @@ use crate::evm::oft::OftDeployments;
 use crate::evm::provider::EvmProvider;
 use crate::evm::signing::EvmSigner;
 use crate::keys::EvmKeyManager;
-use crate::models::{
-    BoltzSwap, BoltzSwapStatus, Chain, PreparedSwap,
-    SwapLimits,
-};
+use crate::models::{BoltzSwap, BoltzSwapStatus, Chain, PreparedSwap, SwapLimits};
 use crate::recover::{self, RecoverableSwap};
 
 /// Maximum claim retries (quote may go stale between encode and submit).
@@ -305,9 +302,10 @@ impl ReverseSwapExecutor {
         // Parse the BOLT11 invoice and verify the amount matches what we
         // requested. A malicious Boltz server could return an invoice with a
         // higher amount, causing the user to overpay on Lightning.
-        let decoded_invoice: Bolt11Invoice = resp.invoice.parse().map_err(|e| {
-            BoltzError::Generic(format!("Failed to parse BOLT11 invoice: {e}"))
-        })?;
+        let decoded_invoice: Bolt11Invoice = resp
+            .invoice
+            .parse()
+            .map_err(|e| BoltzError::Generic(format!("Failed to parse BOLT11 invoice: {e}")))?;
         let decoded_amount_sats = decoded_invoice
             .amount_milli_satoshis()
             .ok_or_else(|| BoltzError::Generic("BOLT11 invoice missing amount".to_string()))?
@@ -484,12 +482,8 @@ impl ReverseSwapExecutor {
         // that triggered the `transaction.confirmed` WS event.
         let mut lockup_verified = false;
         for attempt in 0..LOCKUP_CHECK_MAX_ATTEMPTS {
-            match recover::is_swap_still_locked_by_swap(
-                &self.evm_provider,
-                swap,
-                &self.key_manager,
-            )
-            .await
+            match recover::is_swap_still_locked_by_swap(&self.evm_provider, swap, &self.key_manager)
+                .await
             {
                 Ok(true) => {
                     lockup_verified = true;
@@ -849,9 +843,7 @@ impl ReverseSwapExecutor {
                 U256::from(trade_best.amount),
                 U256::ZERO,
             );
-            let (_, drift_receipt) = self
-                .quote_oft(source_oft_address, &drift_param)
-                .await?;
+            let (_, drift_receipt) = self.quote_oft(source_oft_address, &drift_param).await?;
             let raw_dest_amount: u128 = drift_receipt
                 .amountReceivedLD
                 .try_into()

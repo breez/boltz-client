@@ -299,18 +299,13 @@ impl BoltzService {
 
         if let Some(highest) = stats.highest_key_index {
             self.store
-                .set_key_index_if_higher(
-                    self.executor.config.chain_id,
-                    highest.saturating_add(1),
-                )
+                .set_key_index_if_higher(self.executor.config.chain_id, highest.saturating_add(1))
                 .await?;
         }
 
         let mut claimed = Vec::new();
         for r in &recoverable {
-            let swap = self
-                .executor
-                .build_recovery_swap(r, destination_address)?;
+            let swap = self.executor.build_recovery_swap(r, destination_address)?;
             if let Err(e) = self.store.insert_swap(&swap).await {
                 tracing::error!(
                     key_index = r.key_index,

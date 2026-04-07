@@ -269,7 +269,7 @@ impl SwapStatusSubscriber {
                 };
 
                 if global_tx.send(status_update).await.is_err() {
-                    tracing::debug!(
+                    tracing::error!(
                         swap_id = update.id,
                         "Global receiver dropped, update discarded"
                     );

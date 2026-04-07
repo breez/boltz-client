@@ -8,8 +8,8 @@ use crate::api::ws::{SwapStatusSubscriber, SwapStatusUpdate};
 use crate::error::BoltzError;
 use crate::events::{BoltzSwapEvent, EventEmitter};
 use crate::models::{BoltzSwap, BoltzSwapStatus};
-use crate::store::BoltzStorage;
 use crate::recover;
+use crate::store::BoltzStorage;
 use crate::swap::reverse::{ReverseSwapExecutor, current_unix_timestamp};
 
 /// Maximum number of receipt-poll attempts for a `Claiming` swap (5s * 60 = 5min).
@@ -219,8 +219,13 @@ impl SwapManager {
         match update.status.as_str() {
             "swap.created" | "invoice.set" | "invoice.pending" => {}
             "invoice.paid" => {
-                update_swap_status(&**store, event_emitter, &mut swap, BoltzSwapStatus::InvoicePaid)
-                    .await;
+                update_swap_status(
+                    &**store,
+                    event_emitter,
+                    &mut swap,
+                    BoltzSwapStatus::InvoicePaid,
+                )
+                .await;
             }
             "transaction.mempool" => {
                 if let Some(tx) = &update.transaction {
@@ -270,10 +275,8 @@ impl SwapManager {
             // slippage).
             "invoice.settled" | "transaction.claimed" => {
                 if let Some(ref tx_hash) = swap.claim_tx_hash {
-                    let reached_terminal = Self::poll_receipt(
-                        executor, store, event_emitter, swap_id, tx_hash,
-                    )
-                    .await;
+                    let reached_terminal =
+                        Self::poll_receipt(executor, store, event_emitter, swap_id, tx_hash).await;
                     if reached_terminal {
                         Self::cleanup_terminal(ws_subscriber, tracked_ids, swap_id).await;
                     }
@@ -283,14 +286,18 @@ impl SwapManager {
                         "No claim tx hash — cannot verify on-chain, trusting WS event"
                     );
                     update_swap_status(
-                        &**store, event_emitter, &mut swap, BoltzSwapStatus::Completed,
+                        &**store,
+                        event_emitter,
+                        &mut swap,
+                        BoltzSwapStatus::Completed,
                     )
                     .await;
                     Self::cleanup_terminal(ws_subscriber, tracked_ids, swap_id).await;
                 }
             }
             "invoice.expired" | "swap.expired" => {
-                update_swap_status(&**store, event_emitter, &mut swap, BoltzSwapStatus::Expired).await;
+                update_swap_status(&**store, event_emitter, &mut swap, BoltzSwapStatus::Expired)
+                    .await;
                 Self::cleanup_terminal(ws_subscriber, tracked_ids, swap_id).await;
             }
             "invoice.failedToPay"
@@ -374,8 +381,7 @@ impl SwapManager {
         swap: &BoltzSwap,
     ) {
         if let Some(ref tx_hash) = swap.claim_tx_hash {
-            let _ =
-                Self::poll_receipt(executor, store, event_emitter, &swap.id, tx_hash).await;
+            let _ = Self::poll_receipt(executor, store, event_emitter, &swap.id, tx_hash).await;
         } else {
             // Crash during Alchemy call: we set Claiming but never got a tx
             // hash back. Check on-chain if the claim went through anyway.
@@ -438,9 +444,9 @@ impl SwapManager {
                 }
                 Err(e) => {
                     tracing::warn!(swap_id, attempt, error = %e, "Receipt poll failed");
-                    platform_utils::tokio::time::sleep(
-                        platform_utils::time::Duration::from_secs(RECEIPT_POLL_INTERVAL_SECS),
-                    )
+                    platform_utils::tokio::time::sleep(platform_utils::time::Duration::from_secs(
+                        RECEIPT_POLL_INTERVAL_SECS,
+                    ))
                     .await;
                 }
             }
@@ -518,9 +524,6 @@ pub(crate) async fn update_swap_status(
         tracing::error!(swap_id = swap.id, error = %e, "Failed to update swap status");
     }
     emitter
-        .emit(&BoltzSwapEvent::SwapUpdated {
-            swap: swap.clone(),
-        })
+        .emit(&BoltzSwapEvent::SwapUpdated { swap: swap.clone() })
         .await;
 }
-
