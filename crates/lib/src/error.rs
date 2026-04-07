@@ -43,19 +43,16 @@ pub enum BoltzError {
         quoted_usdt: u64,
     },
 
+    /// Boltz rejected swap creation because the preimage hash was already used
+    /// (HTTP 409 Conflict). This indicates a serious local state issue: the key
+    /// index counter has regressed, causing preimage reuse. Callers must NOT
+    /// retry with the next index — that would trust Boltz to tell us which
+    /// indices are used.
+    #[error("Duplicate preimage hash: key index counter may have regressed")]
+    DuplicatePreimage,
+
     #[error("{0}")]
     Generic(String),
-}
-
-impl BoltzError {
-    /// Returns `true` if Boltz rejected swap creation because the preimage hash
-    /// was already used by a previous swap.
-    ///
-    /// Current error: HTTP 400, `{"error":"a swap with this preimage hash exists already"}`
-    pub fn is_duplicate_preimage(&self) -> bool {
-        matches!(self, Self::Api { code: Some(400), reason }
-            if reason.to_lowercase().contains("preimage hash"))
-    }
 }
 
 impl From<platform_utils::HttpError> for BoltzError {

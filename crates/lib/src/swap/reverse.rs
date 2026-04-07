@@ -244,8 +244,7 @@ impl ReverseSwapExecutor {
     }
 
     /// Call the Boltz API to create a reverse swap with the given key index.
-    /// Returns the validated `BoltzSwap`. The caller handles persistence
-    /// and duplicate-preimage retry logic.
+    /// Returns the validated `BoltzSwap`. The caller handles persistence.
     pub async fn create(
         &self,
         prepared: &PreparedSwap,
@@ -277,7 +276,16 @@ impl ReverseSwapExecutor {
             invoice_expiry: None,
         };
 
-        let resp = self.api_client.create_reverse_swap(&create_req).await?;
+        let resp = self
+            .api_client
+            .create_reverse_swap(&create_req)
+            .await
+            .map_err(|e| match e {
+                BoltzError::Api {
+                    code: Some(409), ..
+                } => BoltzError::DuplicatePreimage,
+                other => other,
+            })?;
 
         if resp.onchain_amount < prepared.estimated_onchain_amount {
             return Err(BoltzError::Generic(format!(

@@ -5,6 +5,13 @@ use crate::models::BoltzSwap;
 ///
 /// The boltz crate defines the trait; the caller provides the implementation.
 /// For testing, use `MemoryBoltzStorage`.
+///
+/// # Key index durability
+///
+/// `increment_key_index` must be durable: the new index must be persisted
+/// before the method returns. This is the sole defense against preimage
+/// reuse — if the counter regresses after a crash, a previously-used
+/// preimage hash could be sent to Boltz, enabling fund theft.
 #[macros::async_trait]
 pub trait BoltzStorage: Send + Sync {
     async fn insert_swap(&self, swap: &BoltzSwap) -> Result<(), BoltzError>;

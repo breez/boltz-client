@@ -185,48 +185,35 @@ impl BoltzService {
             .await
     }
 
-    /// Maximum retries when Boltz rejects a preimage hash as already used.
-    const MAX_DUPLICATE_RETRIES: u32 = 10;
-
     /// Create the swap on Boltz and begin background monitoring.
     /// Returns the hold invoice to pay.
+    ///
+    /// # Key index safety
+    ///
+    /// The caller's `BoltzStorage` implementation must ensure that
+    /// `increment_key_index` is durable (persisted before returning).
+    /// This is the sole defense against preimage reuse — Boltz's
+    /// duplicate-preimage detection (HTTP 409) must NOT be relied upon,
+    /// as a malicious API could lie and accept a reused hash.
     pub async fn create_reverse_swap(
         &self,
         prepared: &PreparedSwap,
     ) -> Result<CreatedSwap, BoltzError> {
-        let mut last_err = None;
-        for _ in 0..Self::MAX_DUPLICATE_RETRIES {
-            let key_index = self
-                .store
-                .increment_key_index(self.executor.config.chain_id)
-                .await?;
+        let key_index = self
+            .store
+            .increment_key_index(self.executor.config.chain_id)
+            .await?;
 
-            match self.executor.create(prepared, key_index).await {
-                Ok(swap) => {
-                    let created = CreatedSwap {
-                        swap_id: swap.id.clone(),
-                        invoice: swap.invoice.clone(),
-                        invoice_amount_sats: swap.invoice_amount_sats,
-                        timeout_block_height: swap.timeout_block_height,
-                    };
-                    self.store.insert_swap(&swap).await?;
-                    self.swap_manager.track_swap(&created.swap_id).await;
-                    return Ok(created);
-                }
-                Err(e) if e.is_duplicate_preimage() => {
-                    tracing::warn!(
-                        key_index,
-                        "Preimage hash already used, bumping key index and retrying"
-                    );
-                    last_err = Some(e);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        Err(last_err.unwrap_or_else(|| {
-            BoltzError::Generic("Exhausted duplicate preimage retries".into())
-        }))
+        let swap = self.executor.create(prepared, key_index).await?;
+        let created = CreatedSwap {
+            swap_id: swap.id.clone(),
+            invoice: swap.invoice.clone(),
+            invoice_amount_sats: swap.invoice_amount_sats,
+            timeout_block_height: swap.timeout_block_height,
+        };
+        self.store.insert_swap(&swap).await?;
+        self.swap_manager.track_swap(&created.swap_id).await;
+        Ok(created)
     }
 
     /// Get supported destination chains.
