@@ -828,6 +828,34 @@ impl ReverseSwapExecutor {
         if trade_best.amount == 0 {
             return Err(BoltzError::InvalidQuote("DEX returned zero USDT".into()));
         }
+
+        // ─── Drift check ─────────────────────────────────────────────
+        // Quote OFT with the raw DEX output (pre-slippage) to estimate
+        // what the user would receive on the destination chain. Using
+        // the slippage-reduced amount here would compound the reduction:
+        // once in the OFT input and again in the drift threshold.
+        if !skip_drift_check {
+            let drift_param = contracts::build_oft_send_param(
+                dst_eid,
+                addrs.destination,
+                U256::from(trade_best.amount),
+                U256::ZERO,
+            );
+            let (_, drift_receipt) = self
+                .quote_oft(source_oft_address, &drift_param)
+                .await?;
+            let raw_dest_amount: u128 = drift_receipt
+                .amountReceivedLD
+                .try_into()
+                .map_err(|_| BoltzError::Generic("OFT amount too large".into()))?;
+            check_quote_drift(
+                swap.expected_usdt_amount,
+                raw_dest_amount,
+                self.config.slippage_bps,
+            )?;
+        }
+
+        // ─── Slippage-adjusted OFT quote for transaction ─────────────
         #[expect(clippy::arithmetic_side_effects)]
         let slippage_factor = 10000 - u128::from(self.config.slippage_bps);
         #[expect(clippy::arithmetic_side_effects)]
@@ -838,7 +866,6 @@ impl ReverseSwapExecutor {
             ));
         }
 
-        // Final OFT quote with the actual USDT amount
         let final_send_param = contracts::build_oft_send_param(
             dst_eid,
             addrs.destination,
@@ -855,21 +882,10 @@ impl ReverseSwapExecutor {
             .quote_send(source_oft_address, &final_quoted_param)
             .await?;
 
-        // Apply slippage to the OFT min receive amount
         let min_amount_ld_raw: u128 = final_receipt
             .amountReceivedLD
             .try_into()
             .map_err(|_| BoltzError::Generic("OFT amount too large".into()))?;
-
-        // Drift check: compare what the user would receive on the destination
-        // chain against the creation-time estimate (expected_usdt_amount).
-        if !skip_drift_check {
-            check_quote_drift(
-                swap.expected_usdt_amount,
-                min_amount_ld_raw,
-                self.config.slippage_bps,
-            )?;
-        }
 
         #[expect(clippy::arithmetic_side_effects)]
         let min_amount_ld_slipped = min_amount_ld_raw * slippage_factor / 10000;
