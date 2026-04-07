@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use alloy_primitives::U256;
 
 use crate::api::BoltzApiClient;
@@ -19,11 +17,10 @@ use crate::evm::provider::EvmProvider;
 use crate::evm::signing::EvmSigner;
 use crate::keys::EvmKeyManager;
 use crate::models::{
-    BoltzSwap, BoltzSwapStatus, Chain, ClaimedRecovery, CreatedSwap, PreparedSwap, RecoveryResult,
+    BoltzSwap, BoltzSwapStatus, Chain, PreparedSwap,
     SwapLimits,
 };
 use crate::recover::{self, RecoverableSwap};
-use crate::store::BoltzStorage;
 
 /// Maximum claim retries (quote may go stale between encode and submit).
 const MAX_CLAIM_RETRIES: u32 = 3;
@@ -35,7 +32,6 @@ pub(crate) struct ReverseSwapExecutor {
     alchemy_client: AlchemyGasClient,
     pub(crate) evm_provider: EvmProvider,
     oft_deployments: OftDeployments,
-    pub(crate) store: Arc<dyn BoltzStorage>,
     pub(crate) config: BoltzConfig,
     pub(crate) erc20swap_address: String,
 }
@@ -48,7 +44,6 @@ impl ReverseSwapExecutor {
         alchemy_client: AlchemyGasClient,
         evm_provider: EvmProvider,
         oft_deployments: OftDeployments,
-        store: Arc<dyn BoltzStorage>,
         config: BoltzConfig,
         erc20swap_address: String,
     ) -> Self {
@@ -58,7 +53,6 @@ impl ReverseSwapExecutor {
             alchemy_client,
             evm_provider,
             oft_deployments,
-            store,
             config,
             erc20swap_address,
         }
@@ -245,79 +239,42 @@ impl ReverseSwapExecutor {
         })
     }
 
-    /// Maximum retries when encountering duplicate preimage errors. Handles
-    /// races between concurrent instances; the consumer is responsible for
-    /// syncing the key index on restore / cold start.
-    const MAX_DUPLICATE_RETRIES: u32 = 10;
-
-    /// Create the swap on Boltz. Returns the hold invoice to pay.
-    ///
-    /// If Boltz rejects the preimage hash as already used, the method bumps the
-    /// key index and retries up to [`Self::MAX_DUPLICATE_RETRIES`] times. This
-    /// handles races between concurrent instances sharing the same seed. For
-    /// larger index gaps (e.g. restoring from mnemonic after many unpaid swaps),
-    /// the consumer should sync the key index via
-    /// [`BoltzStorage::set_key_index_if_higher`] before calling this method.
-    pub async fn create(&self, prepared: &PreparedSwap) -> Result<CreatedSwap, BoltzError> {
+    /// Call the Boltz API to create a reverse swap with the given key index.
+    /// Returns the validated `BoltzSwap`. The caller handles persistence
+    /// and duplicate-preimage retry logic.
+    pub async fn create(
+        &self,
+        prepared: &PreparedSwap,
+        key_index: u32,
+    ) -> Result<BoltzSwap, BoltzError> {
         if current_unix_timestamp() >= prepared.expires_at {
             return Err(BoltzError::QuoteExpired);
         }
         let chain_id_u32 = to_chain_id_u32(self.config.chain_id)?;
         let gas_signer = self.key_manager.derive_gas_signer(chain_id_u32)?;
 
-        let mut last_err = None;
-        for _ in 0..Self::MAX_DUPLICATE_RETRIES {
-            let key_index = self.store.increment_key_index(self.config.chain_id).await?;
+        let preimage_hash = self
+            .key_manager
+            .derive_preimage_hash(chain_id_u32, key_index)?;
+        let preimage_key = self
+            .key_manager
+            .derive_preimage_key(chain_id_u32, key_index)?;
 
-            let preimage_hash = self
-                .key_manager
-                .derive_preimage_hash(chain_id_u32, key_index)?;
-            let preimage_key = self
-                .key_manager
-                .derive_preimage_key(chain_id_u32, key_index)?;
+        let create_req = crate::api::types::CreateReverseSwapRequest {
+            from: "BTC".to_string(),
+            to: "TBTC".to_string(),
+            preimage_hash: hex::encode(preimage_hash),
+            claim_address: gas_signer.address_hex(),
+            invoice_amount: prepared.invoice_amount_sats,
+            pair_hash: prepared.pair_hash.clone(),
+            referral_id: self.config.referral_id.clone(),
+            claim_public_key: hex::encode(&preimage_key.public_key),
+            description: None,
+            invoice_expiry: None,
+        };
 
-            let create_req = crate::api::types::CreateReverseSwapRequest {
-                from: "BTC".to_string(),
-                to: "TBTC".to_string(),
-                preimage_hash: hex::encode(preimage_hash),
-                claim_address: gas_signer.address_hex(),
-                invoice_amount: prepared.invoice_amount_sats,
-                pair_hash: prepared.pair_hash.clone(),
-                referral_id: self.config.referral_id.clone(),
-                claim_public_key: hex::encode(&preimage_key.public_key),
-                description: None,
-                invoice_expiry: None,
-            };
+        let resp = self.api_client.create_reverse_swap(&create_req).await?;
 
-            match self.api_client.create_reverse_swap(&create_req).await {
-                Ok(resp) => {
-                    return self
-                        .finalize_swap(prepared, resp, key_index, &gas_signer)
-                        .await;
-                }
-                Err(e) if e.is_duplicate_preimage() => {
-                    tracing::warn!(
-                        key_index,
-                        "Preimage hash already used, bumping key index and retrying"
-                    );
-                    last_err = Some(e);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        Err(last_err
-            .unwrap_or_else(|| BoltzError::Generic("Exhausted duplicate preimage retries".into())))
-    }
-
-    /// Validate the Boltz response, persist the swap, and return the result.
-    async fn finalize_swap(
-        &self,
-        prepared: &PreparedSwap,
-        resp: crate::api::types::CreateReverseSwapResponse,
-        key_index: u32,
-        gas_signer: &crate::keys::EvmKeyPair,
-    ) -> Result<CreatedSwap, BoltzError> {
         if resp.onchain_amount < prepared.estimated_onchain_amount {
             return Err(BoltzError::Generic(format!(
                 "Boltz onchain_amount ({}) less than prepared estimate ({})",
@@ -326,8 +283,8 @@ impl ReverseSwapExecutor {
         }
 
         let now = current_unix_timestamp();
-        let swap = BoltzSwap {
-            id: resp.id.clone(),
+        Ok(BoltzSwap {
+            id: resp.id,
             status: BoltzSwapStatus::Created,
             claim_key_index: key_index,
             chain_id: self.config.chain_id,
@@ -340,7 +297,7 @@ impl ReverseSwapExecutor {
             })?,
             erc20swap_address: self.erc20swap_address.clone(),
             router_address: ARBITRUM_ROUTER_ADDRESS.to_string(),
-            invoice: resp.invoice.clone(),
+            invoice: resp.invoice,
             invoice_amount_sats: prepared.invoice_amount_sats,
             onchain_amount: resp.onchain_amount,
             expected_usdt_amount: prepared.usdt_amount,
@@ -349,78 +306,32 @@ impl ReverseSwapExecutor {
             claim_tx_hash: None,
             created_at: now,
             updated_at: now,
-        };
-        self.store.insert_swap(&swap).await?;
-
-        Ok(CreatedSwap {
-            swap_id: resp.id,
-            invoice: resp.invoice,
-            invoice_amount_sats: prepared.invoice_amount_sats,
-            timeout_block_height: resp.timeout_block_height,
         })
     }
 
-    /// Recover unclaimed swaps by scanning the blockchain.
-    ///
-    /// Matches the Boltz web app's EVM recovery flow: scan `ERC20Swap` contract
-    /// Lockup events, match against derived preimage hashes, claim any still-locked swaps.
-    pub async fn recover(&self, destination_address: &str) -> Result<RecoveryResult, BoltzError> {
+    /// Scan the blockchain for unclaimed swaps.
+    /// Returns recoverable swaps and scan statistics. The caller handles
+    /// persistence, key index sync, and claiming.
+    pub async fn scan_recoverable(
+        &self,
+    ) -> Result<(Vec<RecoverableSwap>, recover::ScanStats), BoltzError> {
         let chain_id_u32 = to_chain_id_u32(self.config.chain_id)?;
-
-        let (recoverable, stats) = recover::scan_for_recoverable_swaps(
+        recover::scan_for_recoverable_swaps(
             &self.evm_provider,
             &self.key_manager,
             chain_id_u32,
             &self.erc20swap_address,
             ARBITRUM_ERC20SWAP_DEPLOY_BLOCK,
         )
-        .await?;
-
-        // Sync key index past all discovered indices
-        if let Some(highest) = stats.highest_key_index {
-            self.store
-                .set_key_index_if_higher(self.config.chain_id, highest.saturating_add(1))
-                .await?;
-        }
-
-        // Claim each recoverable swap
-        let mut claimed = Vec::new();
-        for swap in &recoverable {
-            match self.claim_recovered_swap(swap, destination_address).await {
-                Ok(tx_hash) => {
-                    claimed.push(ClaimedRecovery {
-                        key_index: swap.key_index,
-                        preimage_hash: swap.preimage_hash,
-                        claim_tx_hash: tx_hash,
-                    });
-                }
-                Err(e) => {
-                    tracing::error!(
-                        key_index = swap.key_index,
-                        tx = swap.lockup_tx_hash,
-                        error = %e,
-                        "Failed to claim recovered swap"
-                    );
-                }
-            }
-        }
-
-        Ok(RecoveryResult {
-            claimed,
-            already_settled: stats.already_settled,
-            total_events_scanned: stats.total_events,
-            highest_key_index: stats.highest_key_index,
-        })
+        .await
     }
 
-    /// Claim a single recovered swap by constructing a synthetic `BoltzSwap`
-    /// and reusing the existing claim pipeline.
-    async fn claim_recovered_swap(
+    /// Build a synthetic `BoltzSwap` from a recoverable on-chain swap.
+    pub fn build_recovery_swap(
         &self,
         recoverable: &RecoverableSwap,
         destination_address: &str,
-    ) -> Result<String, BoltzError> {
-        // Convert tBTC EVM amount (18 decimals) back to sats (8 decimals)
+    ) -> Result<BoltzSwap, BoltzError> {
         let onchain_sats: u64 = recoverable
             .amount
             .checked_div(U256::from(SATS_TO_TBTC_FACTOR))
@@ -435,34 +346,27 @@ impl ReverseSwapExecutor {
 
         let now = current_unix_timestamp();
 
-        let mut swap = BoltzSwap {
+        Ok(BoltzSwap {
             id: format!("recovery-{}-{}", recoverable.key_index, now),
             status: BoltzSwapStatus::TbtcLocked,
             claim_key_index: recoverable.key_index,
             chain_id: self.config.chain_id,
             claim_address: format!("0x{}", hex::encode(recoverable.claim_address.as_slice())),
             destination_address: destination_address.to_string(),
-            destination_chain: Chain::Arbitrum, // Recovery always claims to Arbitrum
+            destination_chain: Chain::Arbitrum,
             refund_address: format!("0x{}", hex::encode(recoverable.refund_address.as_slice())),
             erc20swap_address: self.erc20swap_address.clone(),
             router_address: ARBITRUM_ROUTER_ADDRESS.to_string(),
             invoice: String::new(),
             invoice_amount_sats: 0,
             onchain_amount: onchain_sats,
-            expected_usdt_amount: 0, // Unknown for recovered swaps
+            expected_usdt_amount: 0,
             timeout_block_height: timelock,
             lockup_tx_id: Some(recoverable.lockup_tx_hash.clone()),
             claim_tx_hash: None,
             created_at: now,
             updated_at: now,
-        };
-
-        // Insert into store so claim_and_swap can track it
-        self.store.insert_swap(&swap).await?;
-
-        // Recovery swaps have no creation-time quote — skip drift check.
-        let completed = self.claim_and_swap(&mut swap, true).await?;
-        Ok(completed.claim_tx_hash.unwrap_or_default())
+        })
     }
 
     // ─── Internal ────────────────────────────────────────────────────────
@@ -523,14 +427,12 @@ impl ReverseSwapExecutor {
     }
 
     /// Claim tBTC locked on-chain and swap to USDT.
-    /// On success the swap transitions to `Claiming` with `claim_tx_hash` set.
-    /// The caller (`SwapManager`) is responsible for waiting for on-chain
-    /// confirmation and transitioning to `Completed`.
+    /// Returns the claim tx hash on success.
     pub(crate) async fn claim_and_swap(
         &self,
-        swap: &mut BoltzSwap,
+        swap: &BoltzSwap,
         skip_drift_check: bool,
-    ) -> Result<BoltzSwap, BoltzError> {
+    ) -> Result<String, BoltzError> {
         let chain_id_u32 = to_chain_id_u32(swap.chain_id)?;
         let preimage = self
             .key_manager
@@ -566,8 +468,8 @@ impl ReverseSwapExecutor {
                 .await;
 
             match result {
-                Ok(_tx_hash) => {
-                    return Ok(swap.clone());
+                Ok(tx_hash) => {
+                    return Ok(tx_hash);
                 }
                 Err(e) => {
                     // Quote drift is not transient — retrying immediately
@@ -596,7 +498,7 @@ impl ReverseSwapExecutor {
                                 swap_id = swap.id,
                                 "Funds no longer locked on-chain, stopping retries"
                             );
-                            return Ok(swap.clone());
+                            return Err(e);
                         }
                         Ok(true) => {} // Still locked, worth retrying.
                         Err(check_err) => {
@@ -608,16 +510,10 @@ impl ReverseSwapExecutor {
                         }
                     }
 
-                    if attempt < MAX_CLAIM_RETRIES.saturating_sub(1) {
-                        sleep_1s().await;
-                    } else {
-                        swap.status = BoltzSwapStatus::Failed {
-                            reason: format!("Claim failed after {MAX_CLAIM_RETRIES} attempts: {e}"),
-                        };
-                        swap.updated_at = current_unix_timestamp();
-                        self.store.update_swap(swap).await?;
+                    if attempt >= MAX_CLAIM_RETRIES.saturating_sub(1) {
                         return Err(e);
                     }
+                    sleep_1s().await;
                 }
             }
         }
@@ -627,7 +523,7 @@ impl ReverseSwapExecutor {
     #[expect(clippy::too_many_arguments)]
     async fn try_claim(
         &self,
-        swap: &mut BoltzSwap,
+        swap: &BoltzSwap,
         gas_signer: &EvmSigner,
         erc20swap_version: &str,
         preimage: &[u8; 32],
@@ -667,7 +563,7 @@ impl ReverseSwapExecutor {
     #[expect(clippy::too_many_arguments)]
     async fn try_claim_same_chain(
         &self,
-        swap: &mut BoltzSwap,
+        swap: &BoltzSwap,
         gas_signer: &EvmSigner,
         erc20swap_version: &str,
         preimage: &[u8; 32],
@@ -741,7 +637,7 @@ impl ReverseSwapExecutor {
     #[expect(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn try_claim_cross_chain(
         &self,
-        swap: &mut BoltzSwap,
+        swap: &BoltzSwap,
         gas_signer: &EvmSigner,
         erc20swap_version: &str,
         preimage: &[u8; 32],
@@ -1017,16 +913,10 @@ impl ReverseSwapExecutor {
     /// Submit encoded calldata via Alchemy gas abstraction.
     async fn submit_claim(
         &self,
-        swap: &mut BoltzSwap,
+        swap: &BoltzSwap,
         router_address: &str,
         calldata: &[u8],
     ) -> Result<String, BoltzError> {
-        // Set Claiming BEFORE the Alchemy call so that on crash we know a
-        // claim was attempted (even if we don't yet have the tx hash).
-        swap.status = BoltzSwapStatus::Claiming;
-        swap.updated_at = current_unix_timestamp();
-        self.store.update_swap(swap).await?;
-
         let evm_call = EvmCall {
             to: router_address.to_string(),
             value: None,
@@ -1037,12 +927,6 @@ impl ReverseSwapExecutor {
             .alchemy_client
             .send_sponsored_calls(vec![evm_call], swap.chain_id)
             .await?;
-
-        // Persist the tx hash immediately so that on crash after this point
-        // we can poll the chain for the receipt.
-        swap.claim_tx_hash = Some(result.tx_hash.clone());
-        swap.updated_at = current_unix_timestamp();
-        self.store.update_swap(swap).await?;
 
         tracing::info!(
             tx_hash = result.tx_hash,

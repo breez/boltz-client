@@ -8,13 +8,14 @@ use crate::api::ws::{SwapStatusSubscriber, SwapStatusUpdate};
 use crate::error::BoltzError;
 use crate::events::{BoltzSwapEvent, EventEmitter};
 use crate::models::{BoltzSwap, BoltzSwapStatus};
+use crate::store::BoltzStorage;
 use crate::recover;
 use crate::swap::reverse::{ReverseSwapExecutor, current_unix_timestamp};
 
 /// Maximum number of receipt-poll attempts for a `Claiming` swap (5s * 60 = 5min).
-/// If the receipt is still not found after this, the task exits and relies on
-/// the WS `transaction.claimed` message. On process restart, `resume_all`
-/// re-triggers the poll, so this is self-healing across restarts.
+/// If the receipt is still not found after this, the loop iteration exits and
+/// relies on the WS `transaction.claimed` message. On process restart,
+/// `resume_all` re-triggers the poll, so this is self-healing across restarts.
 const RECEIPT_POLL_MAX_ATTEMPTS: u32 = 60;
 /// Interval between receipt-poll attempts.
 const RECEIPT_POLL_INTERVAL_SECS: u64 = 5;
@@ -24,8 +25,16 @@ const RECEIPT_POLL_INTERVAL_SECS: u64 = 5;
 /// Owns a single event loop that:
 /// - Receives WebSocket status updates for all tracked swaps.
 /// - Progresses each swap through its state machine.
-/// - Spawns short-lived tasks for heavy operations (claiming, receipt polling).
+/// - Runs claim/receipt-poll operations inline (blocking the loop).
+///
+/// NOTE: All reactions (claiming, receipt polling, on-chain checks) run inline
+/// in the event loop. This keeps the code simple and race-free but means a slow
+/// operation blocks processing of other swap updates. If this is ever used as a
+/// backend relay serving many concurrent swaps, consider spawning these
+/// operations into a `JoinSet` so they run in parallel while still being owned
+/// by the loop for proper cancellation and error propagation.
 pub(crate) struct SwapManager {
+    store: Arc<dyn BoltzStorage>,
     /// Channel for sending swap IDs to track.
     cmd_tx: mpsc::Sender<String>,
     /// Shutdown signal — dropping the sender stops the event loop.
@@ -42,6 +51,7 @@ impl SwapManager {
     /// `ws_rx` is the global receiver for all WebSocket status updates.
     pub fn start(
         executor: Arc<ReverseSwapExecutor>,
+        store: Arc<dyn BoltzStorage>,
         event_emitter: Arc<EventEmitter>,
         ws_subscriber: Arc<SwapStatusSubscriber>,
         ws_rx: mpsc::Receiver<SwapStatusUpdate>,
@@ -51,6 +61,7 @@ impl SwapManager {
 
         let handle = tokio::spawn(Self::run_loop(
             executor,
+            store.clone(),
             event_emitter,
             ws_subscriber,
             ws_rx,
@@ -61,6 +72,7 @@ impl SwapManager {
         let abort_handle = handle.abort_handle();
 
         Self {
+            store,
             cmd_tx,
             shutdown_tx,
             task_handle: Mutex::new(Some(handle)),
@@ -75,11 +87,8 @@ impl SwapManager {
     }
 
     /// Resume all non-terminal swaps from the store.
-    pub async fn resume_all(
-        &self,
-        executor: &ReverseSwapExecutor,
-    ) -> Result<Vec<String>, BoltzError> {
-        let active = executor.store.list_active_swaps().await?;
+    pub async fn resume_all(&self) -> Result<Vec<String>, BoltzError> {
+        let active = self.store.list_active_swaps().await?;
         let mut ids = Vec::with_capacity(active.len());
         for swap in &active {
             tracing::info!(swap_id = swap.id, status = ?swap.status, "Resuming swap");
@@ -109,6 +118,7 @@ impl SwapManager {
 
     async fn run_loop(
         executor: Arc<ReverseSwapExecutor>,
+        store: Arc<dyn BoltzStorage>,
         event_emitter: Arc<EventEmitter>,
         ws_subscriber: Arc<SwapStatusSubscriber>,
         mut ws_rx: mpsc::Receiver<SwapStatusUpdate>,
@@ -117,8 +127,6 @@ impl SwapManager {
     ) {
         // Swap IDs currently being tracked (for WS dispatch filtering).
         let mut tracked_ids: HashSet<String> = HashSet::new();
-        // Track spawned claim/poll tasks so we don't duplicate work.
-        let active_claims: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
         loop {
             tokio::select! {
@@ -131,9 +139,9 @@ impl SwapManager {
                     }
                     Self::handle_ws_update(
                         &executor,
+                        &store,
                         &event_emitter,
                         &ws_subscriber,
-                        &active_claims,
                         &mut tracked_ids,
                         &update,
                     ).await;
@@ -175,14 +183,14 @@ impl SwapManager {
     /// Process a WS status update for a tracked swap.
     async fn handle_ws_update(
         executor: &Arc<ReverseSwapExecutor>,
+        store: &Arc<dyn BoltzStorage>,
         event_emitter: &Arc<EventEmitter>,
         ws_subscriber: &Arc<SwapStatusSubscriber>,
-        active_claims: &Arc<Mutex<HashSet<String>>>,
         tracked_ids: &mut HashSet<String>,
         update: &SwapStatusUpdate,
     ) {
         let swap_id = &update.swap_id;
-        let swap = match executor.store.get_swap(swap_id).await {
+        let mut swap = match store.get_swap(swap_id).await {
             Ok(Some(s)) => s,
             Ok(None) => {
                 tracing::warn!(swap_id, "WS update for unknown swap");
@@ -210,7 +218,7 @@ impl SwapManager {
         match update.status.as_str() {
             "swap.created" | "invoice.set" | "invoice.pending" => {}
             "invoice.paid" => {
-                Self::update_status(executor, event_emitter, &swap, BoltzSwapStatus::InvoicePaid)
+                update_swap_status(&**store, event_emitter, &mut swap, BoltzSwapStatus::InvoicePaid)
                     .await;
             }
             "transaction.mempool" => {
@@ -218,7 +226,7 @@ impl SwapManager {
                     let mut s = swap;
                     s.lockup_tx_id = Some(tx.id.clone());
                     s.updated_at = current_unix_timestamp();
-                    if let Err(e) = executor.store.update_swap(&s).await {
+                    if let Err(e) = store.update_swap(&s).await {
                         tracing::error!(swap_id, error = %e, "Failed to persist lockup_tx_id");
                     }
                     event_emitter
@@ -227,10 +235,8 @@ impl SwapManager {
                 }
             }
             "transaction.confirmed" => {
-                // If we already submitted a claim, don't overwrite local
-                // status — just let the claiming resume logic handle it.
                 if matches!(swap.status, BoltzSwapStatus::Claiming) {
-                    Self::handle_claiming_resume(executor, event_emitter, active_claims, &swap);
+                    Self::handle_claiming_resume(executor, store, event_emitter, &swap).await;
                 } else {
                     // tBTC locked on-chain. Update local status, then claim.
                     let mut s = swap.clone();
@@ -239,13 +245,13 @@ impl SwapManager {
                     }
                     s.status = BoltzSwapStatus::TbtcLocked;
                     s.updated_at = current_unix_timestamp();
-                    if let Err(e) = executor.store.update_swap(&s).await {
+                    if let Err(e) = store.update_swap(&s).await {
                         tracing::error!(swap_id, error = %e, "Failed to persist TbtcLocked status");
                     }
                     event_emitter
                         .emit(&BoltzSwapEvent::SwapUpdated { swap: s.clone() })
                         .await;
-                    Self::spawn_claim(executor, event_emitter, active_claims, &s, false);
+                    Self::do_claim(executor, store, event_emitter, &mut s, false).await;
                 }
             }
             // `invoice.settled`: reverse swap success (Boltz settled the hold
@@ -259,12 +265,12 @@ impl SwapManager {
             // Transfer event logs from the receipt to record the actual USDT
             // amount delivered (may differ from estimate due to slippage).
             "invoice.settled" | "transaction.claimed" => {
-                Self::update_status(executor, event_emitter, &swap, BoltzSwapStatus::Completed)
+                update_swap_status(&**store, event_emitter, &mut swap, BoltzSwapStatus::Completed)
                     .await;
                 Self::cleanup_terminal(ws_subscriber, tracked_ids, swap_id).await;
             }
             "invoice.expired" | "swap.expired" => {
-                Self::update_status(executor, event_emitter, &swap, BoltzSwapStatus::Expired).await;
+                update_swap_status(&**store, event_emitter, &mut swap, BoltzSwapStatus::Expired).await;
                 Self::cleanup_terminal(ws_subscriber, tracked_ids, swap_id).await;
             }
             "invoice.failedToPay"
@@ -275,10 +281,10 @@ impl SwapManager {
                     .failure_reason
                     .clone()
                     .unwrap_or_else(|| update.status.clone());
-                Self::update_status(
-                    executor,
+                update_swap_status(
+                    &**store,
                     event_emitter,
-                    &swap,
+                    &mut swap,
                     BoltzSwapStatus::Failed { reason },
                 )
                 .await;
@@ -294,309 +300,175 @@ impl SwapManager {
         }
     }
 
-    /// Spawn a short-lived claim task for a `TbtcLocked` swap.
-    fn spawn_claim(
-        executor: &Arc<ReverseSwapExecutor>,
-        event_emitter: &Arc<EventEmitter>,
-        active_claims: &Arc<Mutex<HashSet<String>>>,
-        swap: &BoltzSwap,
+    /// Execute the claim flow for a swap, handling all outcomes inline.
+    async fn do_claim(
+        executor: &ReverseSwapExecutor,
+        store: &Arc<dyn BoltzStorage>,
+        event_emitter: &EventEmitter,
+        swap: &mut BoltzSwap,
         skip_drift_check: bool,
     ) {
         let swap_id = swap.id.clone();
-        let executor = executor.clone();
-        let emitter = event_emitter.clone();
-        let claims = active_claims.clone();
 
-        tokio::spawn(async move {
-            // Prevent duplicate claim tasks for the same swap.
-            {
-                let mut set = claims.lock().await;
-                if set.contains(&swap_id) {
-                    tracing::debug!(swap_id, "Claim already in progress, skipping");
-                    return;
+        update_swap_status(&**store, event_emitter, swap, BoltzSwapStatus::Claiming).await;
+
+        match executor.claim_and_swap(swap, skip_drift_check).await {
+            Ok(tx_hash) => {
+                swap.claim_tx_hash = Some(tx_hash);
+                swap.updated_at = current_unix_timestamp();
+                if let Err(e) = store.update_swap(swap).await {
+                    tracing::error!(swap_id, error = %e, "Failed to persist claim tx hash");
                 }
-                set.insert(swap_id.clone());
             }
-
-            let result = Self::do_claim(&executor, &swap_id, skip_drift_check).await;
-            match result {
-                Ok(_) => {
-                    // Re-read from store: the WS loop may have already moved
-                    // the swap to Completed while we were claiming. Emitting
-                    // the stale snapshot from claim_and_swap would produce an
-                    // out-of-order Claiming event after Completed.
-                    if let Ok(Some(swap)) = executor.store.get_swap(&swap_id).await
-                        && !swap.status.is_terminal()
-                    {
-                        emitter.emit(&BoltzSwapEvent::SwapUpdated { swap }).await;
-                    }
-                }
-                Err(BoltzError::QuoteDegradedBeyondSlippage {
+            Err(BoltzError::QuoteDegradedBeyondSlippage {
+                expected_usdt,
+                quoted_usdt,
+            }) => {
+                tracing::warn!(
+                    swap_id,
                     expected_usdt,
                     quoted_usdt,
-                }) => {
-                    tracing::warn!(
-                        swap_id,
+                    "Claim-time quote degraded beyond slippage tolerance"
+                );
+                event_emitter
+                    .emit(&BoltzSwapEvent::QuoteDegraded {
+                        swap: swap.clone(),
                         expected_usdt,
                         quoted_usdt,
-                        "Claim-time quote degraded beyond slippage tolerance"
-                    );
-                    if let Ok(Some(swap)) = executor.store.get_swap(&swap_id).await {
-                        emitter
-                            .emit(&BoltzSwapEvent::QuoteDegraded {
-                                swap,
-                                expected_usdt,
-                                quoted_usdt,
-                            })
-                            .await;
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(swap_id, error = %e, "Claim failed");
-                    // claim_and_swap marks the swap as Failed in the store on
-                    // final retry failure. Emit the event so listeners learn.
-                    if let Ok(Some(swap)) = executor.store.get_swap(&swap_id).await {
-                        emitter.emit(&BoltzSwapEvent::SwapUpdated { swap }).await;
-                    }
-                }
+                    })
+                    .await;
             }
-
-            claims.lock().await.remove(&swap_id);
-        });
-    }
-
-    /// Execute the claim flow for a swap.
-    async fn do_claim(
-        executor: &ReverseSwapExecutor,
-        swap_id: &str,
-        skip_drift_check: bool,
-    ) -> Result<BoltzSwap, BoltzError> {
-        let mut swap = executor
-            .store
-            .get_swap(swap_id)
-            .await?
-            .ok_or_else(|| BoltzError::Store(format!("Swap not found: {swap_id}")))?;
-
-        executor.claim_and_swap(&mut swap, skip_drift_check).await
+            Err(e) => {
+                tracing::error!(swap_id, error = %e, "Claim failed, staying in Claiming for retry");
+            }
+        }
     }
 
     /// Handle resuming a swap stuck in `Claiming` status. Either the tx hash
     /// is known (poll chain for receipt) or unknown (check on-chain if preimage
     /// was revealed).
-    fn handle_claiming_resume(
-        executor: &Arc<ReverseSwapExecutor>,
-        event_emitter: &Arc<EventEmitter>,
-        active_claims: &Arc<Mutex<HashSet<String>>>,
+    async fn handle_claiming_resume(
+        executor: &ReverseSwapExecutor,
+        store: &Arc<dyn BoltzStorage>,
+        event_emitter: &EventEmitter,
         swap: &BoltzSwap,
     ) {
         if let Some(ref tx_hash) = swap.claim_tx_hash {
-            // We have a tx hash — poll chain for its receipt.
-            Self::spawn_receipt_poll(
-                executor,
-                event_emitter,
-                active_claims,
-                swap.id.clone(),
-                tx_hash.clone(),
-            );
+            Self::poll_receipt(executor, store, event_emitter, &swap.id, tx_hash).await;
         } else {
             // Crash during Alchemy call: we set Claiming but never got a tx
             // hash back. Check on-chain if the claim went through anyway.
-            Self::spawn_on_chain_check(executor, event_emitter, active_claims, swap.clone());
+            Self::check_on_chain_and_retry(executor, store, event_emitter, swap).await;
         }
     }
 
-    /// Spawn a task that polls `eth_get_transaction_receipt` for a known tx
-    /// hash. If the receipt shows success, mark `Completed`. If reverted,
-    /// mark `Failed`.
-    fn spawn_receipt_poll(
-        executor: &Arc<ReverseSwapExecutor>,
-        event_emitter: &Arc<EventEmitter>,
-        active_claims: &Arc<Mutex<HashSet<String>>>,
-        swap_id: String,
-        tx_hash: String,
+    /// Poll `eth_get_transaction_receipt` for a known tx hash. If the receipt
+    /// shows success, mark `Completed`. If reverted, mark `Failed`.
+    async fn poll_receipt(
+        executor: &ReverseSwapExecutor,
+        store: &Arc<dyn BoltzStorage>,
+        event_emitter: &EventEmitter,
+        swap_id: &str,
+        tx_hash: &str,
     ) {
-        let executor = executor.clone();
-        let emitter = event_emitter.clone();
-        let claims = active_claims.clone();
-
-        tokio::spawn(async move {
+        for attempt in 0..RECEIPT_POLL_MAX_ATTEMPTS {
+            match executor
+                .evm_provider
+                .eth_get_transaction_receipt(tx_hash)
+                .await
             {
-                let mut set = claims.lock().await;
-                if set.contains(&swap_id) {
-                    return;
-                }
-                set.insert(swap_id.clone());
-            }
-
-            for attempt in 0..RECEIPT_POLL_MAX_ATTEMPTS {
-                match executor
-                    .evm_provider
-                    .eth_get_transaction_receipt(&tx_hash)
-                    .await
-                {
-                    Ok(Some(receipt)) => {
-                        if receipt.is_success() {
-                            tracing::info!(swap_id, tx_hash, "Claim receipt confirmed");
-                            if let Ok(Some(swap)) = executor.store.get_swap(&swap_id).await {
-                                Self::update_status(
-                                    &executor,
-                                    &emitter,
-                                    &swap,
-                                    BoltzSwapStatus::Completed,
-                                )
-                                .await;
-                            }
-                        } else {
-                            tracing::error!(swap_id, tx_hash, "Claim tx reverted");
-                            if let Ok(Some(swap)) = executor.store.get_swap(&swap_id).await {
-                                Self::update_status(
-                                    &executor,
-                                    &emitter,
-                                    &swap,
-                                    BoltzSwapStatus::Failed {
-                                        reason: "Claim transaction reverted".to_string(),
-                                    },
-                                )
-                                .await;
-                            }
+                Ok(Some(receipt)) => {
+                    if receipt.is_success() {
+                        tracing::info!(swap_id, tx_hash, "Claim receipt confirmed");
+                        if let Ok(Some(mut swap)) = store.get_swap(swap_id).await {
+                            update_swap_status(
+                                &**store,
+                                event_emitter,
+                                &mut swap,
+                                BoltzSwapStatus::Completed,
+                            )
+                            .await;
                         }
-                        claims.lock().await.remove(&swap_id);
-                        return;
-                    }
-                    Ok(None) => {
-                        // Not mined yet.
-                        if attempt < RECEIPT_POLL_MAX_ATTEMPTS.saturating_sub(1) {
-                            platform_utils::tokio::time::sleep(
-                                platform_utils::time::Duration::from_secs(
-                                    RECEIPT_POLL_INTERVAL_SECS,
-                                ),
+                    } else {
+                        tracing::error!(swap_id, tx_hash, "Claim tx reverted");
+                        if let Ok(Some(mut swap)) = store.get_swap(swap_id).await {
+                            update_swap_status(
+                                &**store,
+                                event_emitter,
+                                &mut swap,
+                                BoltzSwapStatus::Failed {
+                                    reason: "Claim transaction reverted".to_string(),
+                                },
                             )
                             .await;
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(swap_id, attempt, error = %e, "Receipt poll failed");
+                    return;
+                }
+                Ok(None) => {
+                    // Not mined yet.
+                    if attempt < RECEIPT_POLL_MAX_ATTEMPTS.saturating_sub(1) {
                         platform_utils::tokio::time::sleep(
                             platform_utils::time::Duration::from_secs(RECEIPT_POLL_INTERVAL_SECS),
                         )
                         .await;
                     }
                 }
-            }
-
-            // Timed out — rely on WS `transaction.claimed` to complete.
-            // On process restart, `resume_all` re-triggers the poll.
-            tracing::warn!(swap_id, tx_hash, "Receipt poll timed out, waiting for WS");
-            claims.lock().await.remove(&swap_id);
-        });
-    }
-
-    /// Spawn a task that checks on-chain whether the preimage was already
-    /// revealed. If still locked, retry the claim. If already claimed, wait
-    /// for WS `transaction.claimed`.
-    fn spawn_on_chain_check(
-        executor: &Arc<ReverseSwapExecutor>,
-        event_emitter: &Arc<EventEmitter>,
-        active_claims: &Arc<Mutex<HashSet<String>>>,
-        swap: BoltzSwap,
-    ) {
-        let executor = executor.clone();
-        let emitter = event_emitter.clone();
-        let claims = active_claims.clone();
-        let swap_id = swap.id.clone();
-
-        tokio::spawn(async move {
-            {
-                let mut set = claims.lock().await;
-                if set.contains(&swap_id) {
-                    return;
-                }
-                set.insert(swap_id.clone());
-            }
-
-            match recover::is_swap_still_locked_by_swap(
-                &executor.evm_provider,
-                &swap,
-                &executor.key_manager,
-            )
-            .await
-            {
-                Ok(true) => {
-                    // Still locked — safe to retry claim.
-                    tracing::info!(swap_id, "Swap still locked on-chain, retrying claim");
-                    // Reset to TbtcLocked so claim_and_swap can proceed.
-                    let mut s = swap;
-                    s.status = BoltzSwapStatus::TbtcLocked;
-                    s.updated_at = current_unix_timestamp();
-                    if let Err(e) = executor.store.update_swap(&s).await {
-                        tracing::error!(swap_id, error = %e, "Failed to persist TbtcLocked reset");
-                    }
-                    match executor.claim_and_swap(&mut s, false).await {
-                        Ok(s) => {
-                            emitter.emit(&BoltzSwapEvent::SwapUpdated { swap: s }).await;
-                        }
-                        Err(BoltzError::QuoteDegradedBeyondSlippage {
-                            expected_usdt,
-                            quoted_usdt,
-                        }) => {
-                            tracing::warn!(
-                                swap_id = s.id,
-                                expected_usdt,
-                                quoted_usdt,
-                                "Claim-time quote degraded beyond slippage on resume"
-                            );
-                            if let Ok(Some(swap)) = executor.store.get_swap(&s.id).await {
-                                emitter
-                                    .emit(&BoltzSwapEvent::QuoteDegraded {
-                                        swap,
-                                        expected_usdt,
-                                        quoted_usdt,
-                                    })
-                                    .await;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!(swap_id = s.id, error = %e, "Retry claim failed");
-                            // claim_and_swap marks Failed in store. Emit so
-                            // listeners learn about the failure.
-                            if let Ok(Some(failed)) = executor.store.get_swap(&s.id).await {
-                                emitter
-                                    .emit(&BoltzSwapEvent::SwapUpdated { swap: failed })
-                                    .await;
-                            }
-                        }
-                    }
-                }
-                Ok(false) => {
-                    // Already claimed — just wait for WS `transaction.claimed`.
-                    tracing::info!(
-                        swap_id,
-                        "Swap already claimed on-chain, waiting for WS confirmation"
-                    );
-                }
                 Err(e) => {
-                    tracing::error!(swap_id, error = %e, "On-chain check failed");
+                    tracing::warn!(swap_id, attempt, error = %e, "Receipt poll failed");
+                    platform_utils::tokio::time::sleep(
+                        platform_utils::time::Duration::from_secs(RECEIPT_POLL_INTERVAL_SECS),
+                    )
+                    .await;
                 }
             }
+        }
 
-            claims.lock().await.remove(&swap_id);
-        });
+        // Timed out — rely on WS `transaction.claimed` to complete.
+        // On process restart, `resume_all` re-triggers the poll.
+        tracing::warn!(swap_id, tx_hash, "Receipt poll timed out, waiting for WS");
     }
 
-    /// Update a swap's status, persist, and emit an event.
-    async fn update_status(
+    /// Check on-chain whether the preimage was already revealed. If still
+    /// locked, retry the claim. If already claimed, wait for WS
+    /// `transaction.claimed`.
+    async fn check_on_chain_and_retry(
         executor: &ReverseSwapExecutor,
-        emitter: &EventEmitter,
+        store: &Arc<dyn BoltzStorage>,
+        event_emitter: &EventEmitter,
         swap: &BoltzSwap,
-        new_status: BoltzSwapStatus,
     ) {
-        let mut s = swap.clone();
-        s.status = new_status;
-        s.updated_at = current_unix_timestamp();
-        if let Err(e) = executor.store.update_swap(&s).await {
-            tracing::error!(swap_id = s.id, error = %e, "Failed to update swap status");
+        let swap_id = &swap.id;
+
+        match recover::is_swap_still_locked_by_swap(
+            &executor.evm_provider,
+            swap,
+            &executor.key_manager,
+        )
+        .await
+        {
+            Ok(true) => {
+                // Still locked — safe to retry claim.
+                tracing::info!(swap_id, "Swap still locked on-chain, retrying claim");
+                let mut s = swap.clone();
+                s.status = BoltzSwapStatus::TbtcLocked;
+                s.updated_at = current_unix_timestamp();
+                if let Err(e) = store.update_swap(&s).await {
+                    tracing::error!(swap_id, error = %e, "Failed to persist TbtcLocked reset");
+                }
+                Self::do_claim(executor, store, event_emitter, &mut s, false).await;
+            }
+            Ok(false) => {
+                // Already claimed — just wait for WS `transaction.claimed`.
+                tracing::info!(
+                    swap_id,
+                    "Swap already claimed on-chain, waiting for WS confirmation"
+                );
+            }
+            Err(e) => {
+                tracing::error!(swap_id, error = %e, "On-chain check failed");
+            }
         }
-        emitter.emit(&BoltzSwapEvent::SwapUpdated { swap: s }).await;
     }
 
     /// Unsubscribe from WS and remove from tracking set after a swap
@@ -610,3 +482,22 @@ impl SwapManager {
         tracked_ids.remove(swap_id);
     }
 }
+
+pub(crate) async fn update_swap_status(
+    store: &dyn BoltzStorage,
+    emitter: &EventEmitter,
+    swap: &mut BoltzSwap,
+    new_status: BoltzSwapStatus,
+) {
+    swap.status = new_status;
+    swap.updated_at = current_unix_timestamp();
+    if let Err(e) = store.update_swap(swap).await {
+        tracing::error!(swap_id = swap.id, error = %e, "Failed to update swap status");
+    }
+    emitter
+        .emit(&BoltzSwapEvent::SwapUpdated {
+            swap: swap.clone(),
+        })
+        .await;
+}
+

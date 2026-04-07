@@ -28,7 +28,7 @@ use evm::oft::OftDeployments;
 use evm::provider::EvmProvider;
 use evm::signing::EvmSigner;
 use swap::manager::SwapManager;
-use swap::reverse::ReverseSwapExecutor;
+use swap::reverse::{ReverseSwapExecutor, current_unix_timestamp};
 
 /// Top-level Boltz service facade.
 ///
@@ -41,6 +41,7 @@ use swap::reverse::ReverseSwapExecutor;
 /// Register a `BoltzEventListener` to receive swap status updates.
 pub struct BoltzService {
     executor: Arc<ReverseSwapExecutor>,
+    store: Arc<dyn BoltzStorage>,
     swap_manager: SwapManager,
     event_emitter: Arc<EventEmitter>,
     ws_subscriber: Arc<SwapStatusSubscriber>,
@@ -110,7 +111,6 @@ impl BoltzService {
             alchemy_client,
             evm_provider,
             oft_deployments,
-            store,
             config,
             erc20swap_address,
         ));
@@ -119,6 +119,7 @@ impl BoltzService {
 
         let swap_manager = SwapManager::start(
             executor.clone(),
+            store.clone(),
             event_emitter.clone(),
             ws_subscriber.clone(),
             ws_rx,
@@ -126,6 +127,7 @@ impl BoltzService {
 
         Ok(Self {
             executor,
+            store,
             swap_manager,
             event_emitter,
             ws_subscriber,
@@ -135,7 +137,7 @@ impl BoltzService {
     /// Load and resume all active (non-terminal) swaps from storage.
     /// Call once after construction to pick up swaps from previous runs.
     pub async fn resume_swaps(&self) -> Result<Vec<String>, BoltzError> {
-        self.swap_manager.resume_all(&self.executor).await
+        self.swap_manager.resume_all().await
     }
 
     /// Register an event listener. Returns a unique ID for removal.
@@ -150,7 +152,7 @@ impl BoltzService {
 
     /// Get a swap by its internal ID.
     pub async fn get_swap(&self, swap_id: &str) -> Result<Option<BoltzSwap>, BoltzError> {
-        self.executor.store.get_swap(swap_id).await
+        self.store.get_swap(swap_id).await
     }
 
     /// Shut down the swap manager and close the WebSocket connection.
@@ -183,15 +185,48 @@ impl BoltzService {
             .await
     }
 
+    /// Maximum retries when Boltz rejects a preimage hash as already used.
+    const MAX_DUPLICATE_RETRIES: u32 = 10;
+
     /// Create the swap on Boltz and begin background monitoring.
     /// Returns the hold invoice to pay.
     pub async fn create_reverse_swap(
         &self,
         prepared: &PreparedSwap,
     ) -> Result<CreatedSwap, BoltzError> {
-        let created = self.executor.create(prepared).await?;
-        self.swap_manager.track_swap(&created.swap_id).await;
-        Ok(created)
+        let mut last_err = None;
+        for _ in 0..Self::MAX_DUPLICATE_RETRIES {
+            let key_index = self
+                .store
+                .increment_key_index(self.executor.config.chain_id)
+                .await?;
+
+            match self.executor.create(prepared, key_index).await {
+                Ok(swap) => {
+                    let created = CreatedSwap {
+                        swap_id: swap.id.clone(),
+                        invoice: swap.invoice.clone(),
+                        invoice_amount_sats: swap.invoice_amount_sats,
+                        timeout_block_height: swap.timeout_block_height,
+                    };
+                    self.store.insert_swap(&swap).await?;
+                    self.swap_manager.track_swap(&created.swap_id).await;
+                    return Ok(created);
+                }
+                Err(e) if e.is_duplicate_preimage() => {
+                    tracing::warn!(
+                        key_index,
+                        "Preimage hash already used, bumping key index and retrying"
+                    );
+                    last_err = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            BoltzError::Generic("Exhausted duplicate preimage retries".into())
+        }))
     }
 
     /// Get supported destination chains.
@@ -233,7 +268,6 @@ impl BoltzService {
     /// the current DEX quote (with on-chain slippage protection still applied).
     pub async fn accept_degraded_quote(&self, swap_id: &str) -> Result<BoltzSwap, BoltzError> {
         let mut swap = self
-            .executor
             .store
             .get_swap(swap_id)
             .await?
@@ -246,29 +280,91 @@ impl BoltzService {
             )));
         }
 
-        let result = self.executor.claim_and_swap(&mut swap, true).await;
+        swap::manager::update_swap_status(
+            &*self.store,
+            &self.event_emitter,
+            &mut swap,
+            BoltzSwapStatus::Claiming,
+        )
+        .await;
 
-        match &result {
-            Ok(swap) => {
-                self.event_emitter
-                    .emit(&BoltzSwapEvent::SwapUpdated { swap: swap.clone() })
-                    .await;
+        match self.executor.claim_and_swap(&swap, true).await {
+            Ok(tx_hash) => {
+                swap.claim_tx_hash = Some(tx_hash);
+                swap.updated_at = current_unix_timestamp();
+                self.store.update_swap(&swap).await?;
+                Ok(swap)
             }
             Err(e) => {
-                tracing::error!(swap_id, error = %e, "Forced claim after accept_degraded_quote failed");
-                if let Ok(Some(swap)) = self.executor.store.get_swap(swap_id).await {
-                    self.event_emitter
-                        .emit(&BoltzSwapEvent::SwapUpdated { swap })
-                        .await;
-                }
+                tracing::error!(swap_id, error = %e, "Forced claim after accept_degraded_quote failed, staying in Claiming for retry");
+                Err(e)
             }
         }
-
-        result
     }
 
     /// Recover unclaimed swaps by scanning the blockchain.
     pub async fn recover(&self, destination_address: &str) -> Result<RecoveryResult, BoltzError> {
-        self.executor.recover(destination_address).await
+        let (recoverable, stats) = self.executor.scan_recoverable().await?;
+
+        if let Some(highest) = stats.highest_key_index {
+            self.store
+                .set_key_index_if_higher(
+                    self.executor.config.chain_id,
+                    highest.saturating_add(1),
+                )
+                .await?;
+        }
+
+        let mut claimed = Vec::new();
+        for r in &recoverable {
+            let swap = self
+                .executor
+                .build_recovery_swap(r, destination_address)?;
+            if let Err(e) = self.store.insert_swap(&swap).await {
+                tracing::error!(
+                    key_index = r.key_index,
+                    error = %e,
+                    "Failed to persist recovery swap"
+                );
+                continue;
+            }
+            let mut swap = swap;
+            swap::manager::update_swap_status(
+                &*self.store,
+                &self.event_emitter,
+                &mut swap,
+                BoltzSwapStatus::Claiming,
+            )
+            .await;
+            match self.executor.claim_and_swap(&swap, true).await {
+                Ok(tx_hash) => {
+                    swap.claim_tx_hash = Some(tx_hash.clone());
+                    swap.updated_at = current_unix_timestamp();
+                    if let Err(e) = self.store.update_swap(&swap).await {
+                        tracing::error!(key_index = r.key_index, error = %e, "Failed to persist claim tx hash");
+                    }
+                    claimed.push(ClaimedRecovery {
+                        key_index: r.key_index,
+                        preimage_hash: r.preimage_hash,
+                        claim_tx_hash: tx_hash,
+                    });
+                }
+                Err(e) => {
+                    tracing::error!(
+                        key_index = r.key_index,
+                        tx = r.lockup_tx_hash,
+                        error = %e,
+                        "Failed to claim recovered swap"
+                    );
+                }
+            }
+        }
+
+        Ok(RecoveryResult {
+            claimed,
+            already_settled: stats.already_settled,
+            total_events_scanned: stats.total_events,
+            highest_key_index: stats.highest_key_index,
+        })
     }
 }
