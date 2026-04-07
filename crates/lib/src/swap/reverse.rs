@@ -921,6 +921,12 @@ impl ReverseSwapExecutor {
             .collect::<Result<Vec<_>, _>>()?;
 
         // Fee calls: tBTC -> ETH (for LZ messaging)
+        // NOTE: amount_out_min uses the Pass-1 native_fee, not the final_msg_fee
+        // re-quoted above. If the LZ fee increases between passes the fee swap
+        // may yield less ETH than needed and the transaction reverts (no fund
+        // loss — just wasted sponsored gas). The fee_with_slippage buffer on
+        // the input side absorbs typical fee movement. The Boltz web app has
+        // the same design.
         let fee_encode = self
             .api_client
             .encode_quote(
