@@ -77,10 +77,12 @@ impl SwapStatusSubscriber {
     pub async fn subscribe(&self, swap_id: &str) -> Result<(), BoltzError> {
         self.subscribed_ids.lock().await.insert(swap_id.to_string());
 
-        let _ = self
-            .cmd_tx
+        self.cmd_tx
             .send(ReaderCommand::Subscribe(swap_id.to_string()))
-            .await;
+            .await
+            .map_err(|_| {
+                BoltzError::WebSocket("Reader loop is not running, subscribe failed".into())
+            })?;
 
         tracing::info!(swap_id, "Subscribed to swap status updates");
         Ok(())
@@ -90,16 +92,25 @@ impl SwapStatusSubscriber {
     pub async fn unsubscribe(&self, swap_id: &str) {
         self.subscribed_ids.lock().await.remove(swap_id);
 
-        let _ = self
+        if self
             .cmd_tx
             .send(ReaderCommand::Unsubscribe(swap_id.to_string()))
-            .await;
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                swap_id,
+                "Reader loop is not running, unsubscribe not delivered"
+            );
+        }
 
         tracing::info!(swap_id, "Unsubscribed from swap status updates");
     }
 
     pub async fn close(&self) {
-        let _ = self.cmd_tx.send(ReaderCommand::Shutdown).await;
+        if self.cmd_tx.send(ReaderCommand::Shutdown).await.is_err() {
+            tracing::warn!("Reader loop is not running, shutdown not delivered");
+        }
         self.subscribed_ids.lock().await.clear();
         tracing::info!("WebSocket subscriber closed");
     }
