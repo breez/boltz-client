@@ -21,7 +21,7 @@ use crate::models::{BoltzSwap, BoltzSwapStatus, Chain, PreparedSwap, SwapLimits}
 use crate::recover::{self, RecoverableSwap};
 
 /// Maximum claim retries (quote may go stale between encode and submit).
-const MAX_CLAIM_RETRIES: u32 = 3;
+const MAX_CLAIM_RETRIES: u32 = 5;
 
 /// Maximum attempts to verify lockup on-chain before claiming.
 /// The public RPC endpoint may lag behind Boltz's node by a few seconds.
@@ -596,7 +596,12 @@ impl ReverseSwapExecutor {
                     if attempt >= MAX_CLAIM_RETRIES.saturating_sub(1) {
                         return Err(e);
                     }
-                    sleep_1s().await;
+                    // Exponential backoff: 1s, 2s, 4s, 8s, ...
+                    let delay_secs = 2u64.pow(attempt);
+                    platform_utils::tokio::time::sleep(
+                        platform_utils::time::Duration::from_secs(delay_secs),
+                    )
+                    .await;
                 }
             }
         }
