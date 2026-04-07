@@ -184,6 +184,9 @@ impl AlchemyGasClient {
             });
         }
 
+        // TRUST NOTE: We sign Alchemy's returned payloads without independent
+        // verification. Exploiting this requires compromising Alchemy's infrastructure.
+
         // Entry 0: authorization — raw ECDSA sign of signatureRequest.rawPayload
         let auth_entry = &data[0];
         let auth_payload = extract_raw_payload(auth_entry)?;
@@ -207,6 +210,7 @@ impl AlchemyGasClient {
 
     /// Subsequent response: single user-operation-v070.
     /// Sign `signatureRequest.data.raw` with EIP-191.
+    /// See trust note in `sign_first_time_response`.
     fn sign_subsequent_response(
         &self,
         prepared: &serde_json::Value,
@@ -632,7 +636,7 @@ mod tests {
             "data": [
                 {
                     "type": "authorization",
-                    "data": { "address": "0x1234", "nonce": "0x0" },
+                    "data": { "address": "0x69007702764179f14F51cdce752f4f775d74E139", "nonce": "0x0" },
                     "signatureRequest": {
                         "rawPayload": format!("0x{}", hex::encode([2u8; 32])),
                         "type": "eip7702Auth"

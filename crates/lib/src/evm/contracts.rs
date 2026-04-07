@@ -151,6 +151,11 @@ sol! {
 
 /// Convert a Boltz encode API `QuoteCalldata` to a Router `Call`.
 /// Maps: `to` -> `target`, `data` -> `callData`.
+///
+/// TRUST NOTE: The `calls` array is NOT covered by the Router's EIP-712 signature
+/// (which only binds `preimage, token, minAmountOut, destination`). We trust Boltz
+/// to provide honest DEX routing. The Router contract enforces `minAmountOut` as a
+/// floor on the output, bounding any manipulation to the slippage tolerance.
 pub fn quote_calldata_to_call(qc: &QuoteCalldata) -> Result<Call, BoltzError> {
     let target = parse_address(&qc.to)?;
     let value = parse_u256(&qc.value)?;
