@@ -1,5 +1,15 @@
 default: check
 
+# On macOS, auto-detect Homebrew LLVM for wasm32 cross-compilation of C
+# dependencies (e.g. secp256k1-sys). Apple's default clang doesn't support
+# the wasm32-unknown-unknown target.
+BREW_LLVM_PREFIX := $(shell brew --prefix llvm 2>/dev/null)
+ifneq ($(BREW_LLVM_PREFIX),)
+  WASM_ENV := CC_wasm32_unknown_unknown=$(BREW_LLVM_PREFIX)/bin/clang AR_wasm32_unknown_unknown=$(BREW_LLVM_PREFIX)/bin/llvm-ar
+else
+  WASM_ENV :=
+endif
+
 build:
 	cargo build
 
@@ -7,7 +17,7 @@ build-release:
 	cargo build --release
 
 build-wasm:
-	cargo build -p boltz-client --target wasm32-unknown-unknown
+	$(WASM_ENV) cargo build -p boltz-client --target wasm32-unknown-unknown
 
 check: fmt-check clippy-check wasm-clippy-check test wasm-test
 
@@ -18,10 +28,10 @@ clippy-fix:
 	cargo clippy --all-targets --fix --allow-dirty --allow-staged
 
 wasm-clippy-check:
-	cargo clippy -p boltz-client --target wasm32-unknown-unknown -- -D warnings
+	$(WASM_ENV) cargo clippy -p boltz-client --target wasm32-unknown-unknown -- -D warnings
 
 wasm-clippy-fix:
-	cargo clippy -p boltz-client --target wasm32-unknown-unknown --fix --allow-dirty --allow-staged
+	$(WASM_ENV) cargo clippy -p boltz-client --target wasm32-unknown-unknown --fix --allow-dirty --allow-staged
 
 fmt-check:
 	cargo fmt -- --check
@@ -37,10 +47,10 @@ test:
 wasm-test: wasm-test-browser wasm-test-node
 
 wasm-test-browser:
-	cd crates/lib && wasm-pack test --headless --firefox -- --features browser-tests
+	cd crates/lib && $(WASM_ENV) wasm-pack test --headless --firefox -- --features browser-tests
 
 wasm-test-node:
-	cd crates/lib && wasm-pack test --node
+	cd crates/lib && $(WASM_ENV) wasm-pack test --node
 
 itest:
 	@cd crates/lib/regtest && ./start.sh

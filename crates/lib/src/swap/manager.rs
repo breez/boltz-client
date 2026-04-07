@@ -181,6 +181,7 @@ impl SwapManager {
     }
 
     /// Process a WS status update for a tracked swap.
+    #[expect(clippy::too_many_lines)]
     async fn handle_ws_update(
         executor: &Arc<ReverseSwapExecutor>,
         store: &Arc<dyn BoltzStorage>,
@@ -259,15 +260,34 @@ impl SwapManager {
             // `transaction.claimed`: submarine/chain swap success (included
             //   for completeness, not expected for reverse swaps).
             //
-            // TODO: Before marking Completed, verify the claim TX receipt
-            // on-chain (is_success). Currently we trust the Boltz backend
-            // status without independent verification. Additionally, parse
-            // Transfer event logs from the receipt to record the actual USDT
-            // amount delivered (may differ from estimate due to slippage).
+            // If we have a claim tx hash, verify the receipt on-chain before
+            // marking Completed. Without a tx hash we can't meaningfully verify
+            // (the on-chain lock check can't distinguish our claim from a Boltz
+            // refund), so trust the WS event and log a warning.
+            //
+            // TODO: Parse Transfer event logs from the receipt to record the
+            // actual USDT amount delivered (may differ from estimate due to
+            // slippage).
             "invoice.settled" | "transaction.claimed" => {
-                update_swap_status(&**store, event_emitter, &mut swap, BoltzSwapStatus::Completed)
+                if let Some(ref tx_hash) = swap.claim_tx_hash {
+                    let reached_terminal = Self::poll_receipt(
+                        executor, store, event_emitter, swap_id, tx_hash,
+                    )
                     .await;
-                Self::cleanup_terminal(ws_subscriber, tracked_ids, swap_id).await;
+                    if reached_terminal {
+                        Self::cleanup_terminal(ws_subscriber, tracked_ids, swap_id).await;
+                    }
+                } else {
+                    tracing::warn!(
+                        swap_id,
+                        "No claim tx hash — cannot verify on-chain, trusting WS event"
+                    );
+                    update_swap_status(
+                        &**store, event_emitter, &mut swap, BoltzSwapStatus::Completed,
+                    )
+                    .await;
+                    Self::cleanup_terminal(ws_subscriber, tracked_ids, swap_id).await;
+                }
             }
             "invoice.expired" | "swap.expired" => {
                 update_swap_status(&**store, event_emitter, &mut swap, BoltzSwapStatus::Expired).await;
@@ -354,7 +374,8 @@ impl SwapManager {
         swap: &BoltzSwap,
     ) {
         if let Some(ref tx_hash) = swap.claim_tx_hash {
-            Self::poll_receipt(executor, store, event_emitter, &swap.id, tx_hash).await;
+            let _ =
+                Self::poll_receipt(executor, store, event_emitter, &swap.id, tx_hash).await;
         } else {
             // Crash during Alchemy call: we set Claiming but never got a tx
             // hash back. Check on-chain if the claim went through anyway.
@@ -364,13 +385,14 @@ impl SwapManager {
 
     /// Poll `eth_get_transaction_receipt` for a known tx hash. If the receipt
     /// shows success, mark `Completed`. If reverted, mark `Failed`.
+    /// Returns `true` if a terminal state was reached.
     async fn poll_receipt(
         executor: &ReverseSwapExecutor,
         store: &Arc<dyn BoltzStorage>,
         event_emitter: &EventEmitter,
         swap_id: &str,
         tx_hash: &str,
-    ) {
+    ) -> bool {
         for attempt in 0..RECEIPT_POLL_MAX_ATTEMPTS {
             match executor
                 .evm_provider
@@ -403,7 +425,7 @@ impl SwapManager {
                             .await;
                         }
                     }
-                    return;
+                    return true;
                 }
                 Ok(None) => {
                     // Not mined yet.
@@ -427,6 +449,7 @@ impl SwapManager {
         // Timed out — rely on WS `transaction.claimed` to complete.
         // On process restart, `resume_all` re-triggers the poll.
         tracing::warn!(swap_id, tx_hash, "Receipt poll timed out, waiting for WS");
+        false
     }
 
     /// Check on-chain whether the preimage was already revealed. If still

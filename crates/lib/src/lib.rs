@@ -264,8 +264,9 @@ impl BoltzService {
     /// Accept a degraded DEX quote and proceed with claiming.
     ///
     /// Call this after receiving a [`BoltzSwapEvent::QuoteDegraded`] event.
-    /// The swap must be in `TbtcLocked` status. The claim will proceed with
-    /// the current DEX quote (with on-chain slippage protection still applied).
+    /// The swap must be in `TbtcLocked` or `Claiming` status. The claim will
+    /// proceed with the current DEX quote (with on-chain slippage protection
+    /// still applied).
     pub async fn accept_degraded_quote(&self, swap_id: &str) -> Result<BoltzSwap, BoltzError> {
         let mut swap = self
             .store
@@ -273,9 +274,12 @@ impl BoltzService {
             .await?
             .ok_or_else(|| BoltzError::Store(format!("Swap not found: {swap_id}")))?;
 
-        if swap.status != BoltzSwapStatus::TbtcLocked {
+        if !matches!(
+            swap.status,
+            BoltzSwapStatus::TbtcLocked | BoltzSwapStatus::Claiming
+        ) {
             return Err(BoltzError::Generic(format!(
-                "Cannot accept degraded quote: swap {} is {:?}, expected TbtcLocked",
+                "Cannot accept degraded quote: swap {} is {:?}, expected TbtcLocked or Claiming",
                 swap_id, swap.status
             )));
         }

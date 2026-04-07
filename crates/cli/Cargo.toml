@@ -11,7 +11,7 @@ workspace = true
 boltz-client.workspace = true
 macros.workspace = true
 async-trait.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync"] }
 clap = { workspace = true, features = ["derive", "env"] }
 anyhow.workspace = true
 serde.workspace = true

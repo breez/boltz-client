@@ -148,6 +148,12 @@ enum Command {
         chain: Chain,
     },
 
+    /// Accept a degraded quote for a swap stuck waiting for approval.
+    Accept {
+        /// Swap ID.
+        swap_id: String,
+    },
+
     /// Recover unclaimed swaps by scanning the blockchain (from mnemonic alone).
     Recover {
         /// Destination EVM address for recovered USDT.
@@ -308,6 +314,11 @@ async fn execute_command(command: Command, svc: &BoltzService, seed: &[u8]) -> R
             cmd_swap(svc, &destination, chain.into(), usdt, sats).await?;
             Ok(true)
         }
+        Command::Accept { swap_id } => {
+            svc.accept_degraded_quote(&swap_id).await?;
+            println!("Accepted degraded quote for {swap_id}");
+            Ok(true)
+        }
         Command::Recover { destination } => {
             cmd_recover(svc, &destination).await?;
             Ok(true)
@@ -442,22 +453,34 @@ async fn cmd_swap(
     print_json(&created);
     println!("\n>>> PAY THIS INVOICE to continue <<<\n");
 
-    // Step 4: Wait for this swap to reach a terminal state
-    while let Some(event) = event_rx.recv().await {
-        match &event {
-            BoltzSwapEvent::SwapUpdated { swap }
-                if swap.id == created.swap_id && swap.status.is_terminal() =>
-            {
-                break;
-            }
-            BoltzSwapEvent::QuoteDegraded { swap, .. } if swap.id == created.swap_id => {
-                // Auto-accept in the CLI for convenience
-                println!("  Auto-accepting degraded quote...");
-                if let Err(e) = svc.accept_degraded_quote(&swap.id).await {
-                    eprintln!("  accept_degraded_quote failed: {e}");
+    // Step 4: Wait for this swap to reach a terminal state.
+    // Also listen for Ctrl+C so the user can always bail out.
+    loop {
+        tokio::select! {
+            event = event_rx.recv() => {
+                match event {
+                    Some(BoltzSwapEvent::SwapUpdated { swap })
+                        if swap.id == created.swap_id && swap.status.is_terminal() =>
+                    {
+                        break;
+                    }
+                    Some(BoltzSwapEvent::QuoteDegraded { swap, .. })
+                        if swap.id == created.swap_id =>
+                    {
+                        // Auto-accept in the CLI for convenience
+                        println!("  Auto-accepting degraded quote...");
+                        if let Err(e) = svc.accept_degraded_quote(&swap.id).await {
+                            eprintln!("  accept_degraded_quote failed: {e}");
+                        }
+                    }
+                    Some(_) => {}
+                    None => break,
                 }
             }
-            _ => {}
+            _ = tokio::signal::ctrl_c() => {
+                println!("\nInterrupted. Swap still active in background.");
+                break;
+            }
         }
     }
 

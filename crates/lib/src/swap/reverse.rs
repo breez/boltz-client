@@ -1,4 +1,5 @@
 use alloy_primitives::U256;
+use lightning_invoice::Bolt11Invoice;
 
 use crate::api::BoltzApiClient;
 use crate::api::types::{EncodeRequest, QuoteResponse, ReversePairInfo};
@@ -25,6 +26,10 @@ use crate::recover::{self, RecoverableSwap};
 /// Maximum claim retries (quote may go stale between encode and submit).
 const MAX_CLAIM_RETRIES: u32 = 3;
 
+/// Maximum attempts to verify lockup on-chain before claiming.
+/// The public RPC endpoint may lag behind Boltz's node by a few seconds.
+const LOCKUP_CHECK_MAX_ATTEMPTS: u32 = 10;
+
 /// Orchestrates the LN -> USDT reverse swap flow.
 pub(crate) struct ReverseSwapExecutor {
     api_client: BoltzApiClient,
@@ -37,7 +42,6 @@ pub(crate) struct ReverseSwapExecutor {
 }
 
 impl ReverseSwapExecutor {
-    #[expect(clippy::too_many_arguments)]
     pub fn new(
         api_client: BoltzApiClient,
         key_manager: EvmKeyManager,
@@ -282,6 +286,35 @@ impl ReverseSwapExecutor {
             )));
         }
 
+        // Validate lockup address matches the expected ERC20Swap contract.
+        if resp.lockup_address.to_lowercase() != self.erc20swap_address.to_lowercase() {
+            return Err(BoltzError::Generic(format!(
+                "Boltz lockup_address ({}) does not match expected ERC20Swap ({})",
+                resp.lockup_address, self.erc20swap_address,
+            )));
+        }
+
+        // Parse the BOLT11 invoice and verify the amount matches what we
+        // requested. A malicious Boltz server could return an invoice with a
+        // higher amount, causing the user to overpay on Lightning.
+        let decoded_invoice: Bolt11Invoice = resp.invoice.parse().map_err(|e| {
+            BoltzError::Generic(format!("Failed to parse BOLT11 invoice: {e}"))
+        })?;
+        let decoded_amount_sats = decoded_invoice
+            .amount_milli_satoshis()
+            .ok_or_else(|| BoltzError::Generic("BOLT11 invoice missing amount".to_string()))?
+            / 1000;
+        if decoded_amount_sats != prepared.invoice_amount_sats {
+            return Err(BoltzError::Generic(format!(
+                "Invoice amount ({decoded_amount_sats} sats) does not match requested amount ({} sats)",
+                prepared.invoice_amount_sats,
+            )));
+        }
+
+        // TODO: Validate timeout_block_height for reasonableness (minimum delta
+        // from current block). A very short timeout could allow Boltz to refund
+        // before the user can claim. The Boltz web app has the same gap.
+
         let now = current_unix_timestamp();
         Ok(BoltzSwap {
             id: resp.id,
@@ -428,11 +461,59 @@ impl ReverseSwapExecutor {
 
     /// Claim tBTC locked on-chain and swap to USDT.
     /// Returns the claim tx hash on success.
+    #[expect(clippy::too_many_lines)]
     pub(crate) async fn claim_and_swap(
         &self,
         swap: &BoltzSwap,
         skip_drift_check: bool,
     ) -> Result<String, BoltzError> {
+        // Verify funds are actually locked on-chain BEFORE deriving the
+        // preimage. Without this check, a fraudulent `transaction.confirmed` WS
+        // message would cause us to reveal the preimage in (reverted) calldata,
+        // allowing an attacker to settle the Lightning HTLC.
+        //
+        // Retry a few times: the public RPC endpoint may lag behind Boltz's node
+        // that triggered the `transaction.confirmed` WS event.
+        let mut lockup_verified = false;
+        for attempt in 0..LOCKUP_CHECK_MAX_ATTEMPTS {
+            match recover::is_swap_still_locked_by_swap(
+                &self.evm_provider,
+                swap,
+                &self.key_manager,
+            )
+            .await
+            {
+                Ok(true) => {
+                    lockup_verified = true;
+                    break;
+                }
+                Ok(false) => {
+                    tracing::debug!(
+                        swap_id = swap.id,
+                        attempt,
+                        "Lockup not yet visible on-chain, retrying"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        swap_id = swap.id,
+                        attempt,
+                        error = %e,
+                        "Lockup check RPC error, retrying"
+                    );
+                }
+            }
+            if attempt < LOCKUP_CHECK_MAX_ATTEMPTS.saturating_sub(1) {
+                sleep_1s().await;
+            }
+        }
+        if !lockup_verified {
+            return Err(BoltzError::Generic(
+                "On-chain lockup check failed: funds are not locked in ERC20Swap contract"
+                    .to_string(),
+            ));
+        }
+
         let chain_id_u32 = to_chain_id_u32(swap.chain_id)?;
         let preimage = self
             .key_manager
