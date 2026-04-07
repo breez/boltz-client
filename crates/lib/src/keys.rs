@@ -32,10 +32,10 @@ impl EvmKeyManager {
     /// All levels are NON-HARDENED.
     pub fn derive_gas_signer(&self, chain_id: u32) -> Result<EvmKeyPair, BoltzError> {
         let path = [
-            ChildNumber::new(44, false).expect("valid child number"),
-            ChildNumber::new(chain_id, false).expect("valid child number"),
-            ChildNumber::new(1, false).expect("valid child number"),
-            ChildNumber::new(0, false).expect("valid child number"),
+            child_number(44)?,
+            child_number(chain_id)?,
+            child_number(1)?,
+            child_number(0)?,
         ];
         self.derive_key_pair(&path)
     }
@@ -44,11 +44,11 @@ impl EvmKeyManager {
     /// Used ONLY for preimage derivation and sending the public key to Boltz — NOT for signing.
     pub fn derive_preimage_key(&self, chain_id: u32, index: u32) -> Result<EvmKeyPair, BoltzError> {
         let path = [
-            ChildNumber::new(44, false).expect("valid child number"),
-            ChildNumber::new(chain_id, false).expect("valid child number"),
-            ChildNumber::new(0, false).expect("valid child number"),
-            ChildNumber::new(0, false).expect("valid child number"),
-            ChildNumber::new(index, false).expect("valid child number"),
+            child_number(44)?,
+            child_number(chain_id)?,
+            child_number(0)?,
+            child_number(0)?,
+            child_number(index)?,
         ];
         self.derive_key_pair(&path)
     }
@@ -174,6 +174,11 @@ fn checksum_address(address: &[u8; 20]) -> String {
         }
     }
     checksummed
+}
+
+fn child_number(index: u32) -> Result<ChildNumber, BoltzError> {
+    ChildNumber::new(index, false)
+        .map_err(|e| BoltzError::Signing(format!("Invalid BIP-32 child number: {e}")))
 }
 
 #[cfg(test)]
