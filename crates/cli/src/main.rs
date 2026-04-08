@@ -438,53 +438,13 @@ async fn cmd_swap(
         return Ok(());
     }
 
-    // Step 2: Register a channel listener to wait for this swap's terminal event.
-    // The global PrintingEventListener (registered in init_service) handles
-    // printing status updates for all swaps.
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<BoltzSwapEvent>(32);
-    let listener_id = svc
-        .add_event_listener(Box::new(ChannelEventListener { tx: event_tx }))
-        .await;
-
-    // Step 3: Create — swap monitoring starts automatically
+    // Create — swap monitoring starts automatically
     println!("\nCreating swap on Boltz...");
     let created = svc.create_reverse_swap(&prepared).await?;
     println!("\nSwap created:");
     print_json(&created);
     println!("\n>>> PAY THIS INVOICE to continue <<<\n");
 
-    // Step 4: Wait for this swap to reach a terminal state.
-    // Also listen for Ctrl+C so the user can always bail out.
-    loop {
-        tokio::select! {
-            event = event_rx.recv() => {
-                match event {
-                    Some(BoltzSwapEvent::SwapUpdated { swap })
-                        if swap.id == created.swap_id && swap.status.is_terminal() =>
-                    {
-                        break;
-                    }
-                    Some(BoltzSwapEvent::QuoteDegraded { swap, .. })
-                        if swap.id == created.swap_id =>
-                    {
-                        // Auto-accept in the CLI for convenience
-                        println!("  Auto-accepting degraded quote...");
-                        if let Err(e) = svc.accept_degraded_quote(&swap.id).await {
-                            eprintln!("  accept_degraded_quote failed: {e}");
-                        }
-                    }
-                    Some(_) => {}
-                    None => break,
-                }
-            }
-            _ = tokio::signal::ctrl_c() => {
-                println!("\nInterrupted. Swap still active in background.");
-                break;
-            }
-        }
-    }
-
-    svc.remove_event_listener(&listener_id).await;
     Ok(())
 }
 
@@ -514,18 +474,6 @@ impl BoltzEventListener for PrintingEventListener {
                 );
             }
         }
-    }
-}
-
-/// Event listener that forwards events to an mpsc channel.
-struct ChannelEventListener {
-    tx: tokio::sync::mpsc::Sender<BoltzSwapEvent>,
-}
-
-#[macros::async_trait]
-impl BoltzEventListener for ChannelEventListener {
-    async fn on_event(&self, event: BoltzSwapEvent) {
-        let _ = self.tx.send(event).await;
     }
 }
 
