@@ -963,6 +963,28 @@ impl ReverseSwapExecutor {
         let mut all_calls = trade_calls;
         all_calls.extend(fee_calls);
 
+        // ─── Optional OFT approval top-up ─────────────────────────────
+        // Matches the web app's `buildOftApprovalCall`. For the current
+        // Arbitrum native-mesh OFT this is a no-op (`approvalRequired()`
+        // returns false because the mint/burn variant bypasses ERC20
+        // transfers). It will kick in for legacy-mesh destinations
+        // (Solana/Tron/Celo/TON), whose source OFT is a classical Adapter
+        // requiring `transferFrom` allowance.
+        //
+        // The amount passed to the gate is the raw pre-slippage DEX quote
+        // (`trade_best.amount`), matching the web app's `amountOut`.
+        if let Some(approval_call) = self
+            .build_oft_approval_call(
+                addrs.router,
+                oft_addr,
+                addrs.usdt,
+                U256::from(trade_best.amount),
+            )
+            .await?
+        {
+            all_calls.push(approval_call);
+        }
+
         // ─── Build SendData + hash ────────────────────────────────────
         let send_data = SendData {
             dstEid: dst_eid,
@@ -1199,6 +1221,59 @@ impl ReverseSwapExecutor {
         contracts::decode_quote_send_return(&result)
     }
 
+    /// Build an `approve(oft, MaxUint256)` call to top up the Router's
+    /// allowance on the source OFT, mirroring the web app's
+    /// `buildOftApprovalCall` in `src/utils/oft/oft.ts`.
+    ///
+    /// The OFT's `approvalRequired()` distinguishes mint/burn variants
+    /// (return false — no `transferFrom` path, no allowance consumed) from
+    /// classical Adapter variants (return true — `send` internally does
+    /// `token.transferFrom(msg.sender, oft, amount)`). For the current
+    /// Arbitrum → EVM native-mesh flow this is always a no-op; it becomes
+    /// load-bearing once legacy-mesh destinations (Solana/Tron/Celo/TON) are
+    /// wired up, since those route through the legacy-mesh Arbitrum OFT
+    /// Adapter.
+    ///
+    /// The actual decision (`allowance < amount * 10` → top up to
+    /// `MaxUint256`) is factored out into [`decide_oft_approval_top_up`] so
+    /// the gate can be exhaustively unit-tested without a live RPC.
+    async fn build_oft_approval_call(
+        &self,
+        router: alloy_primitives::Address,
+        oft: alloy_primitives::Address,
+        token: alloy_primitives::Address,
+        amount: U256,
+    ) -> Result<Option<contracts::Call>, BoltzError> {
+        let oft_str = oft.to_string();
+        let approval_required_data = contracts::encode_approval_required();
+        let result = self
+            .evm_provider
+            .eth_call(&oft_str, &approval_required_data)
+            .await?;
+        let required = contracts::decode_approval_required_return(&result)?;
+        if !required {
+            // Short-circuit: native-mesh mint/burn OFTs never need an ERC20
+            // allowance. Skipping the second eth_call matches the web app's
+            // early return in `buildOftApprovalCall`.
+            return Ok(None);
+        }
+
+        let token_str = token.to_string();
+        let allowance_data = contracts::encode_allowance(router, oft);
+        let result = self
+            .evm_provider
+            .eth_call(&token_str, &allowance_data)
+            .await?;
+        let current_allowance = contracts::decode_allowance_return(&result)?;
+
+        Ok(decide_oft_approval_top_up(
+            current_allowance,
+            amount,
+            oft,
+            token,
+        ))
+    }
+
     /// Fetch `TYPEHASH_SEND_DATA` from the Router contract.
     async fn fetch_typehash_send_data(&self, router_address: &str) -> Result<[u8; 32], BoltzError> {
         let calldata = contracts::encode_typehash_send_data_call();
@@ -1276,6 +1351,37 @@ impl ReverseSwapExecutor {
 
         Ok((calls, min_amount_out, raw_quote_amount))
     }
+}
+
+// ─── OFT approval gate (pure) ────────────────────────────────────────────
+
+/// Decide whether the Router needs an `approve(oft, MaxUint256)` top-up on
+/// the source OFT, given the current on-chain allowance and the amount
+/// about to flow through the OFT. Mirrors the `allowance < amount * 10`
+/// gate in the web app's `buildOftApprovalCall`.
+///
+/// Caller must have already verified `oft.approvalRequired() == true`;
+/// this function unconditionally assumes the OFT is an Adapter.
+///
+/// A 10x runway is used so one `MaxUint256` approval amortises the SSTORE
+/// across roughly ten equal-size claims. `saturating_mul` protects against
+/// absurdly large `amount` values by saturating the threshold to
+/// `U256::MAX`, which errs on the side of topping up.
+fn decide_oft_approval_top_up(
+    current_allowance: U256,
+    amount: U256,
+    oft: alloy_primitives::Address,
+    token: alloy_primitives::Address,
+) -> Option<contracts::Call> {
+    let threshold = amount.saturating_mul(U256::from(10u64));
+    if current_allowance >= threshold {
+        return None;
+    }
+    Some(contracts::Call {
+        target: token,
+        value: U256::ZERO,
+        callData: contracts::encode_approve(oft, U256::MAX).into(),
+    })
 }
 
 // ─── Parsed addresses for claim ──────────────────────────────────────────
@@ -1744,5 +1850,99 @@ mod tests {
         // Recovery swaps have expected=0, should always pass
         // (but in practice skip_drift_check=true is used for recovery)
         assert!(check_quote_drift(0, 500_000, 100).is_ok());
+    }
+
+    // ─── OFT approval gate tests ─────────────────────────────────────
+
+    fn approval_test_addrs() -> (alloy_primitives::Address, alloy_primitives::Address) {
+        let oft = contracts::parse_address("0x77652D5aba086137b595875263FC200182919B92").unwrap();
+        let token = contracts::parse_address("0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9").unwrap();
+        (oft, token)
+    }
+
+    #[macros::test_all]
+    fn decide_approval_skips_when_allowance_far_above_threshold() {
+        let (oft, token) = approval_test_addrs();
+        let amount = U256::from(1_000_000u64);
+        // 100x the amount — well above the 10x threshold.
+        let allowance = U256::from(100_000_000u64);
+        assert!(decide_oft_approval_top_up(allowance, amount, oft, token).is_none());
+    }
+
+    #[macros::test_all]
+    fn decide_approval_skips_at_exact_threshold() {
+        let (oft, token) = approval_test_addrs();
+        let amount = U256::from(1_000_000u64);
+        // allowance == amount * 10 exactly — `>=` means no top-up.
+        let allowance = U256::from(10_000_000u64);
+        assert!(decide_oft_approval_top_up(allowance, amount, oft, token).is_none());
+    }
+
+    #[macros::test_all]
+    fn decide_approval_tops_up_just_below_threshold() {
+        let (oft, token) = approval_test_addrs();
+        let amount = U256::from(1_000_000u64);
+        // allowance == amount * 10 - 1 — one wei below the gate.
+        let allowance = U256::from(9_999_999u64);
+        let call =
+            decide_oft_approval_top_up(allowance, amount, oft, token).expect("should top up");
+        assert_eq!(call.target, token);
+        assert_eq!(call.value, U256::ZERO);
+    }
+
+    #[macros::test_all]
+    fn decide_approval_tops_up_when_allowance_is_zero() {
+        let (oft, token) = approval_test_addrs();
+        let amount = U256::from(1u64);
+        let call = decide_oft_approval_top_up(U256::ZERO, amount, oft, token)
+            .expect("should top up with zero allowance");
+        assert_eq!(call.target, token);
+    }
+
+    #[macros::test_all]
+    fn decide_approval_skips_when_amount_is_zero() {
+        // Degenerate edge: amount == 0 → threshold == 0. Any allowance
+        // (including 0) satisfies `>=`, so no top-up is emitted.
+        let (oft, token) = approval_test_addrs();
+        assert!(decide_oft_approval_top_up(U256::ZERO, U256::ZERO, oft, token).is_none());
+    }
+
+    #[macros::test_all]
+    fn decide_approval_saturates_on_pathological_amount() {
+        // amount * 10 overflows U256; `saturating_mul` clamps to U256::MAX.
+        // Only an allowance == U256::MAX can satisfy `>= U256::MAX`.
+        let (oft, token) = approval_test_addrs();
+        let huge_amount = U256::MAX;
+        // allowance strictly below MAX → top up.
+        assert!(
+            decide_oft_approval_top_up(U256::MAX - U256::from(1u64), huge_amount, oft, token)
+                .is_some()
+        );
+        // allowance at MAX → no top up.
+        assert!(decide_oft_approval_top_up(U256::MAX, huge_amount, oft, token).is_none());
+    }
+
+    #[macros::test_all]
+    fn decide_approval_emits_max_uint256_for_the_oft_spender() {
+        // Verify the generated `Call` really encodes `approve(oft, MaxUint256)`
+        // on the underlying token — catches target/spender mix-ups. We rely
+        // on `contracts::encode_approve` being independently validated in
+        // its own unit tests (selector + length + args roundtrip).
+        let (oft, token) = approval_test_addrs();
+        let call =
+            decide_oft_approval_top_up(U256::ZERO, U256::from(1_000_000u64), oft, token).unwrap();
+
+        assert_eq!(call.target, token);
+        assert_eq!(call.value, U256::ZERO);
+
+        let expected_calldata = contracts::encode_approve(oft, U256::MAX);
+        assert_eq!(call.callData.as_ref(), expected_calldata.as_slice());
+
+        // Cross-check: swapping oft/token would change the calldata, so a
+        // mix-up where we accidentally target `oft` and spend `token` would
+        // be caught by this byte-equality assertion against the
+        // independently-tested `encode_approve`.
+        let wrong_way = contracts::encode_approve(token, U256::MAX);
+        assert_ne!(call.callData.as_ref(), wrong_way.as_slice());
     }
 }

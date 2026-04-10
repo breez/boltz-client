@@ -103,6 +103,8 @@ sol! {
 
     function transfer(address to, uint256 amount) returns (bool);
     function balanceOf(address account) returns (uint256);
+    function approve(address spender, uint256 amount) returns (bool);
+    function allowance(address owner, address spender) returns (uint256);
 
     // ─── Router read functions ───────────────────────────────────────────
 
@@ -147,6 +149,11 @@ sol! {
     function quoteSend(OftSendParam calldata sendParam, bool payInLzToken)
         external view
         returns (MessagingFee);
+
+    /// True when the OFT is an Adapter that debits via `transferFrom` and
+    /// therefore requires an ERC20 allowance from `msg.sender`. Mint/burn
+    /// variants (e.g. Arbitrum's native-mesh USDT0 OFT) return false.
+    function approvalRequired() external view returns (bool);
 }
 
 /// Convert a Boltz encode API `QuoteCalldata` to a Router `Call`.
@@ -236,6 +243,39 @@ pub fn encode_balance_of(account: Address) -> Vec<u8> {
 pub fn decode_balance_of(data: &[u8]) -> Result<U256, BoltzError> {
     let decoded = <(U256,)>::abi_decode(data).map_err(|e| BoltzError::Evm {
         reason: format!("Failed to decode balanceOf return: {e}"),
+        tx_hash: None,
+    })?;
+    Ok(decoded.0)
+}
+
+/// Encode `approve(spender, amount)` calldata.
+pub fn encode_approve(spender: Address, amount: U256) -> Vec<u8> {
+    approveCall { spender, amount }.abi_encode()
+}
+
+/// Encode `allowance(owner, spender)` calldata.
+pub fn encode_allowance(owner: Address, spender: Address) -> Vec<u8> {
+    allowanceCall { owner, spender }.abi_encode()
+}
+
+/// Decode `allowance` return value.
+pub fn decode_allowance_return(data: &[u8]) -> Result<U256, BoltzError> {
+    let decoded = <(U256,)>::abi_decode(data).map_err(|e| BoltzError::Evm {
+        reason: format!("Failed to decode allowance return: {e}"),
+        tx_hash: None,
+    })?;
+    Ok(decoded.0)
+}
+
+/// Encode `approvalRequired()` calldata.
+pub fn encode_approval_required() -> Vec<u8> {
+    approvalRequiredCall {}.abi_encode()
+}
+
+/// Decode `approvalRequired()` return value.
+pub fn decode_approval_required_return(data: &[u8]) -> Result<bool, BoltzError> {
+    let decoded = <(bool,)>::abi_decode(data).map_err(|e| BoltzError::Evm {
+        reason: format!("Failed to decode approvalRequired return: {e}"),
         tx_hash: None,
     })?;
     Ok(decoded.0)
@@ -793,6 +833,69 @@ mod tests {
         let encoded = encode_quote_send(&send_param, false);
         let expected_selector = &quoteSendCall::SELECTOR;
         assert_eq!(&encoded[..4], expected_selector);
+    }
+
+    #[macros::test_all]
+    fn test_approve_call_selector_and_roundtrip() {
+        let spender = parse_address("0x14E4A1B13bf7F943c8ff7C51fb60FA964A298D92").unwrap();
+        let amount = U256::from(0x1234_5678_u64);
+        let encoded = encode_approve(spender, amount);
+
+        assert_eq!(&encoded[..4], &approveCall::SELECTOR);
+        // ERC20.approve(address,uint256) — well-known selector.
+        assert_eq!(&encoded[..4], &[0x09, 0x5e, 0xa7, 0xb3]);
+        // calldata = selector(4) + address(32) + uint256(32) = 68 bytes.
+        assert_eq!(encoded.len(), 68);
+
+        // Full roundtrip: decode the args and confirm they survived.
+        let decoded = approveCall::abi_decode(&encoded).unwrap();
+        assert_eq!(decoded.spender, spender);
+        assert_eq!(decoded.amount, amount);
+    }
+
+    #[macros::test_all]
+    fn test_approve_max_uint256_roundtrip() {
+        let spender = parse_address("0x77652D5aba086137b595875263FC200182919B92").unwrap();
+        let encoded = encode_approve(spender, U256::MAX);
+        let decoded = approveCall::abi_decode(&encoded).unwrap();
+        assert_eq!(decoded.spender, spender);
+        assert_eq!(decoded.amount, U256::MAX);
+    }
+
+    #[macros::test_all]
+    fn test_allowance_call_selector() {
+        let owner = parse_address("0x6EA68e965fcd19b6fbC6553BABbF87a5018F9B28").unwrap();
+        let spender = parse_address("0x77652D5aba086137b595875263FC200182919B92").unwrap();
+        let encoded = encode_allowance(owner, spender);
+        assert_eq!(&encoded[..4], &allowanceCall::SELECTOR);
+        assert_eq!(&encoded[..4], &[0xdd, 0x62, 0xed, 0x3e]);
+    }
+
+    #[macros::test_all]
+    fn test_decode_allowance_return() {
+        // ABI-encoded uint256(0xdead_beef).
+        let mut buf = [0u8; 32];
+        buf[28..].copy_from_slice(&0xdead_beef_u32.to_be_bytes());
+        let decoded = decode_allowance_return(&buf).unwrap();
+        assert_eq!(decoded, U256::from(0xdead_beef_u64));
+    }
+
+    #[macros::test_all]
+    fn test_approval_required_call_selector() {
+        let encoded = encode_approval_required();
+        assert_eq!(&encoded[..4], &approvalRequiredCall::SELECTOR);
+        // Zero-arg calldata = 4 bytes.
+        assert_eq!(encoded.len(), 4);
+    }
+
+    #[macros::test_all]
+    fn test_decode_approval_required_return() {
+        let mut true_bytes = [0u8; 32];
+        true_bytes[31] = 1;
+        assert!(decode_approval_required_return(&true_bytes).unwrap());
+
+        let false_bytes = [0u8; 32];
+        assert!(!decode_approval_required_return(&false_bytes).unwrap());
     }
 
     #[macros::test_all]
