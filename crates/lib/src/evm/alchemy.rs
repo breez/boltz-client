@@ -711,7 +711,7 @@ mod tests {
         let result = client
             .send_sponsored_calls(
                 vec![EvmCall {
-                    to: "0xaB6B467FC443Ca37a8E5aA11B04ea29434688d61".to_string(),
+                    to: "0x0000000000000000000000000000000000000042".to_string(),
                     value: None,
                     data: Some("0xdeadbeef".to_string()),
                 }],
@@ -764,7 +764,7 @@ mod tests {
         let result = client
             .send_sponsored_calls(
                 vec![EvmCall {
-                    to: "0xaB6B467FC443Ca37a8E5aA11B04ea29434688d61".to_string(),
+                    to: "0x0000000000000000000000000000000000000042".to_string(),
                     value: None,
                     data: Some("0xdeadbeef".to_string()),
                 }],

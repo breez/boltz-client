@@ -557,15 +557,15 @@ mod tests {
 
     #[macros::test_all]
     fn test_parse_address() {
-        let addr = parse_address("0xaB6B467FC443Ca37a8E5aA11B04ea29434688d61").unwrap();
-        let expected_bytes = hex::decode("aB6B467FC443Ca37a8E5aA11B04ea29434688d61").unwrap();
+        let addr = parse_address("0x1234567890AbCdEf1234567890aBcDeF12345678").unwrap();
+        let expected_bytes = hex::decode("1234567890AbCdEf1234567890aBcDeF12345678").unwrap();
         assert_eq!(addr.as_slice(), &expected_bytes);
     }
 
     #[macros::test_all]
     fn test_parse_address_no_prefix() {
-        let addr = parse_address("aB6B467FC443Ca37a8E5aA11B04ea29434688d61").unwrap();
-        let expected_bytes = hex::decode("aB6B467FC443Ca37a8E5aA11B04ea29434688d61").unwrap();
+        let addr = parse_address("1234567890AbCdEf1234567890aBcDeF12345678").unwrap();
+        let expected_bytes = hex::decode("1234567890AbCdEf1234567890aBcDeF12345678").unwrap();
         assert_eq!(addr.as_slice(), &expected_bytes);
     }
 
@@ -596,14 +596,14 @@ mod tests {
     #[macros::test_all]
     fn test_quote_calldata_to_call() {
         let qc = QuoteCalldata {
-            to: "0xaB6B467FC443Ca37a8E5aA11B04ea29434688d61".to_string(),
+            to: "0x0000000000000000000000000000000000000042".to_string(),
             value: "0".to_string(),
             data: "0xabcdef".to_string(),
         };
         let call = quote_calldata_to_call(&qc).unwrap();
         assert_eq!(
             call.target,
-            parse_address("0xaB6B467FC443Ca37a8E5aA11B04ea29434688d61").unwrap()
+            parse_address("0x0000000000000000000000000000000000000042").unwrap()
         );
         assert_eq!(call.value, U256::ZERO);
         assert_eq!(call.callData.as_ref(), &[0xab, 0xcd, 0xef]);
@@ -765,7 +765,7 @@ mod tests {
 
     #[macros::test_all]
     fn test_address_to_bytes32() {
-        let addr = parse_address("0xaB6B467FC443Ca37a8E5aA11B04ea29434688d61").unwrap();
+        let addr = parse_address("0x0000000000000000000000000000000000000042").unwrap();
         let b32 = address_to_bytes32(addr);
         // First 12 bytes should be zero-padding
         assert_eq!(&b32[..12], &[0u8; 12]);
@@ -834,7 +834,7 @@ mod tests {
 
     #[macros::test_all]
     fn test_build_oft_send_param() {
-        let addr = parse_address("0xaB6B467FC443Ca37a8E5aA11B04ea29434688d61").unwrap();
+        let addr = parse_address("0x0000000000000000000000000000000000000042").unwrap();
         let sp = build_oft_send_param(30111, addr, U256::from(1000u64), U256::from(900u64));
         assert_eq!(sp.dstEid, 30111);
         assert_eq!(&sp.to[12..], addr.as_slice());

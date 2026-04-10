@@ -256,6 +256,11 @@ mod tests {
 
     const TEST_SEED_HEX: &str = "5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc19a5ac40b389cd370d086206dec8aa6c43daea6690f20ad3d8d48b2d2ce9e38e4";
 
+    // Dummy router address used as the EIP-712 `verifyingContract` in these tests.
+    // The tests only assert signature validity / recovery, not fixture equality,
+    // so any 20-byte value works — keeps the real router address out of tests.
+    const TEST_ROUTER: &str = "0x0000000000000000000000000000000000000042";
+
     fn test_seed() -> Vec<u8> {
         hex::decode(TEST_SEED_HEX).unwrap()
     }
@@ -328,7 +333,7 @@ mod tests {
                 addr("0x6c84a8f1c29108F47a79964b5Fe888D4f4D0dE40"),
                 addr("0x0000000000000000000000000000000000000002"),
                 U256::from(12345u64),
-                addr("0xaB6B467FC443Ca37a8E5aA11B04ea29434688d61"),
+                addr(TEST_ROUTER),
             )
             .unwrap();
 
@@ -350,7 +355,7 @@ mod tests {
                 addr("0x6c84a8f1c29108F47a79964b5Fe888D4f4D0dE40"),
                 addr("0x0000000000000000000000000000000000000002"),
                 U256::from(100u64),
-                addr("0xaB6B467FC443Ca37a8E5aA11B04ea29434688d61"),
+                addr(TEST_ROUTER),
             )
         };
 
@@ -367,7 +372,7 @@ mod tests {
 
         let sig = signer
             .sign_eip712_router_claim(
-                addr("0xaB6B467FC443Ca37a8E5aA11B04ea29434688d61"),
+                addr(TEST_ROUTER),
                 &[1u8; 32],
                 addr("0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9"),
                 U256::from(71_000_000u64),
@@ -385,7 +390,7 @@ mod tests {
 
         let sig = signer
             .sign_eip712_router_claim_send(
-                addr("0xaB6B467FC443Ca37a8E5aA11B04ea29434688d61"),
+                addr(TEST_ROUTER),
                 &[1u8; 32],
                 addr("0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9"),
                 addr("0x0000000000000000000000000000000000000005"),
@@ -414,13 +419,13 @@ mod tests {
                 addr("0x6c84a8f1c29108F47a79964b5Fe888D4f4D0dE40"),
                 addr("0x0000000000000000000000000000000000000002"),
                 U256::from(100u64),
-                addr("0xaB6B467FC443Ca37a8E5aA11B04ea29434688d61"),
+                addr(TEST_ROUTER),
             )
             .unwrap();
 
         let router_sig = signer
             .sign_eip712_router_claim(
-                addr("0xaB6B467FC443Ca37a8E5aA11B04ea29434688d61"),
+                addr(TEST_ROUTER),
                 &preimage,
                 addr("0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9"),
                 U256::from(100u64),
@@ -479,7 +484,7 @@ mod tests {
             name: Some("Router".into()),
             version: Some("2".into()),
             chain_id: Some(U256::from(42161u64)),
-            verifying_contract: Some(addr("0xaB6B467FC443Ca37a8E5aA11B04ea29434688d61")),
+            verifying_contract: Some(addr(TEST_ROUTER)),
             salt: None,
         };
 
@@ -495,7 +500,7 @@ mod tests {
 
         let sig = signer
             .sign_eip712_router_claim(
-                addr("0xaB6B467FC443Ca37a8E5aA11B04ea29434688d61"),
+                addr(TEST_ROUTER),
                 &preimage,
                 addr("0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9"),
                 U256::from(100u64),

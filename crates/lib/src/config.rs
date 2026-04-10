@@ -77,7 +77,7 @@ pub const DEFAULT_OFT_DEPLOYMENTS_URL: &str = "https://docs.usdt0.to/api/deploym
 
 /// Router contract address on Arbitrum — not available via the Boltz API.
 /// If upgraded, the old contract address remains valid.
-pub const ARBITRUM_ROUTER_ADDRESS: &str = "0xaB6B467FC443Ca37a8E5aA11B04ea29434688d61";
+pub const ARBITRUM_ROUTER_ADDRESS: &str = "0x6EA68e965fcd19b6fbC6553BABbF87a5018F9B28";
 
 /// tBTC token address on Arbitrum.
 pub const ARBITRUM_TBTC_ADDRESS: &str = "0x6c84a8f1c29108F47a79964b5Fe888D4f4D0dE40";
