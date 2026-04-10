@@ -223,34 +223,57 @@ impl AlchemyGasClient {
     }
 
     /// Step 3: Poll `wallet_getCallsStatus` until confirmed or timeout.
+    ///
+    /// A transient RPC error on a single iteration does not abort the poll
+    /// — it is stashed as `last_err` and only returned if every subsequent
+    /// attempt also fails. A receipt with status `0x0` is a terminal revert
+    /// and returns immediately.
     async fn poll_status(&self, call_id: &str) -> Result<AlchemyResult, BoltzError> {
+        let mut last_err: Option<BoltzError> = None;
+
         for attempt in 0..MAX_POLL_ATTEMPTS {
-            let status: CallsStatusResponse = self
-                .rpc_call("wallet_getCallsStatus", serde_json::json!([call_id]))
-                .await?;
-
-            if let Some(receipts) = &status.receipts
-                && !receipts.is_empty()
+            match self
+                .rpc_call::<CallsStatusResponse>(
+                    "wallet_getCallsStatus",
+                    serde_json::json!([call_id]),
+                )
+                .await
             {
-                let receipt = &receipts[0];
+                Ok(status) => {
+                    last_err = None;
 
-                // Check receipt status for safety (stricter than web app)
-                if receipt.status.as_deref() == Some("0x0") {
-                    return Err(BoltzError::Evm {
-                        reason: "Transaction reverted".to_string(),
-                        tx_hash: receipt.transaction_hash.clone(),
-                    });
+                    if let Some(receipts) = &status.receipts
+                        && !receipts.is_empty()
+                    {
+                        let receipt = &receipts[0];
+
+                        if receipt.status.as_deref() == Some("0x0") {
+                            return Err(BoltzError::Evm {
+                                reason: "Transaction reverted".to_string(),
+                                tx_hash: receipt.transaction_hash.clone(),
+                            });
+                        }
+
+                        let tx_hash =
+                            receipt
+                                .transaction_hash
+                                .clone()
+                                .ok_or_else(|| BoltzError::Evm {
+                                    reason: "Receipt missing transactionHash".to_string(),
+                                    tx_hash: None,
+                                })?;
+
+                        return Ok(AlchemyResult { tx_hash });
+                    }
                 }
-
-                let tx_hash = receipt
-                    .transaction_hash
-                    .clone()
-                    .ok_or_else(|| BoltzError::Evm {
-                        reason: "Receipt missing transactionHash".to_string(),
-                        tx_hash: None,
-                    })?;
-
-                return Ok(AlchemyResult { tx_hash });
+                Err(e) => {
+                    tracing::debug!(
+                        attempt,
+                        error = %e,
+                        "wallet_getCallsStatus transient error, continuing poll"
+                    );
+                    last_err = Some(e);
+                }
             }
 
             if attempt < MAX_POLL_ATTEMPTS - 1 {
@@ -258,10 +281,10 @@ impl AlchemyGasClient {
             }
         }
 
-        Err(BoltzError::Evm {
+        Err(last_err.unwrap_or_else(|| BoltzError::Evm {
             reason: format!("wallet_getCallsStatus timed out after {MAX_POLL_ATTEMPTS} attempts"),
             tx_hash: None,
-        })
+        }))
     }
 
     /// Internal: send a JSON-RPC request to Alchemy.
@@ -775,6 +798,65 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("reverted"));
+    }
+
+    #[macros::async_test_all]
+    async fn test_poll_status_tolerates_transient_error() {
+        let config = AlchemyConfig {
+            api_key: "test_key".to_string(),
+            gas_policy_id: "policy_id".to_string(),
+        };
+        let signer = test_signer();
+
+        let responses = vec![
+            alchemy_rpc_success(&serde_json::json!({
+                "type": "user-operation-v070",
+                "data": { "sender": "0x1234" },
+                "signatureRequest": {
+                    "data": { "raw": format!("0x{}", hex::encode([1u8; 32])) }
+                },
+                "chainId": "0xa4b1"
+            })),
+            alchemy_rpc_success(&serde_json::json!({
+                "preparedCallIds": ["call_transient"]
+            })),
+            // First poll: HTTP 500 — must not abort.
+            HttpResponse {
+                status: 500,
+                body: "upstream unavailable".to_string(),
+            },
+            // Second poll: confirmed.
+            alchemy_rpc_success(&serde_json::json!({
+                "status": 1,
+                "receipts": [{
+                    "transactionHash": "0xrecovered",
+                    "status": "0x1",
+                    "blockHash": "0xblock",
+                    "blockNumber": "0x100",
+                    "gasUsed": "0x5208"
+                }]
+            })),
+        ];
+
+        let client = AlchemyGasClient::new(
+            &config,
+            Box::new(MockAlchemyHttpClient::new(responses)),
+            signer,
+        );
+
+        let result = client
+            .send_sponsored_calls(
+                vec![EvmCall {
+                    to: "0x0000000000000000000000000000000000000042".to_string(),
+                    value: None,
+                    data: Some("0xdeadbeef".to_string()),
+                }],
+                42161,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.tx_hash, "0xrecovered");
     }
 
     #[macros::test_all]
