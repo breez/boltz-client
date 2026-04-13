@@ -1,5 +1,6 @@
-//! OFT deployment registry — fetches `LayerZero` endpoint IDs and OFT contract
-//! addresses from the USDT0 API at runtime, matching the Boltz web app.
+//! OFT deployment registry — fetches `LayerZero` endpoint IDs and OFT
+//! contract addresses from the USDT0 deployments API at runtime rather than
+//! hard-coding them, because the mesh composition changes over time.
 //!
 //! The USDT0 API exposes two meshes:
 //! - `native` — the `OFTv2` mesh that carries most EVM chains (Arbitrum,
@@ -67,7 +68,10 @@ pub fn ceil_div(numerator: u128, denominator: u128) -> Option<u128> {
     Some(bumped / denominator)
 }
 
-/// Which USDT0 mesh a chain belongs to. Mirrors the web app's `Usdt0Kind`.
+/// Which USDT0 mesh a chain belongs to. Native-mesh and legacy-mesh
+/// deployments live on distinct source-side OFT contracts with different
+/// fee models, so the destination's mesh determines which source contract
+/// the claim path quotes and bridges through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Usdt0Kind {
     Native,

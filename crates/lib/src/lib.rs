@@ -6,6 +6,7 @@ pub mod evm;
 pub mod keys;
 pub mod models;
 pub mod recover;
+pub mod solana;
 pub mod store;
 pub mod swap;
 
@@ -28,6 +29,7 @@ use evm::alchemy::AlchemyGasClient;
 use evm::oft::OftDeployments;
 use evm::provider::EvmProvider;
 use evm::signing::EvmSigner;
+use solana::rpc::SolanaRpcClient;
 use swap::manager::SwapManager;
 use swap::reverse::{ReverseSwapExecutor, current_unix_timestamp};
 
@@ -106,6 +108,11 @@ impl BoltzService {
                 code: None,
             })?;
 
+        let solana_rpc = SolanaRpcClient::new(
+            Box::new(DefaultHttpClient::new(None)),
+            config.solana_rpc_url.clone(),
+        );
+
         let executor = Arc::new(ReverseSwapExecutor::new(
             api_client,
             key_manager,
@@ -114,6 +121,7 @@ impl BoltzService {
             oft_deployments,
             config,
             erc20swap_address,
+            solana_rpc,
         ));
 
         let event_emitter = Arc::new(EventEmitter::new());
@@ -238,8 +246,10 @@ impl BoltzService {
             Chain::Polygon,
             Chain::Rootstock,
             Chain::Sei,
+            Chain::Solana,
             Chain::Stable,
             Chain::Tempo,
+            Chain::Tron,
             Chain::Unichain,
             Chain::XLayer,
         ]

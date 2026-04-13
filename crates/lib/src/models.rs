@@ -104,12 +104,12 @@ pub enum Chain {
     Polygon,
     Rootstock,
     Sei,
+    Solana,
     Stable,
     Tempo,
+    Tron,
     Unichain,
     XLayer,
-    Solana,
-    Tron,
 }
 
 impl Chain {

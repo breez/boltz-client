@@ -19,6 +19,11 @@ pub struct BoltzConfig {
     pub slippage_bps: u32,
     /// URL for fetching OFT (USDT0) deployment data.
     pub oft_deployments_url: String,
+    /// Solana JSON-RPC endpoint used when the destination chain is Solana.
+    /// Queried to check whether the recipient's `Associated Token Account`
+    /// already exists so the cross-chain message can pre-fund its creation
+    /// when it doesn't. Unused for EVM and Tron destinations.
+    pub solana_rpc_url: String,
 }
 
 /// Alchemy configuration for EIP-7702 gas abstraction.
@@ -48,6 +53,7 @@ impl BoltzConfig {
             referral_id,
             slippage_bps: DEFAULT_SLIPPAGE_BPS,
             oft_deployments_url: DEFAULT_OFT_DEPLOYMENTS_URL.to_string(),
+            solana_rpc_url: DEFAULT_SOLANA_RPC_URL.to_string(),
         }
     }
 
@@ -84,6 +90,17 @@ pub const ARBITRUM_TBTC_ADDRESS: &str = "0x6c84a8f1c29108F47a79964b5Fe888D4f4D0d
 
 /// USDT token address on Arbitrum.
 pub const ARBITRUM_USDT_ADDRESS: &str = "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9";
+
+/// SPL token mint for USDT0 on Solana. Used to derive the recipient's
+/// `Associated Token Account` when building the `LayerZero` OFT send from
+/// Arbitrum. Not exposed by the USDT0 deployments API.
+pub const SOLANA_USDT0_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
+
+/// Default Solana JSON-RPC endpoint used when the destination is Solana.
+/// Public mainnet endpoint — fine for casual use but rate-limited, so
+/// callers with non-trivial throughput should override with a dedicated
+/// provider.
+pub const DEFAULT_SOLANA_RPC_URL: &str = "https://api.mainnet.solana.com";
 
 /// tBTC has 18 decimals on EVM. Sats have 8 decimals. Conversion factor = 10^10.
 pub const SATS_TO_TBTC_FACTOR: u64 = 10_000_000_000;

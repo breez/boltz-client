@@ -41,7 +41,11 @@ tiny-keccak = { version = "2", features = ["keccak"] }
 # Base58 decoding for Solana / Tron destination addresses
 bs58 = { version = "0.5", default-features = false, features = ["alloc"] }
 
-# Key derivation (BIP-32 over secp256k1, matching Boltz web app's @scure/bip32)
+# ed25519 point validation for Solana Program Derived Address derivation
+# (associated token account lookup). Only the curve primitive is used — no signing.
+curve25519-dalek = { version = "4", default-features = false, features = ["alloc"] }
+
+# Key derivation (BIP-32 over secp256k1, matching the `@scure/bip32` JS library)
 bip32 = "0.5"
 
 # BOLT11 invoice decoding (amount validation in swap response)

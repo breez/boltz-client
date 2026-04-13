@@ -375,7 +375,9 @@ mod tests {
         };
 
         let json = serde_json::to_value(&req).unwrap();
-        // amounts must be serialized as strings (matching web app BigInt.toString())
+        // Amounts must be serialized as decimal strings — the Boltz API
+        // rejects integer-typed amounts because JS clients send `BigInt`s
+        // stringified.
         assert_eq!(json["amountIn"], "1000000000000000000");
         assert_eq!(json["amountOutMin"], "71000000");
         assert_eq!(json["recipient"], "0xRouterAddress");

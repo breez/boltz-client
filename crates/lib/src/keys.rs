@@ -7,20 +7,20 @@ use crate::error::BoltzError;
 
 /// Manages EVM key derivation from a BIP-32 master seed.
 ///
-/// Key identity model (matching the Boltz web app):
+/// Key identity model:
 /// - **Gas signer** (`m/44/{chainId}/1/0`): Signs all EVM transactions, used as `claimAddress`.
 /// - **Per-swap preimage key** (`m/44/{chainId}/0/0/{index}`): Deterministic preimage source.
 ///
-/// All derivation levels are NON-HARDENED to match the Boltz web app's `@scure/bip32`
-/// derivation paths. This ensures key compatibility: the same mnemonic produces the
-/// same keys in both the web app and this SDK.
+/// All derivation levels are NON-HARDENED so that the same mnemonic
+/// produces the same keys across any client using the same derivation
+/// scheme — including the Boltz backend's restore endpoint
+/// (`POST /v2/swap/restore`), which derives child public keys from the
+/// master xpub without access to private keys. Hardened derivation would
+/// make that restore path impossible.
 ///
-/// Non-hardened derivation is required for the Boltz backend's restore endpoint
-/// (`POST /v2/swap/restore`), which derives child public keys from the master xpub
-/// without access to private keys. Hardened derivation would make this impossible.
-/// As of 2026-04, restore only works for BTC/L-BTC swaps (the backend doesn't store
-/// `claimPublicKey` for EVM swaps), but there are no technical blockers preventing
-/// future support — the web app already sends `claimPublicKey` for EVM swaps.
+/// As of 2026-04, restore only works for BTC/L-BTC swaps (the backend
+/// doesn't store `claimPublicKey` for EVM swaps), but there are no
+/// technical blockers preventing future support.
 pub struct EvmKeyManager {
     master_key: XPrv,
 }
@@ -367,11 +367,11 @@ mod tests {
         );
     }
 
-    // Cross-referenced test vectors: values verified against Boltz web app's @scure/bip32
+    // Cross-referenced test vectors: values verified against `@scure/bip32`
     // using the same seed. See test_vectors/generate.mjs for the JS script.
     //
     // Seed: "abandon" x11 + "about" mnemonic (empty passphrase)
-    // All paths use NON-HARDENED derivation (matching Boltz web app).
+    // All paths use NON-HARDENED derivation.
 
     #[macros::test_all]
     fn test_known_derivation_gas_signer() {

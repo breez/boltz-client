@@ -1,13 +1,11 @@
 #![allow(dead_code)]
 //! Docker command helpers for the Boltz regtest stack.
-//! Mirrors the web app's `e2e/utils.ts` patterns.
 
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
 /// Execute a command inside the `boltz-scripts` container.
-/// Equivalent to the web app's `execCommand()`.
 pub fn exec_boltz_scripts(cmd: &str) -> Result<String> {
     let full_cmd = format!("source /etc/profile.d/utils.sh && {cmd}");
     let output = Command::new("docker")
@@ -24,7 +22,6 @@ pub fn exec_boltz_scripts(cmd: &str) -> Result<String> {
 }
 
 /// Execute a command via `boltzr-cli` inside the `boltz-backend` container.
-/// Equivalent to the web app's `boltzrCli()`.
 pub fn exec_boltzr_cli(cmd: &str) -> Result<String> {
     let output = Command::new("docker")
         .args([

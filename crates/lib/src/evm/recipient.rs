@@ -140,9 +140,10 @@ mod tests {
 
     #[macros::test_all]
     fn solana_recipient_roundtrips_non_trivial_pubkey() {
-        // The web app's canonical valid Solana recipient (oft.spec.ts:27).
-        // Verifies the full base58 alphabet (not just '1'-as-zero) by
-        // encoding the decoded bytes back and asserting bit-exact match.
+        // An arbitrary valid Solana pubkey that exercises the full base58
+        // alphabet (not just '1'-as-zero). Encoding the decoded bytes back
+        // and asserting a bit-exact match catches any bs58 encode/decode
+        // asymmetry that zero-only vectors would miss.
         let addr = "BZkwksSEeHrCVS3HeewBJKEBTEEuwnEqpkHqEg1dRpuE";
         let encoded = encode_oft_recipient(NetworkTransport::Solana, addr).unwrap();
         assert_eq!(encoded.len(), 32);

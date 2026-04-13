@@ -1,11 +1,15 @@
-use alloy_primitives::{FixedBytes, U256};
+use std::collections::HashSet;
+use std::sync::Mutex;
+
+use alloy_primitives::{Bytes, FixedBytes, U256};
 use lightning_invoice::Bolt11Invoice;
 
 use crate::api::BoltzApiClient;
 use crate::api::types::{EncodeRequest, QuoteResponse, ReversePairInfo};
 use crate::config::{
     ARBITRUM_ERC20SWAP_DEPLOY_BLOCK, ARBITRUM_ROUTER_ADDRESS, ARBITRUM_TBTC_ADDRESS,
-    ARBITRUM_USDT_ADDRESS, BoltzConfig, MAX_SLIPPAGE_BPS, SATS_TO_TBTC_FACTOR, ZERO_ADDRESS,
+    ARBITRUM_USDT_ADDRESS, BoltzConfig, MAX_SLIPPAGE_BPS, SATS_TO_TBTC_FACTOR, SOLANA_USDT0_MINT,
+    ZERO_ADDRESS,
 };
 use crate::error::BoltzError;
 use crate::evm::alchemy::{AlchemyGasClient, EvmCall};
@@ -13,15 +17,18 @@ use crate::evm::contracts::{
     self, ClaimSendAuthorization, Erc20Claim, SendData, encode_claim_erc20_execute,
     encode_claim_erc20_execute_oft, parse_address, quote_calldata_to_call,
 };
+use crate::evm::lz_options::build_extra_options;
 use crate::evm::oft::{OftDeployments, Usdt0Kind, legacy_mesh_source_amount};
 use crate::evm::provider::EvmProvider;
-use crate::evm::recipient::encode_oft_recipient;
+use crate::evm::recipient::{encode_oft_recipient, is_valid_destination_address};
 use crate::evm::signing::EvmSigner;
 use crate::keys::EvmKeyManager;
 use crate::models::{
     BoltzSwap, BoltzSwapStatus, Chain, NetworkTransport, PreparedSwap, SwapLimits,
 };
 use crate::recover::{self, RecoverableSwap};
+use crate::solana::ata::derive_ata;
+use crate::solana::rpc::SolanaRpcClient;
 
 /// Maximum claim retries (quote may go stale between encode and submit).
 const MAX_CLAIM_RETRIES: u32 = 5;
@@ -39,9 +46,19 @@ pub(crate) struct ReverseSwapExecutor {
     oft_deployments: OftDeployments,
     pub(crate) config: BoltzConfig,
     pub(crate) erc20swap_address: String,
+    /// Used only when the destination chain is Solana, to query whether the
+    /// recipient's Associated Token Account already exists. Always
+    /// constructed — `BoltzConfig::solana_rpc_url` has a mainnet default.
+    solana_rpc: SolanaRpcClient,
+    /// Recipient pubkeys (base58) whose USDT0 Associated Token Account has
+    /// been observed to already exist on-chain. Asymmetric cache: only
+    /// "exists" answers are memoised — "doesn't exist" is not, because the
+    /// user may have created the ATA between calls.
+    ata_cache: Mutex<HashSet<String>>,
 }
 
 impl ReverseSwapExecutor {
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         api_client: BoltzApiClient,
         key_manager: EvmKeyManager,
@@ -50,6 +67,7 @@ impl ReverseSwapExecutor {
         oft_deployments: OftDeployments,
         config: BoltzConfig,
         erc20swap_address: String,
+        solana_rpc: SolanaRpcClient,
     ) -> Self {
         Self {
             api_client,
@@ -59,6 +77,8 @@ impl ReverseSwapExecutor {
             oft_deployments,
             config,
             erc20swap_address,
+            solana_rpc,
+            ata_cache: Mutex::new(HashSet::new()),
         }
     }
 
@@ -73,11 +93,19 @@ impl ReverseSwapExecutor {
 
     /// Prepare a reverse swap quote. No side effects.
     ///
-    /// Matches the web app's `calculateSendAmount` flow, working backwards:
-    /// 1. For cross-chain: invert OFT (find USDT on Arbitrum needed to deliver target on destination)
-    /// 2. Add OFT messaging fee cost (in USDT)
-    /// 3. DEX quote: how much tBTC for the total USDT needed
-    /// 4. Apply Boltz fee to get total sats needed
+    /// Works backwards from the caller's target USDT amount:
+    ///
+    /// 1. Same-chain: one DEX quote (tBTC ← USDT for the target amount);
+    ///    floor to sats; apply the Boltz reverse fee.
+    /// 2. Cross-chain: invert the OFT to get the USDT needed on Arbitrum,
+    ///    quote the LZ messaging fee, then convert **each** leg to tBTC
+    ///    sats independently (tBTC ← USDT and tBTC ← ETH), floor each to
+    ///    sats, sum, and apply the Boltz reverse fee.
+    ///
+    /// The cross-chain path splits the tBTC conversion into two floored
+    /// legs rather than summing in USDT and flooring once: pricing the
+    /// messaging fee against tBTC directly keeps both legs on the same
+    /// DEX pools and avoids a 1-sat drift from combined-flooring.
     pub async fn prepare(
         &self,
         destination: &str,
@@ -90,41 +118,54 @@ impl ReverseSwapExecutor {
             )));
         }
 
-        require_evm_destination(&chain)?;
-        // Validate destination is a well-formed EVM address before committing to a swap
-        parse_address(destination)?;
+        validate_destination(&chain, destination)?;
 
         let tbtc_pair = self.fetch_tbtc_pair().await?;
 
-        // Step 1+2: Determine total USDT needed on Arbitrum
-        let total_usdt_on_arb = if chain.is_source_chain() {
-            u128::from(usdt_amount)
+        // Compute the LayerZero executor options for this (chain, destination)
+        // pair. Solana destinations may need an ATA-creation hint, which
+        // affects the messaging fee and must feed every quote and the final
+        // `SendData` so the router signature matches on-chain execution.
+        let extra_options = self.compute_extra_options(&chain, destination).await?;
+
+        // Compute the total tBTC claim amount (in sats) needed to fund
+        // the destination-side delivery.
+        let total_tbtc_sats = if chain.is_source_chain() {
+            // Same-chain: single DEX quote for how much tBTC to buy
+            // `usdt_amount` USDT, then floor to sats.
+            let tbtc_wei = self.fetch_quote_out_tbtc(usdt_amount).await?;
+            tbtc_wei_to_sats_u64(tbtc_wei)?
         } else {
-            // Matching web app's invertPostOftQuote:
-            // Find how much USDT on Arbitrum is needed to deliver usdt_amount on destination
+            // Cross-chain: find how much USDT on Arbitrum is needed to
+            // deliver `usdt_amount` on the destination after OFT fees, then
+            // convert the USDT leg and the LZ messaging-fee leg to tBTC
+            // sats independently.
             let required_usdt = self
-                .estimate_oft_required_send_amount(&chain, u128::from(usdt_amount))
+                .estimate_oft_required_send_amount(&chain, u128::from(usdt_amount), &extra_options)
                 .await?;
-            // Get messaging fee and convert to USDT cost
-            let (msg_fee_native, _) = self.quote_oft_messaging_fee(&chain, required_usdt).await?;
-            let msg_fee_usdt = if msg_fee_native == 0 {
-                0u128
+            let (msg_fee_native, _) = self
+                .quote_oft_messaging_fee(&chain, required_usdt, &extra_options)
+                .await?;
+
+            let required_usdt_u64 = u64::try_from(required_usdt)
+                .map_err(|_| BoltzError::Generic("USDT amount overflow".into()))?;
+            let usdt_leg_tbtc_wei = self.fetch_quote_out_tbtc(required_usdt_u64).await?;
+            let usdt_leg_tbtc_sats = tbtc_wei_to_sats_u64(usdt_leg_tbtc_wei)?;
+
+            let msg_fee_tbtc_sats = if msg_fee_native == 0 {
+                0u64
             } else {
-                self.fetch_quote_out_usdt_for_eth(msg_fee_native).await?
+                let tbtc_wei = self.fetch_quote_out_tbtc_for_eth(msg_fee_native).await?;
+                tbtc_wei_to_sats_u64(tbtc_wei)?
             };
-            // Total = OFT required amount + messaging fee cost (both in USDT)
-            required_usdt
-                .checked_add(msg_fee_usdt)
-                .ok_or_else(|| BoltzError::Generic("USDT amount overflow".into()))?
+
+            usdt_leg_tbtc_sats
+                .checked_add(msg_fee_tbtc_sats)
+                .ok_or_else(|| BoltzError::Generic("tBTC sats overflow".into()))?
         };
 
-        // Step 3: DEX quote for the total USDT needed → tBTC
-        let total_usdt_u64 = u64::try_from(total_usdt_on_arb)
-            .map_err(|_| BoltzError::Generic("USDT amount overflow".into()))?;
-        let tbtc_evm_units = self.fetch_quote_out_tbtc(total_usdt_u64).await?;
-
-        // Step 4: Apply Boltz fee
-        let fee_calc = compute_invoice_amount(&tbtc_pair, tbtc_evm_units)?;
+        // Apply Boltz fee
+        let fee_calc = compute_invoice_amount(&tbtc_pair, total_tbtc_sats)?;
 
         // Validate against Boltz swap limits
         if fee_calc.invoice_sats < tbtc_pair.limits.minimal
@@ -154,10 +195,17 @@ impl ReverseSwapExecutor {
     /// Prepare a reverse swap quote starting from input sats.
     ///
     /// Walks the route forward:
-    /// 1. Apply Boltz fee to get onchain tBTC sats
-    /// 2. Convert sats to tBTC EVM units
-    /// 3. For cross-chain: subtract LZ messaging fee cost
-    /// 4. Get DEX quote: how much USDT for the remaining tBTC?
+    /// 1. Apply the Boltz reverse fee to get onchain tBTC sats.
+    /// 2. Same-chain: one DEX quote for how much USDT those tBTC sats buy.
+    /// 3. Cross-chain: forward-quote tBTC → USDT; quote the OFT messaging
+    ///    fee; convert the messaging fee to **tBTC sats** (not USDT) via
+    ///    `quote_out(tBTC, ETH)`; subtract in tBTC-sat domain; re-quote
+    ///    the DEX with the adjusted tBTC amount; then re-quote the OFT to
+    ///    get the final destination receive amount.
+    ///
+    /// Subtracting the messaging fee in tBTC sats rather than in USDT
+    /// keeps both legs on the same tBTC↔USDT / tBTC↔ETH DEX pools, so
+    /// cross-chain quotes agree to the sat in both directions.
     pub async fn prepare_from_sats(
         &self,
         destination: &str,
@@ -170,8 +218,7 @@ impl ReverseSwapExecutor {
             )));
         }
 
-        require_evm_destination(&chain)?;
-        parse_address(destination)?;
+        validate_destination(&chain, destination)?;
 
         let tbtc_pair = self.fetch_tbtc_pair().await?;
 
@@ -193,39 +240,54 @@ impl ReverseSwapExecutor {
             .checked_mul(u128::from(SATS_TO_TBTC_FACTOR))
             .ok_or_else(|| BoltzError::Generic("tBTC amount overflow".into()))?;
 
+        // Compute LayerZero executor options for this destination — same
+        // reasoning as `prepare`: any ATA-creation hint must feed every quote
+        // call for the returned fee to match on-chain execution.
+        let extra_options = self.compute_extra_options(&chain, destination).await?;
+
         let usdt_output = if chain.is_source_chain() {
-            // Same-chain: simple DEX quote
+            // Same-chain: single forward DEX quote tBTC → USDT.
             self.fetch_quote_in_usdt(tbtc_evm_units).await?
         } else {
-            // Cross-chain: matching web app's applyPostOftQuote exactly.
-            // 1. DEX quote with full tBTC → initial USDT
+            // Cross-chain: forward DEX quote tBTC → USDT, quote OFT for the
+            // messaging fee, then convert that fee to tBTC sats directly
+            // via a second DEX quote and subtract in tBTC-sat domain.
             let initial_usdt = self.fetch_quote_in_usdt(tbtc_evm_units).await?;
-            // 2. Quote OFT with that USDT to get messaging fee
             let (msg_fee_native, _) = self
-                .quote_oft_messaging_fee(&chain, u128::from(initial_usdt))
+                .quote_oft_messaging_fee(&chain, u128::from(initial_usdt), &extra_options)
                 .await?;
-            // 3. Convert messaging fee (ETH) to USDT cost
-            let fee_usdt = if msg_fee_native == 0 {
-                0u128
+
+            let msg_fee_tbtc_sats = if msg_fee_native == 0 {
+                0u64
             } else {
-                self.fetch_quote_out_usdt_for_eth(msg_fee_native).await?
+                let tbtc_wei = self.fetch_quote_out_tbtc_for_eth(msg_fee_native).await?;
+                tbtc_wei_to_sats_u64(tbtc_wei)?
             };
-            // 4. Subtract USDT cost from USDT amount
-            let adjusted_usdt =
-                u128::from(initial_usdt)
-                    .checked_sub(fee_usdt)
-                    .ok_or_else(|| {
-                        BoltzError::Generic(
-                            "Amount too small to cover OFT cross-chain messaging fee".into(),
-                        )
-                    })?;
-            if adjusted_usdt == 0 {
+
+            let adjusted_tbtc_sats = fee_calc
+                .onchain_sats
+                .checked_sub(msg_fee_tbtc_sats)
+                .ok_or_else(|| {
+                    BoltzError::Generic(
+                        "Amount too small to cover OFT cross-chain messaging fee".into(),
+                    )
+                })?;
+            if adjusted_tbtc_sats == 0 {
                 return Err(BoltzError::Generic(
                     "Amount too small to cover OFT cross-chain messaging fee".into(),
                 ));
             }
-            // 5. Re-quote OFT with adjusted USDT to get final received amount
-            let (_, oft_received) = self.quote_oft_messaging_fee(&chain, adjusted_usdt).await?;
+
+            // Re-quote the DEX with the adjusted tBTC claim amount to get
+            // the USDT that actually arrives on Arbitrum, then re-quote the
+            // OFT to translate that to the destination chain's USDT.
+            let adjusted_tbtc_evm_units = u128::from(adjusted_tbtc_sats)
+                .checked_mul(u128::from(SATS_TO_TBTC_FACTOR))
+                .ok_or_else(|| BoltzError::Generic("tBTC amount overflow".into()))?;
+            let adjusted_usdt = self.fetch_quote_in_usdt(adjusted_tbtc_evm_units).await?;
+            let (_, oft_received) = self
+                .quote_oft_messaging_fee(&chain, u128::from(adjusted_usdt), &extra_options)
+                .await?;
             u64::try_from(oft_received)
                 .map_err(|_| BoltzError::Generic("USDT amount overflow".into()))?
         };
@@ -322,9 +384,9 @@ impl ReverseSwapExecutor {
             )));
         }
 
-        // TODO: Validate timeout_block_height for reasonableness (minimum delta
-        // from current block). A very short timeout could allow Boltz to refund
-        // before the user can claim. The Boltz web app has the same gap.
+        // TODO: Validate timeout_block_height for reasonableness (minimum
+        // delta from current block). A very short timeout could allow Boltz
+        // to refund before the user can claim.
 
         let now = current_unix_timestamp();
         Ok(BoltzSwap {
@@ -448,8 +510,8 @@ impl ReverseSwapExecutor {
                 u128::from(usdt_amount),
             )
             .await?;
-        // "out" direction: pick lowest amount (least input needed for desired output),
-        // matching web app's sortDexQuotes("out") which sorts ascending.
+        // "out" direction: pick the lowest amount (least input needed for
+        // the desired output).
         let quote = pick_best_quote(&quotes, QuoteDirection::Out)?;
         if quote == 0 {
             return Err(BoltzError::InvalidQuote(
@@ -741,7 +803,7 @@ impl ReverseSwapExecutor {
 
     /// Cross-chain claim: claim tBTC + DEX swap to USDT + OFT bridge to destination chain.
     ///
-    /// Two-pass approach matching the Boltz web app (`TransactionConfirmed.tsx`):
+    /// Two-pass approach:
     /// - Pass 1: estimate `LayerZero` messaging fee cost in tBTC
     /// - Pass 2: re-quote with adjusted tBTC split (trade vs fee)
     #[expect(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -783,6 +845,17 @@ impl ReverseSwapExecutor {
             .map_err(|_| BoltzError::Generic("tBTC amount too large".into()))?;
         let router_str = addrs.router.to_string();
 
+        // Compute the LayerZero executor options once for this claim. Must be
+        // the same bytes on every subsequent `quoteOFT` / `quoteSend` call and
+        // in the `SendData` that the router signs over, or the on-chain
+        // `claimERC20ExecuteOft` signature verification fails. For Solana
+        // destinations whose ATA is missing, this carries the `lzReceive`
+        // option with `solanaAtaRentExemptLamports` so the destination
+        // executor creates the recipient's token account on arrival.
+        let extra_options = self
+            .compute_extra_options(&swap.destination_chain, &swap.destination_address)
+            .await?;
+
         // ─── Pass 1: estimate LZ fee cost ─────────────────────────────
         // Get initial DEX quote with full tBTC to estimate USDT output
         let initial_trade = pick_best_quote_with_data(
@@ -804,6 +877,7 @@ impl ReverseSwapExecutor {
             addrs.destination_bytes32,
             U256::from(initial_trade.amount),
             U256::ZERO,
+            extra_options.clone(),
         );
         let (_, initial_receipt) = self
             .quote_oft(source_oft_address, &initial_send_param)
@@ -875,6 +949,7 @@ impl ReverseSwapExecutor {
                 addrs.destination_bytes32,
                 U256::from(trade_best.amount),
                 U256::ZERO,
+                extra_options.clone(),
             );
             let (_, drift_receipt) = self.quote_oft(source_oft_address, &drift_param).await?;
             let raw_dest_amount: u128 = drift_receipt
@@ -908,6 +983,7 @@ impl ReverseSwapExecutor {
             addrs.destination_bytes32,
             U256::from(min_usdt_out),
             U256::ZERO,
+            extra_options.clone(),
         );
         let (_, final_receipt) = self
             .quote_oft(source_oft_address, &final_send_param)
@@ -954,11 +1030,10 @@ impl ReverseSwapExecutor {
 
         // Fee calls: tBTC -> ETH (for LZ messaging)
         // NOTE: amount_out_min uses the Pass-1 native_fee, not the final_msg_fee
-        // re-quoted above. If the LZ fee increases between passes the fee swap
-        // may yield less ETH than needed and the transaction reverts (no fund
-        // loss — just wasted sponsored gas). The fee_with_slippage buffer on
-        // the input side absorbs typical fee movement. The Boltz web app has
-        // the same design.
+        // re-quoted above. If the LZ fee increases between passes the fee
+        // swap may yield less ETH than needed and the transaction reverts
+        // (no fund loss — just wasted sponsored gas). The fee_with_slippage
+        // buffer on the input side absorbs typical fee movement.
         let fee_encode = self
             .api_client
             .encode_quote(
@@ -982,15 +1057,16 @@ impl ReverseSwapExecutor {
         all_calls.extend(fee_calls);
 
         // ─── Optional OFT approval top-up ─────────────────────────────
-        // Matches the web app's `buildOftApprovalCall`. For the current
-        // Arbitrum native-mesh OFT this is a no-op (`approvalRequired()`
-        // returns false because the mint/burn variant bypasses ERC20
-        // transfers). It will kick in for legacy-mesh destinations
+        // For the current Arbitrum native-mesh OFT this is a no-op
+        // (`approvalRequired()` returns false because the mint/burn variant
+        // bypasses ERC20 transfers). It kicks in for legacy-mesh destinations
         // (Solana/Tron/Celo/TON), whose source OFT is a classical Adapter
-        // requiring `transferFrom` allowance.
+        // that internally does `token.transferFrom(msg.sender, oft, amount)`
+        // and therefore needs a standing ERC20 allowance.
         //
         // The amount passed to the gate is the raw pre-slippage DEX quote
-        // (`trade_best.amount`), matching the web app's `amountOut`.
+        // (`trade_best.amount`) — matching against the slippage-reduced
+        // value would under-approve when slippage eats a big chunk.
         if let Some(approval_call) = self
             .build_oft_approval_call(
                 addrs.router,
@@ -1004,10 +1080,14 @@ impl ReverseSwapExecutor {
         }
 
         // ─── Build SendData + hash ────────────────────────────────────
+        // `extraOptions` here MUST match the bytes used in every `quoteOFT` /
+        // `quoteSend` call above — the router signs over SendData, so any
+        // drift between what is signed and what the OFT executes flips the
+        // on-chain signature verification to revert.
         let send_data = SendData {
             dstEid: dst_eid,
             to: addrs.destination_bytes32,
-            extraOptions: vec![].into(),
+            extraOptions: extra_options,
             composeMsg: vec![].into(),
             oftCmd: vec![].into(),
         };
@@ -1108,6 +1188,7 @@ impl ReverseSwapExecutor {
         &self,
         chain: &Chain,
         target_amount: u128,
+        extra_options: &Bytes,
     ) -> Result<u128, BoltzError> {
         if target_amount == 0 {
             return Ok(0);
@@ -1133,7 +1214,9 @@ impl ReverseSwapExecutor {
         // 32 cannot overflow.
         let mut attempts = 0u32;
         loop {
-            let (_, received) = self.quote_oft_messaging_fee(chain, high).await?;
+            let (_, received) = self
+                .quote_oft_messaging_fee(chain, high, extra_options)
+                .await?;
             if received >= target_amount {
                 break;
             }
@@ -1161,7 +1244,9 @@ impl ReverseSwapExecutor {
         #[expect(clippy::arithmetic_side_effects)]
         while low < high {
             let mid = low + (high - low) / 2;
-            let (_, received) = self.quote_oft_messaging_fee(chain, mid).await?;
+            let (_, received) = self
+                .quote_oft_messaging_fee(chain, mid, extra_options)
+                .await?;
             if received >= target_amount {
                 high = mid;
             } else {
@@ -1174,10 +1259,16 @@ impl ReverseSwapExecutor {
 
     /// Quote OFT messaging fee and received amount for a given USDT amount and destination chain.
     /// Returns `(native_fee, amount_received_on_destination)`.
+    ///
+    /// `extra_options` must match whatever will eventually be submitted in
+    /// the router's `claimERC20ExecuteOft` — for Solana destinations with a
+    /// missing ATA, this contains the lzReceive option that pre-funds the
+    /// account creation, which materially affects the fee.
     async fn quote_oft_messaging_fee(
         &self,
         chain: &Chain,
         usdt_amount: u128,
+        extra_options: &Bytes,
     ) -> Result<(u128, u128), BoltzError> {
         let dst_info = self.oft_deployments.get_for(chain).ok_or_else(|| {
             BoltzError::Generic(format!("No OFT deployment for destination chain {chain:?}"))
@@ -1198,6 +1289,7 @@ impl ReverseSwapExecutor {
             FixedBytes::<32>::ZERO,
             U256::from(usdt_amount),
             U256::ZERO,
+            extra_options.clone(),
         );
         let (_, receipt) = self.quote_oft(source_oft_address, &send_param).await?;
 
@@ -1217,14 +1309,65 @@ impl ReverseSwapExecutor {
         Ok((native_fee, amount_received))
     }
 
-    /// DEX quote: how much USDT needed to buy the given ETH amount.
-    /// Used to convert LZ messaging fee (in ETH) to USDT cost.
-    async fn fetch_quote_out_usdt_for_eth(&self, eth_amount: u128) -> Result<u128, BoltzError> {
+    /// DEX quote: how much tBTC (in wei) needed to buy the given ETH amount.
+    /// Used at prepare time to convert the LZ messaging fee directly into
+    /// tBTC claim cost, keeping cross-chain quotes on the tBTC↔ETH pool
+    /// instead of hopping through USDT↔ETH.
+    async fn fetch_quote_out_tbtc_for_eth(&self, eth_amount: u128) -> Result<u128, BoltzError> {
         let quotes = self
             .api_client
-            .get_quote_out("ARB", ARBITRUM_USDT_ADDRESS, ZERO_ADDRESS, eth_amount)
+            .get_quote_out("ARB", ARBITRUM_TBTC_ADDRESS, ZERO_ADDRESS, eth_amount)
             .await?;
         pick_best_quote(&quotes, QuoteDirection::Out)
+    }
+
+    // ─── LayerZero executor options ───────────────────────────────────
+
+    /// Build the `extraOptions` bytes for an OFT `SendParam` targeting the
+    /// given destination. For EVM and Tron destinations this is always empty.
+    /// For Solana, the destination's Associated Token Account must exist
+    /// before the LZ executor can deliver tokens; if the ATA is missing, the
+    /// returned blob carries an `lzReceive` option pre-funding the account
+    /// creation with `solanaAtaRentExemptLamports`.
+    ///
+    /// The result is cached per-recipient: once we've observed an ATA to
+    /// exist, future checks for the same recipient in-process skip the RPC.
+    /// "Doesn't exist" is not cached — the user may create the ATA between
+    /// calls.
+    async fn compute_extra_options(
+        &self,
+        chain: &Chain,
+        destination: &str,
+    ) -> Result<Bytes, BoltzError> {
+        if chain.transport() != NetworkTransport::Solana {
+            return Ok(Bytes::new());
+        }
+
+        // Fast path: if we've already confirmed the ATA exists for this
+        // recipient, skip the RPC.
+        let cache_hit = self
+            .ata_cache
+            .lock()
+            .map(|guard| guard.contains(destination))
+            .unwrap_or(false);
+        if cache_hit {
+            return Ok(Bytes::new());
+        }
+
+        let owner = decode_solana_pubkey(destination)?;
+        let mint = decode_solana_pubkey(SOLANA_USDT0_MINT)?;
+        let ata_bytes = derive_ata(&owner, &mint)?;
+        let ata_base58 = bs58::encode(ata_bytes).into_string();
+
+        let exists = self.solana_rpc.account_exists(&ata_base58).await?;
+        if exists {
+            if let Ok(mut guard) = self.ata_cache.lock() {
+                guard.insert(destination.to_string());
+            }
+            return Ok(Bytes::new());
+        }
+
+        Ok(Bytes::from(build_extra_options(true)))
     }
 
     // ─── OFT quoting helpers ──────────────────────────────────────────
@@ -1253,8 +1396,7 @@ impl ReverseSwapExecutor {
     }
 
     /// Build an `approve(oft, MaxUint256)` call to top up the Router's
-    /// allowance on the source OFT, mirroring the web app's
-    /// `buildOftApprovalCall` in `src/utils/oft/oft.ts`.
+    /// allowance on the source OFT when the OFT is a classical Adapter.
     ///
     /// The OFT's `approvalRequired()` distinguishes mint/burn variants
     /// (return false — no `transferFrom` path, no allowance consumed) from
@@ -1262,7 +1404,7 @@ impl ReverseSwapExecutor {
     /// `token.transferFrom(msg.sender, oft, amount)`). For the current
     /// Arbitrum → EVM native-mesh flow this is always a no-op; it becomes
     /// load-bearing once legacy-mesh destinations (Solana/Tron/Celo/TON) are
-    /// wired up, since those route through the legacy-mesh Arbitrum OFT
+    /// routed, since those bridge through the legacy-mesh Arbitrum OFT
     /// Adapter.
     ///
     /// The actual decision (`allowance < amount * 10` → top up to
@@ -1284,8 +1426,7 @@ impl ReverseSwapExecutor {
         let required = contracts::decode_approval_required_return(&result)?;
         if !required {
             // Short-circuit: native-mesh mint/burn OFTs never need an ERC20
-            // allowance. Skipping the second eth_call matches the web app's
-            // early return in `buildOftApprovalCall`.
+            // allowance, so skip the allowance `eth_call` entirely.
             return Ok(None);
         }
 
@@ -1348,8 +1489,8 @@ impl ReverseSwapExecutor {
                 amount_in,
             )
             .await?;
-        // "in" direction: pick highest output (best return for our input),
-        // matching web app's sortDexQuotes("in") which sorts descending.
+        // "in" direction: pick the highest output (best return for our
+        // input).
         let best = pick_best_quote_with_data(&quotes, QuoteDirection::In)?;
         if best.amount == 0 {
             return Err(BoltzError::InvalidQuote(
@@ -1388,8 +1529,7 @@ impl ReverseSwapExecutor {
 
 /// Decide whether the Router needs an `approve(oft, MaxUint256)` top-up on
 /// the source OFT, given the current on-chain allowance and the amount
-/// about to flow through the OFT. Mirrors the `allowance < amount * 10`
-/// gate in the web app's `buildOftApprovalCall`.
+/// about to flow through the OFT. Gate: `allowance < amount * 10`.
 ///
 /// Caller must have already verified `oft.approvalRequired() == true`;
 /// this function unconditionally assumes the OFT is an Adapter.
@@ -1461,20 +1601,20 @@ struct FeeCalc {
     onchain_sats: u64,
 }
 
-/// Compute the total sats needed from tBTC EVM units and Boltz pair info.
+/// Compute the total sats needed from an already-floored tBTC-sats claim
+/// amount and Boltz pair info.
 ///
-/// Matches the Boltz web app formula for reverse swaps (using integer math):
+/// Formula (integer math):
 ///   `invoiceAmount = ceil((receiveAmount + minerFee) / (1 - percentage/100))`
 ///
-/// The percentage from the API (e.g. `0.25` for 0.25%) is parsed from its string
-/// representation to avoid floating-point imprecision.
-fn compute_invoice_amount(
-    pair: &ReversePairInfo,
-    tbtc_evm_units: u128,
-) -> Result<FeeCalc, BoltzError> {
-    let sats_factor = u128::from(SATS_TO_TBTC_FACTOR);
-    // Division by constant factor cannot fail
-    let tbtc_sats = tbtc_evm_units.checked_div(sats_factor).unwrap_or(0);
+/// The percentage from the API (e.g. `0.25` for 0.25%) is parsed from its
+/// string representation to avoid floating-point imprecision.
+///
+/// Callers are responsible for converting tBTC EVM units (wei) to sats by
+/// flooring with `SATS_TO_TBTC_FACTOR`. Cross-chain quotes floor each DEX
+/// leg independently before summing.
+fn compute_invoice_amount(pair: &ReversePairInfo, tbtc_sats: u64) -> Result<FeeCalc, BoltzError> {
+    let tbtc_sats = u128::from(tbtc_sats);
 
     let miner_fees = u128::from(pair.fees.miner_fees.claim)
         .checked_add(u128::from(pair.fees.miner_fees.lockup))
@@ -1485,7 +1625,7 @@ fn compute_invoice_amount(
     // i.e., 0.25% → 25 out of 10000.
     let pct_bps = parse_percentage_to_bps(pair.fees.percentage)?;
 
-    // Web app formula: invoiceAmount = ceil((receiveAmount + minerFee) / (1 - pct/100))
+    // invoiceAmount = ceil((receiveAmount + minerFee) / (1 - pct/100))
     // In integer form: ceil((base * 10000) / (10000 - pct_bps))
     let base = tbtc_sats
         .checked_add(miner_fees)
@@ -1545,7 +1685,7 @@ fn parse_percentage_to_bps(percentage: f64) -> Result<u64, BoltzError> {
 
 /// Compute the onchain amount from invoice sats (forward direction).
 ///
-/// Matches the Boltz web app formula for reverse swaps:
+/// Formula:
 ///   `receiveAmount = sendAmount - ceil(sendAmount * percentage / 100) - minerFee`
 fn compute_onchain_amount(
     pair: &ReversePairInfo,
@@ -1589,17 +1729,41 @@ fn to_chain_id_u32(chain_id: u64) -> Result<u32, BoltzError> {
         .map_err(|_| BoltzError::Generic("Chain ID overflow".to_string()))
 }
 
-/// Reject non-EVM destination chains. Solana and Tron variants exist in the
-/// `Chain` enum but the swap pipeline (recipient encoding, legacy-mesh quote
-/// path, ATA pre-funding) is not yet wired up.
-fn require_evm_destination(chain: &Chain) -> Result<(), BoltzError> {
-    if chain.transport() == NetworkTransport::Evm {
+/// Floor tBTC wei (18-decimal EVM units) to tBTC sats (8-decimal), for
+/// converting DEX quote outputs to claim amounts before summing.
+fn tbtc_wei_to_sats_u64(tbtc_wei: u128) -> Result<u64, BoltzError> {
+    let sats_factor = u128::from(SATS_TO_TBTC_FACTOR);
+    let tbtc_sats = tbtc_wei.checked_div(sats_factor).unwrap_or(0);
+    u64::try_from(tbtc_sats).map_err(|_| BoltzError::Generic("tBTC sats overflow".into()))
+}
+
+/// Validate the destination address for the given chain's transport before
+/// committing to a swap. Dispatches to the per-transport parser in
+/// `crate::evm::recipient`.
+fn validate_destination(chain: &Chain, destination: &str) -> Result<(), BoltzError> {
+    if is_valid_destination_address(chain, destination) {
         Ok(())
     } else {
         Err(BoltzError::Generic(format!(
-            "Destination chain {chain:?} is not yet supported"
+            "Invalid destination address '{destination}' for {chain:?}"
         )))
     }
+}
+
+/// Decode a base58 Solana pubkey into its 32-byte form.
+fn decode_solana_pubkey(s: &str) -> Result<[u8; 32], BoltzError> {
+    let decoded = bs58::decode(s)
+        .into_vec()
+        .map_err(|e| BoltzError::Generic(format!("Invalid Solana pubkey '{s}': {e}")))?;
+    if decoded.len() != 32 {
+        return Err(BoltzError::Generic(format!(
+            "Solana pubkey '{s}' must decode to 32 bytes, got {}",
+            decoded.len()
+        )));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&decoded);
+    Ok(out)
 }
 
 pub(crate) fn current_unix_timestamp() -> u64 {
@@ -1618,8 +1782,9 @@ async fn sleep_1s() {
 }
 
 /// Check that the fresh DEX quote hasn't degraded beyond the slippage
-/// tolerance compared to the creation-time estimate. Mirrors the Boltz web
-/// app's `isOutsideSlippage` check in `TransactionConfirmed.tsx`.
+/// tolerance compared to the creation-time estimate. Rejects a swap whose
+/// effective receive amount would drift below `expected * (1 - slippage)`
+/// before we commit the claim transaction.
 #[expect(clippy::arithmetic_side_effects)]
 fn check_quote_drift(
     expected_usdt: u64,
@@ -1645,7 +1810,6 @@ fn apply_slippage_up(amount: u128, slippage_bps: u128) -> u128 {
 }
 
 // ─── DEX quote selection ─────────────────────────────────────────────────
-// Matches the web app's `sortDexQuotes` logic:
 // - "in" direction (quoting by input):  pick highest output (best return)
 // - "out" direction (quoting by output): pick lowest input  (cheapest route)
 
@@ -1736,9 +1900,9 @@ mod tests {
             },
         };
 
-        // 0.001 BTC = 100_000 sats = 100_000 * 10^10 EVM units
-        let tbtc_evm_units: u128 = 100_000 * 10_000_000_000;
-        let result = compute_invoice_amount(&pair, tbtc_evm_units).unwrap();
+        // 0.001 BTC = 100_000 sats
+        let tbtc_sats: u64 = 100_000;
+        let result = compute_invoice_amount(&pair, tbtc_sats).unwrap();
 
         // invoice should be > base (100_000 + 170 + 171 = 100_341)
         assert!(result.invoice_sats > 100_341);
@@ -1840,8 +2004,7 @@ mod tests {
         // compute_onchain_amount(compute_invoice_amount(x).invoice_sats).onchain_sats
         // should be close to the original tbtc_sats (within rounding).
         let pair = test_pair(0.25);
-        let tbtc_evm_units: u128 = 100_000 * u128::from(SATS_TO_TBTC_FACTOR);
-        let invoice = compute_invoice_amount(&pair, tbtc_evm_units).unwrap();
+        let invoice = compute_invoice_amount(&pair, 100_000).unwrap();
         let back = compute_onchain_amount(&pair, invoice.invoice_sats).unwrap();
 
         // onchain_sats from roundtrip should match the original (100_000)

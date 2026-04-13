@@ -37,7 +37,10 @@ enum Chain {
     Polygon,
     Rootstock,
     Sei,
+    Solana,
     Stable,
+    Tempo,
+    Tron,
     Unichain,
     XLayer,
 }
@@ -63,7 +66,10 @@ impl From<Chain> for boltz_client::Chain {
             Chain::Polygon => Self::Polygon,
             Chain::Rootstock => Self::Rootstock,
             Chain::Sei => Self::Sei,
+            Chain::Solana => Self::Solana,
             Chain::Stable => Self::Stable,
+            Chain::Tempo => Self::Tempo,
+            Chain::Tron => Self::Tron,
             Chain::Unichain => Self::Unichain,
             Chain::XLayer => Self::XLayer,
         }

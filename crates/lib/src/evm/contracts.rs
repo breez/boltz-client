@@ -317,24 +317,34 @@ pub fn decode_typehash_send_data(data: &[u8]) -> Result<[u8; 32], BoltzError> {
 
 // ─── OFT helpers ─────────────────────────────────────────────────────────
 
-/// Build an `OftSendParam` for quoting. `extraOptions`, `composeMsg`, and `oftCmd`
-/// are empty (no native drops — disabled for USDT0, matching the web app).
+/// Build an `OftSendParam` for quoting.
 ///
 /// `to` is the transport-encoded 32-byte recipient. Callers compute it via
 /// `crate::evm::recipient::encode_oft_recipient` so the same encoding feeds
 /// both `OftSendParam.to` and `SendData.to`.
+///
+/// `extra_options` is the `LayerZero` v2 executor options blob. Empty for
+/// plain EVM / Tron destinations; populated via `crate::evm::lz_options` when
+/// the destination is Solana and the recipient's `Associated Token Account`
+/// needs pre-funded creation. The same bytes must be used for every
+/// `quoteOFT` / `quoteSend` / `SendData` call on a swap — the router signs
+/// over them, so any divergence from what is submitted on-chain will fail
+/// signature verification.
+///
+/// `composeMsg` and `oftCmd` are always empty — no compose messages in scope.
 pub fn build_oft_send_param(
     dst_eid: u32,
     to: FixedBytes<32>,
     amount_ld: U256,
     min_amount_ld: U256,
+    extra_options: alloy_primitives::Bytes,
 ) -> OftSendParam {
     OftSendParam {
         dstEid: dst_eid,
         to,
         amountLD: amount_ld,
         minAmountLD: min_amount_ld,
-        extraOptions: vec![].into(),
+        extraOptions: extra_options,
         composeMsg: vec![].into(),
         oftCmd: vec![].into(),
     }
@@ -825,8 +835,13 @@ mod tests {
 
     #[macros::test_all]
     fn test_quote_oft_call_selector() {
-        let send_param =
-            build_oft_send_param(30101, FixedBytes::<32>::ZERO, U256::ZERO, U256::ZERO);
+        let send_param = build_oft_send_param(
+            30101,
+            FixedBytes::<32>::ZERO,
+            U256::ZERO,
+            U256::ZERO,
+            alloy_primitives::Bytes::new(),
+        );
         let encoded = encode_quote_oft(&send_param);
         let expected_selector = &quoteOFTCall::SELECTOR;
         assert_eq!(&encoded[..4], expected_selector);
@@ -834,8 +849,13 @@ mod tests {
 
     #[macros::test_all]
     fn test_quote_send_call_selector() {
-        let send_param =
-            build_oft_send_param(30101, FixedBytes::<32>::ZERO, U256::ZERO, U256::ZERO);
+        let send_param = build_oft_send_param(
+            30101,
+            FixedBytes::<32>::ZERO,
+            U256::ZERO,
+            U256::ZERO,
+            alloy_primitives::Bytes::new(),
+        );
         let encoded = encode_quote_send(&send_param, false);
         let expected_selector = &quoteSendCall::SELECTOR;
         assert_eq!(&encoded[..4], expected_selector);
@@ -942,16 +962,32 @@ mod tests {
     }
 
     #[macros::test_all]
-    fn test_build_oft_send_param() {
+    fn test_build_oft_send_param_empty_extra_options() {
         let addr = parse_address("0x0000000000000000000000000000000000000042").unwrap();
         let to = address_to_bytes32(addr);
-        let sp = build_oft_send_param(30111, to, U256::from(1000u64), U256::from(900u64));
+        let sp = build_oft_send_param(
+            30111,
+            to,
+            U256::from(1000u64),
+            U256::from(900u64),
+            alloy_primitives::Bytes::new(),
+        );
         assert_eq!(sp.dstEid, 30111);
         assert_eq!(sp.to, to);
         assert_eq!(&sp.to[12..], addr.as_slice());
         assert_eq!(sp.amountLD, U256::from(1000u64));
         assert_eq!(sp.minAmountLD, U256::from(900u64));
         assert!(sp.extraOptions.is_empty());
+        assert!(sp.composeMsg.is_empty());
+        assert!(sp.oftCmd.is_empty());
+    }
+
+    #[macros::test_all]
+    fn test_build_oft_send_param_with_extra_options() {
+        let to = FixedBytes::<32>::from([0xcc; 32]);
+        let extra = alloy_primitives::Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]);
+        let sp = build_oft_send_param(30168, to, U256::from(5u64), U256::from(4u64), extra.clone());
+        assert_eq!(sp.extraOptions, extra);
         assert!(sp.composeMsg.is_empty());
         assert!(sp.oftCmd.is_empty());
     }

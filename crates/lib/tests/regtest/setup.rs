@@ -6,7 +6,7 @@ use boltz_client::{AlchemyConfig, BoltzConfig};
 const REGTEST_API_URL: &str = "http://localhost:9001";
 /// Anvil RPC URL (from Docker stack).
 const REGTEST_ANVIL_RPC: &str = "http://localhost:8545";
-/// Anvil chain ID (matches web app regtest config).
+/// Anvil chain ID used by the Docker regtest stack.
 const REGTEST_CHAIN_ID: u64 = 33;
 
 /// Build a `BoltzConfig` for the local regtest environment.
