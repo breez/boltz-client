@@ -13,7 +13,7 @@ use crate::evm::contracts::{
     self, ClaimSendAuthorization, Erc20Claim, SendData, encode_claim_erc20_execute,
     encode_claim_erc20_execute_oft, parse_address, quote_calldata_to_call,
 };
-use crate::evm::oft::OftDeployments;
+use crate::evm::oft::{OftDeployments, Usdt0Kind, legacy_mesh_source_amount};
 use crate::evm::provider::EvmProvider;
 use crate::evm::recipient::encode_oft_recipient;
 use crate::evm::signing::EvmSigner;
@@ -767,9 +767,12 @@ impl ReverseSwapExecutor {
             })?;
         let dst_eid = dst_info.lz_eid;
 
+        // The legacy and native USDT0 meshes deploy distinct OFT contracts
+        // on the source chain — pick the one matching the destination's mesh
+        // so quoting and sending bridge through the right contract.
         let source_oft_address = self
             .oft_deployments
-            .source_oft_address(self.config.chain_id)
+            .source_oft_address(self.config.chain_id, dst_info.mesh)
             .ok_or_else(|| {
                 BoltzError::Generic("No OFT deployment for source chain (Arbitrum)".into())
             })?;
@@ -1097,8 +1100,10 @@ impl ReverseSwapExecutor {
 
     // ─── OFT fee estimation (for prepare-time quoting) ─────────────────
 
-    /// Find the OFT send amount required to deliver `target_amount` on the destination chain.
-    /// Matches the web app's `quoteOftAmountInForAmountOut` binary search.
+    /// Find the OFT send amount required to deliver `target_amount` on the
+    /// destination chain. Native-mesh routes binary-search the on-chain
+    /// `quoteOFT`; legacy-mesh routes use the closed-form 3 bps inverse
+    /// because the legacy bridge fee is not deducted by the staticcall.
     async fn estimate_oft_required_send_amount(
         &self,
         chain: &Chain,
@@ -1106,6 +1111,16 @@ impl ReverseSwapExecutor {
     ) -> Result<u128, BoltzError> {
         if target_amount == 0 {
             return Ok(0);
+        }
+
+        // Legacy-mesh routes: skip the binary search and apply the closed-form
+        // 3 bps inverse. The legacy `quoteOFT` does not deduct the bridge fee,
+        // so the search would converge to a too-low source amount.
+        if let Some(dst_info) = self.oft_deployments.get_for(chain)
+            && dst_info.mesh == Usdt0Kind::Legacy
+        {
+            return legacy_mesh_source_amount(target_amount)
+                .ok_or_else(|| BoltzError::Generic("Legacy mesh source amount overflow".into()));
         }
 
         // Binary search: find the minimum send amount where OFT receive >= target
@@ -1167,9 +1182,11 @@ impl ReverseSwapExecutor {
         let dst_info = self.oft_deployments.get_for(chain).ok_or_else(|| {
             BoltzError::Generic(format!("No OFT deployment for destination chain {chain:?}"))
         })?;
+        // Match the source OFT to the destination's mesh: legacy and native
+        // USDT0 use distinct contracts on the source chain.
         let source_oft_address = self
             .oft_deployments
-            .source_oft_address(self.config.chain_id)
+            .source_oft_address(self.config.chain_id, dst_info.mesh)
             .ok_or_else(|| {
                 BoltzError::Generic("No OFT deployment for source chain (Arbitrum)".into())
             })?;

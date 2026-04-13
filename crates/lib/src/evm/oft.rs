@@ -19,13 +19,53 @@ use serde::Deserialize;
 use crate::error::BoltzError;
 use crate::models::{Chain, NetworkTransport};
 
-/// Default OFT token name to look up (matches web app's `defaultOftName`).
+/// Default OFT token name to look up.
 const DEFAULT_OFT_NAME: &str = "usdt0";
 
-/// Primary OFT contract names, tried in order — mirrors the web app's
-/// `primaryOftContractNames` in `src/utils/oft/registry.ts`.
-/// `OFT Program` covers Solana's legacy-mesh deployment.
+/// Primary OFT contract names, tried in order. `OFT Program` covers Solana's
+/// legacy-mesh deployment.
 const PRIMARY_OFT_CONTRACT_NAMES: &[&str] = &["OFT", "OFT Adapter", "OFT Program"];
+
+/// Flat per-route fee charged by the legacy mesh USDT0 bridge, in basis
+/// points. The legacy `quoteOFT` staticcall does not deduct this, so any
+/// inverse-quote (destination amount → required source amount) for a legacy
+/// mesh route must add it back via [`legacy_mesh_source_amount`].
+pub const LEGACY_MESH_FEE_BPS: u32 = 3;
+
+/// Denominator for basis-point math.
+pub const HUNDRED_PERCENT_BPS: u32 = 10_000;
+
+/// Closed-form inverse of the legacy mesh OFT bridge fee: given a desired
+/// destination amount, return the source amount needed to deliver it after
+/// the flat 3 bps fee:
+///
+/// ```text
+///     source = ceilDiv(dest * 10_000, 10_000 - 3)
+/// ```
+///
+/// Used to short-circuit the binary-search inverse-quote for legacy mesh
+/// routes, where the on-chain `quoteOFT` does not account for the bridge
+/// fee. Returns `None` on `u128` overflow.
+#[must_use]
+pub fn legacy_mesh_source_amount(destination_amount: u128) -> Option<u128> {
+    let numerator = destination_amount.checked_mul(u128::from(HUNDRED_PERCENT_BPS))?;
+    let denominator = u128::from(HUNDRED_PERCENT_BPS - LEGACY_MESH_FEE_BPS);
+    ceil_div(numerator, denominator)
+}
+
+/// Integer ceiling division: `(num + den - 1) / den`. Returns `None` on
+/// `u128` overflow or division by zero.
+#[must_use]
+#[expect(clippy::arithmetic_side_effects)]
+pub fn ceil_div(numerator: u128, denominator: u128) -> Option<u128> {
+    if denominator == 0 {
+        return None;
+    }
+    // `denominator - 1` cannot underflow (checked above); the final
+    // division by `denominator` cannot panic for the same reason.
+    let bumped = numerator.checked_add(denominator - 1)?;
+    Some(bumped / denominator)
+}
 
 /// Which USDT0 mesh a chain belongs to. Mirrors the web app's `Usdt0Kind`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,11 +190,20 @@ impl OftDeployments {
         }
     }
 
-    /// Get the native-mesh OFT contract address for a source chain (Arbitrum
-    /// in the normal flow).
-    pub fn source_oft_address(&self, source_chain_id: u64) -> Option<&str> {
-        self.native_chains
-            .get(&source_chain_id)
+    /// Get the source OFT contract address for a chain on a given mesh.
+    ///
+    /// The native and legacy meshes are independent bridges that ship from
+    /// different OFT contracts on the same source chain. Routes that bridge
+    /// into a legacy-mesh destination (Solana, Tron, Celo, …) must depart
+    /// from the legacy-mesh source contract; routes into a native-mesh
+    /// destination must depart from the native-mesh contract. Callers
+    /// derive the mesh from the destination's [`OftChainInfo::mesh`].
+    pub fn source_oft_address(&self, source_chain_id: u64, mesh: Usdt0Kind) -> Option<&str> {
+        let map = match mesh {
+            Usdt0Kind::Native => &self.native_chains,
+            Usdt0Kind::Legacy => &self.legacy_evm_chains,
+        };
+        map.get(&source_chain_id)
             .map(|info| info.oft_address.as_str())
     }
 }
@@ -442,12 +491,99 @@ mod tests {
     }
 
     #[macros::test_all]
-    fn source_oft_address_returns_native() {
+    fn source_oft_address_returns_native_for_native_mesh() {
         let deployments = OftDeployments::parse(SAMPLE_DEPLOYMENTS).unwrap();
         assert_eq!(
-            deployments.source_oft_address(42161),
+            deployments.source_oft_address(42161, Usdt0Kind::Native),
             Some("0x14E4A1B13bf7F943c8ff7C51fb60FA964A298D92")
         );
+    }
+
+    #[macros::test_all]
+    fn source_oft_address_returns_legacy_for_legacy_mesh() {
+        let deployments = OftDeployments::parse(SAMPLE_DEPLOYMENTS).unwrap();
+        assert_eq!(
+            deployments.source_oft_address(42161, Usdt0Kind::Legacy),
+            Some("0x77652D5aba086137b595875263FC200182919B92")
+        );
+    }
+
+    #[macros::test_all]
+    fn source_oft_address_native_and_legacy_differ() {
+        // The native and legacy meshes deploy different OFT contracts on
+        // the same source chain — bridging into a legacy-mesh destination
+        // must depart from the legacy contract, not the native one.
+        let deployments = OftDeployments::parse(SAMPLE_DEPLOYMENTS).unwrap();
+        let native = deployments
+            .source_oft_address(42161, Usdt0Kind::Native)
+            .unwrap();
+        let legacy = deployments
+            .source_oft_address(42161, Usdt0Kind::Legacy)
+            .unwrap();
+        assert_ne!(native, legacy);
+    }
+
+    #[macros::test_all]
+    fn source_oft_address_missing_chain_returns_none() {
+        let deployments = OftDeployments::parse(SAMPLE_DEPLOYMENTS).unwrap();
+        // Polygon isn't in the fixture under either mesh.
+        assert!(
+            deployments
+                .source_oft_address(137, Usdt0Kind::Native)
+                .is_none()
+        );
+        assert!(
+            deployments
+                .source_oft_address(137, Usdt0Kind::Legacy)
+                .is_none()
+        );
+    }
+
+    #[macros::test_all]
+    fn legacy_mesh_source_amount_matches_known_vector() {
+        // 1_000_000_000 -> ceil(1_000_000_000 * 10_000 / 9_997) = 1_000_300_091.
+        assert_eq!(
+            legacy_mesh_source_amount(1_000_000_000),
+            Some(1_000_300_091)
+        );
+    }
+
+    #[macros::test_all]
+    fn legacy_mesh_source_amount_zero() {
+        assert_eq!(legacy_mesh_source_amount(0), Some(0));
+    }
+
+    #[macros::test_all]
+    fn legacy_mesh_source_amount_rounds_up() {
+        // 1 unit out → ceil(10_000 / 9_997) = 2 units in (the 0.0003-unit
+        // remainder is rounded up so the destination receives at least the
+        // requested amount).
+        assert_eq!(legacy_mesh_source_amount(1), Some(2));
+    }
+
+    #[macros::test_all]
+    fn legacy_mesh_source_amount_returns_none_on_overflow() {
+        // u128::MAX * 10_000 overflows.
+        assert_eq!(legacy_mesh_source_amount(u128::MAX), None);
+    }
+
+    #[macros::test_all]
+    fn ceil_div_basic_cases() {
+        assert_eq!(ceil_div(0, 5), Some(0));
+        assert_eq!(ceil_div(6, 3), Some(2)); // exact
+        assert_eq!(ceil_div(7, 3), Some(3)); // rounds up
+        assert_eq!(ceil_div(1, 1), Some(1));
+    }
+
+    #[macros::test_all]
+    fn ceil_div_division_by_zero_is_none() {
+        assert_eq!(ceil_div(42, 0), None);
+    }
+
+    #[macros::test_all]
+    fn ceil_div_overflow_is_none() {
+        // u128::MAX + (3 - 1) overflows.
+        assert_eq!(ceil_div(u128::MAX, 3), None);
     }
 
     #[macros::test_all]
