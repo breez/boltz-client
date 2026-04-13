@@ -1,4 +1,4 @@
-use alloy_primitives::U256;
+use alloy_primitives::{FixedBytes, U256};
 use lightning_invoice::Bolt11Invoice;
 
 use crate::api::BoltzApiClient;
@@ -15,6 +15,7 @@ use crate::evm::contracts::{
 };
 use crate::evm::oft::OftDeployments;
 use crate::evm::provider::EvmProvider;
+use crate::evm::recipient::encode_oft_recipient;
 use crate::evm::signing::EvmSigner;
 use crate::keys::EvmKeyManager;
 use crate::models::{
@@ -686,6 +687,13 @@ impl ReverseSwapExecutor {
             )?;
         }
 
+        // Same-chain claim is Arbitrum-only, which is always EVM, so the
+        // destination must round-trip as a 20-byte EVM address. Surface a
+        // hard error instead of panicking if the invariant is ever violated.
+        let destination_evm = addrs.destination_evm.ok_or_else(|| {
+            BoltzError::Generic("Same-chain claim requires an EVM destination address".to_string())
+        })?;
+
         let erc20swap_sig = gas_signer.sign_eip712_erc20swap_claim(
             addrs.erc20swap,
             erc20swap_version,
@@ -702,7 +710,7 @@ impl ReverseSwapExecutor {
             preimage,
             addrs.usdt,
             min_amount_out,
-            addrs.destination,
+            destination_evm,
         )?;
 
         let erc20_claim = Erc20Claim {
@@ -721,7 +729,7 @@ impl ReverseSwapExecutor {
             &dex_calls,
             addrs.usdt,
             min_amount_out,
-            addrs.destination,
+            destination_evm,
             router_sig.v,
             router_sig.r,
             router_sig.s,
@@ -790,7 +798,7 @@ impl ReverseSwapExecutor {
         // Quote OFT with initial USDT amount to get messaging fee
         let initial_send_param = contracts::build_oft_send_param(
             dst_eid,
-            addrs.destination,
+            addrs.destination_bytes32,
             U256::from(initial_trade.amount),
             U256::ZERO,
         );
@@ -861,7 +869,7 @@ impl ReverseSwapExecutor {
         if !skip_drift_check {
             let drift_param = contracts::build_oft_send_param(
                 dst_eid,
-                addrs.destination,
+                addrs.destination_bytes32,
                 U256::from(trade_best.amount),
                 U256::ZERO,
             );
@@ -894,7 +902,7 @@ impl ReverseSwapExecutor {
 
         let final_send_param = contracts::build_oft_send_param(
             dst_eid,
-            addrs.destination,
+            addrs.destination_bytes32,
             U256::from(min_usdt_out),
             U256::ZERO,
         );
@@ -995,7 +1003,7 @@ impl ReverseSwapExecutor {
         // ─── Build SendData + hash ────────────────────────────────────
         let send_data = SendData {
             dstEid: dst_eid,
-            to: contracts::address_to_bytes32(addrs.destination),
+            to: addrs.destination_bytes32,
             extraOptions: vec![].into(),
             composeMsg: vec![].into(),
             oftCmd: vec![].into(),
@@ -1166,9 +1174,11 @@ impl ReverseSwapExecutor {
                 BoltzError::Generic("No OFT deployment for source chain (Arbitrum)".into())
             })?;
 
+        // The recipient is irrelevant for messaging-fee estimation; an all-zero
+        // 32-byte placeholder is fine for both EVM and non-EVM destinations.
         let send_param = contracts::build_oft_send_param(
             dst_info.lz_eid,
-            alloy_primitives::Address::ZERO,
+            FixedBytes::<32>::ZERO,
             U256::from(usdt_amount),
             U256::ZERO,
         );
@@ -1396,18 +1406,32 @@ struct ClaimAddresses {
     tbtc: alloy_primitives::Address,
     usdt: alloy_primitives::Address,
     refund: alloy_primitives::Address,
-    destination: alloy_primitives::Address,
+    /// EVM destination address. `Some` for EVM transports (used by the
+    /// same-chain claim path which signs over the destination as an
+    /// `address`); `None` for Solana / Tron whose recipients aren't EVM
+    /// addresses.
+    destination_evm: Option<alloy_primitives::Address>,
+    /// Transport-encoded 32-byte destination, ready to feed into both
+    /// `OftSendParam.to` and `SendData.to` on the cross-chain claim path.
+    destination_bytes32: FixedBytes<32>,
 }
 
 impl ClaimAddresses {
     fn parse(swap: &BoltzSwap) -> Result<Self, BoltzError> {
+        let transport = swap.destination_chain.transport();
+        let destination_bytes32 = encode_oft_recipient(transport, &swap.destination_address)?;
+        let destination_evm = match transport {
+            NetworkTransport::Evm => Some(parse_address(&swap.destination_address)?),
+            NetworkTransport::Solana | NetworkTransport::Tron => None,
+        };
         Ok(Self {
             erc20swap: parse_address(&swap.erc20swap_address)?,
             router: parse_address(&swap.router_address)?,
             tbtc: parse_address(ARBITRUM_TBTC_ADDRESS)?,
             usdt: parse_address(ARBITRUM_USDT_ADDRESS)?,
             refund: parse_address(&swap.refund_address)?,
-            destination: parse_address(&swap.destination_address)?,
+            destination_evm,
+            destination_bytes32,
         })
     }
 }

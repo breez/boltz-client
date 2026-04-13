@@ -17,6 +17,7 @@ use platform_utils::tokio::sync::mpsc;
 pub use config::*;
 pub use error::BoltzError;
 pub use events::{BoltzEventListener, BoltzSwapEvent, EventEmitter};
+pub use evm::recipient::is_valid_destination_address;
 pub use keys::EvmKeyManager;
 pub use models::*;
 pub use store::{BoltzStorage, MemoryBoltzStorage};

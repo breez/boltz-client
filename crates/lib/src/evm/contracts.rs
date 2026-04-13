@@ -319,15 +319,19 @@ pub fn decode_typehash_send_data(data: &[u8]) -> Result<[u8; 32], BoltzError> {
 
 /// Build an `OftSendParam` for quoting. `extraOptions`, `composeMsg`, and `oftCmd`
 /// are empty (no native drops — disabled for USDT0, matching the web app).
+///
+/// `to` is the transport-encoded 32-byte recipient. Callers compute it via
+/// `crate::evm::recipient::encode_oft_recipient` so the same encoding feeds
+/// both `OftSendParam.to` and `SendData.to`.
 pub fn build_oft_send_param(
     dst_eid: u32,
-    recipient: Address,
+    to: FixedBytes<32>,
     amount_ld: U256,
     min_amount_ld: U256,
 ) -> OftSendParam {
     OftSendParam {
         dstEid: dst_eid,
-        to: address_to_bytes32(recipient),
+        to,
         amountLD: amount_ld,
         minAmountLD: min_amount_ld,
         extraOptions: vec![].into(),
@@ -821,7 +825,8 @@ mod tests {
 
     #[macros::test_all]
     fn test_quote_oft_call_selector() {
-        let send_param = build_oft_send_param(30101, Address::ZERO, U256::ZERO, U256::ZERO);
+        let send_param =
+            build_oft_send_param(30101, FixedBytes::<32>::ZERO, U256::ZERO, U256::ZERO);
         let encoded = encode_quote_oft(&send_param);
         let expected_selector = &quoteOFTCall::SELECTOR;
         assert_eq!(&encoded[..4], expected_selector);
@@ -829,7 +834,8 @@ mod tests {
 
     #[macros::test_all]
     fn test_quote_send_call_selector() {
-        let send_param = build_oft_send_param(30101, Address::ZERO, U256::ZERO, U256::ZERO);
+        let send_param =
+            build_oft_send_param(30101, FixedBytes::<32>::ZERO, U256::ZERO, U256::ZERO);
         let encoded = encode_quote_send(&send_param, false);
         let expected_selector = &quoteSendCall::SELECTOR;
         assert_eq!(&encoded[..4], expected_selector);
@@ -938,8 +944,10 @@ mod tests {
     #[macros::test_all]
     fn test_build_oft_send_param() {
         let addr = parse_address("0x0000000000000000000000000000000000000042").unwrap();
-        let sp = build_oft_send_param(30111, addr, U256::from(1000u64), U256::from(900u64));
+        let to = address_to_bytes32(addr);
+        let sp = build_oft_send_param(30111, to, U256::from(1000u64), U256::from(900u64));
         assert_eq!(sp.dstEid, 30111);
+        assert_eq!(sp.to, to);
         assert_eq!(&sp.to[12..], addr.as_slice());
         assert_eq!(sp.amountLD, U256::from(1000u64));
         assert_eq!(sp.minAmountLD, U256::from(900u64));

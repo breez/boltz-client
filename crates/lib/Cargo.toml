@@ -38,6 +38,9 @@ k256.workspace = true
 sha2 = "0.10"
 tiny-keccak = { version = "2", features = ["keccak"] }
 
+# Base58 decoding for Solana / Tron destination addresses
+bs58 = { version = "0.5", default-features = false, features = ["alloc"] }
+
 # Key derivation (BIP-32 over secp256k1, matching Boltz web app's @scure/bip32)
 bip32 = "0.5"
 
