@@ -17,7 +17,9 @@ use crate::evm::oft::OftDeployments;
 use crate::evm::provider::EvmProvider;
 use crate::evm::signing::EvmSigner;
 use crate::keys::EvmKeyManager;
-use crate::models::{BoltzSwap, BoltzSwapStatus, Chain, PreparedSwap, SwapLimits};
+use crate::models::{
+    BoltzSwap, BoltzSwapStatus, Chain, NetworkTransport, PreparedSwap, SwapLimits,
+};
 use crate::recover::{self, RecoverableSwap};
 
 /// Maximum claim retries (quote may go stale between encode and submit).
@@ -87,6 +89,7 @@ impl ReverseSwapExecutor {
             )));
         }
 
+        require_evm_destination(&chain)?;
         // Validate destination is a well-formed EVM address before committing to a swap
         parse_address(destination)?;
 
@@ -166,6 +169,7 @@ impl ReverseSwapExecutor {
             )));
         }
 
+        require_evm_destination(&chain)?;
         parse_address(destination)?;
 
         let tbtc_pair = self.fetch_tbtc_pair().await?;
@@ -744,12 +748,15 @@ impl ReverseSwapExecutor {
         timelock: U256,
         skip_drift_check: bool,
     ) -> Result<String, BoltzError> {
-        let dst_chain_id = swap.destination_chain.evm_chain_id();
-        let dst_info = self.oft_deployments.get(dst_chain_id).ok_or_else(|| {
-            BoltzError::Generic(format!(
-                "No OFT deployment for destination chain ID {dst_chain_id}"
-            ))
-        })?;
+        let dst_info = self
+            .oft_deployments
+            .get_for(&swap.destination_chain)
+            .ok_or_else(|| {
+                BoltzError::Generic(format!(
+                    "No OFT deployment for destination chain {:?}",
+                    swap.destination_chain
+                ))
+            })?;
         let dst_eid = dst_info.lz_eid;
 
         let source_oft_address = self
@@ -1149,11 +1156,8 @@ impl ReverseSwapExecutor {
         chain: &Chain,
         usdt_amount: u128,
     ) -> Result<(u128, u128), BoltzError> {
-        let dst_chain_id = chain.evm_chain_id();
-        let dst_info = self.oft_deployments.get(dst_chain_id).ok_or_else(|| {
-            BoltzError::Generic(format!(
-                "No OFT deployment for destination chain ID {dst_chain_id}"
-            ))
+        let dst_info = self.oft_deployments.get_for(chain).ok_or_else(|| {
+            BoltzError::Generic(format!("No OFT deployment for destination chain {chain:?}"))
         })?;
         let source_oft_address = self
             .oft_deployments
@@ -1542,6 +1546,19 @@ fn to_chain_id_u32(chain_id: u64) -> Result<u32, BoltzError> {
     chain_id
         .try_into()
         .map_err(|_| BoltzError::Generic("Chain ID overflow".to_string()))
+}
+
+/// Reject non-EVM destination chains. Solana and Tron variants exist in the
+/// `Chain` enum but the swap pipeline (recipient encoding, legacy-mesh quote
+/// path, ATA pre-funding) is not yet wired up.
+fn require_evm_destination(chain: &Chain) -> Result<(), BoltzError> {
+    if chain.transport() == NetworkTransport::Evm {
+        Ok(())
+    } else {
+        Err(BoltzError::Generic(format!(
+            "Destination chain {chain:?} is not yet supported"
+        )))
+    }
 }
 
 pub(crate) fn current_unix_timestamp() -> u64 {

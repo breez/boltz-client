@@ -17,6 +17,7 @@ use platform_utils::http::HttpClient;
 use serde::Deserialize;
 
 use crate::error::BoltzError;
+use crate::models::{Chain, NetworkTransport};
 
 /// Default OFT token name to look up (matches web app's `defaultOftName`).
 const DEFAULT_OFT_NAME: &str = "usdt0";
@@ -132,10 +133,21 @@ impl OftDeployments {
     /// Look up a legacy-mesh chain by its registry name (case-insensitive).
     ///
     /// Needed for Solana, TON, and Tron, which the USDT0 API returns with
-    /// `chainId: null`. The web app's `getOftChain` uses the same
-    /// `chain.name.toLowerCase() === assetChainName` fallback.
+    /// `chainId: null`.
     pub fn get_by_name(&self, name: &str) -> Option<&OftChainInfo> {
         self.legacy_named_chains.get(&name.to_lowercase())
+    }
+
+    /// Resolve the OFT entry for a `Chain`, dispatching on its transport:
+    /// EVM chains use the native-mesh `chainId` lookup; non-EVM chains
+    /// (Solana, Tron) use the legacy-mesh name lookup.
+    pub fn get_for(&self, chain: &Chain) -> Option<&OftChainInfo> {
+        match chain.transport() {
+            NetworkTransport::Evm => self.get(chain.evm_chain_id()?),
+            NetworkTransport::Solana | NetworkTransport::Tron => {
+                self.get_by_name(chain.registry_name())
+            }
+        }
     }
 
     /// Get the native-mesh OFT contract address for a source chain (Arbitrum
@@ -246,6 +258,15 @@ mod tests {
                     "lzEid": "30101",
                     "contracts": [
                         {"name": "OFT Adapter", "address": "0x6C96dE32CEa08842dcc4058c14d3aaAD7Fa41dee", "explorer": "https://etherscan.io/"}
+                    ]
+                },
+                {
+                    "name": "Tempo",
+                    "chainId": 4217,
+                    "lzEid": "30410",
+                    "contracts": [
+                        {"name": "Token", "address": "0x20C00000000000000000000014f22CA97301EB73", "explorer": "https://explore.mainnet.tempo.xyz/"},
+                        {"name": "OFT", "address": "0xaf37E8B6C9ED7f6318979f56Fc287d76c30847ff", "explorer": "https://explore.mainnet.tempo.xyz/"}
                     ]
                 },
                 {
@@ -366,6 +387,58 @@ mod tests {
 
         assert!(deployments.get(42220).is_none()); // Celo is legacy-only
         assert!(deployments.get_by_name("arbitrum one").is_none()); // native entries aren't named
+    }
+
+    #[macros::test_all]
+    fn get_for_resolves_tempo_via_registry_chain_id() {
+        let deployments = OftDeployments::parse(SAMPLE_DEPLOYMENTS).unwrap();
+        let tempo = deployments.get_for(&Chain::Tempo).expect("tempo");
+        assert_eq!(tempo.lz_eid, 30410);
+        assert_eq!(
+            tempo.oft_address,
+            "0xaf37E8B6C9ED7f6318979f56Fc287d76c30847ff"
+        );
+        assert_eq!(tempo.mesh, Usdt0Kind::Native);
+    }
+
+    #[macros::test_all]
+    fn get_for_dispatches_evm_to_native_mesh() {
+        let deployments = OftDeployments::parse(SAMPLE_DEPLOYMENTS).unwrap();
+
+        let arb = deployments.get_for(&Chain::Arbitrum).expect("arbitrum");
+        assert_eq!(arb.lz_eid, 30110);
+        assert_eq!(arb.mesh, Usdt0Kind::Native);
+        // Must be the native-mesh entry, not the legacy-mesh duplicate.
+        assert_eq!(
+            arb.oft_address,
+            "0x14E4A1B13bf7F943c8ff7C51fb60FA964A298D92"
+        );
+
+        let eth = deployments.get_for(&Chain::Ethereum).expect("ethereum");
+        assert_eq!(
+            eth.oft_address,
+            "0x6C96dE32CEa08842dcc4058c14d3aaAD7Fa41dee"
+        );
+    }
+
+    #[macros::test_all]
+    fn get_for_dispatches_non_evm_to_named_legacy() {
+        let deployments = OftDeployments::parse(SAMPLE_DEPLOYMENTS).unwrap();
+
+        let solana = deployments.get_for(&Chain::Solana).expect("solana");
+        assert_eq!(solana.lz_eid, 30168);
+        assert_eq!(solana.mesh, Usdt0Kind::Legacy);
+
+        let tron = deployments.get_for(&Chain::Tron).expect("tron");
+        assert_eq!(tron.lz_eid, 30420);
+        assert_eq!(tron.mesh, Usdt0Kind::Legacy);
+    }
+
+    #[macros::test_all]
+    fn get_for_returns_none_when_evm_chain_id_missing_from_native_mesh() {
+        let deployments = OftDeployments::parse(SAMPLE_DEPLOYMENTS).unwrap();
+        // Polygon isn't in the sample fixture — must miss cleanly, not panic.
+        assert!(deployments.get_for(&Chain::Polygon).is_none());
     }
 
     #[macros::test_all]

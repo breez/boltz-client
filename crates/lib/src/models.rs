@@ -75,6 +75,15 @@ impl BoltzSwapStatus {
     }
 }
 
+/// Underlying transport for a chain. Determines recipient encoding, RPC
+/// dispatch, and OFT registry lookup keying.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum NetworkTransport {
+    Evm,
+    Solana,
+    Tron,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Chain {
     Arbitrum,
@@ -96,35 +105,82 @@ pub enum Chain {
     Rootstock,
     Sei,
     Stable,
+    Tempo,
     Unichain,
     XLayer,
+    Solana,
+    Tron,
 }
 
 impl Chain {
-    /// EVM chain ID for this chain.
-    pub fn evm_chain_id(&self) -> u64 {
+    /// EVM chain ID for this chain. `None` for non-EVM transports
+    /// (Solana, Tron), which the USDT0 deployments API returns with
+    /// `chainId: null`.
+    pub fn evm_chain_id(&self) -> Option<u64> {
         match self {
-            Self::Arbitrum => 42161,
-            Self::Berachain => 80094,
-            Self::Conflux => 1030,
-            Self::Corn => 21_000_000,
-            Self::Ethereum => 1,
-            Self::Flare => 14,
-            Self::Hedera => 295,
-            Self::HyperEvm => 999,
-            Self::Ink => 57073,
-            Self::Mantle => 5000,
-            Self::MegaEth => 4326,
-            Self::Monad => 143,
-            Self::Morph => 2818,
-            Self::Optimism => 10,
-            Self::Plasma => 9745,
-            Self::Polygon => 137,
-            Self::Rootstock => 30,
-            Self::Sei => 1329,
-            Self::Stable => 988,
-            Self::Unichain => 130,
-            Self::XLayer => 196,
+            Self::Arbitrum => Some(42161),
+            Self::Berachain => Some(80094),
+            Self::Conflux => Some(1030),
+            Self::Corn => Some(21_000_000),
+            Self::Ethereum => Some(1),
+            Self::Flare => Some(14),
+            Self::Hedera => Some(295),
+            Self::HyperEvm => Some(999),
+            Self::Ink => Some(57073),
+            Self::Mantle => Some(5000),
+            Self::MegaEth => Some(4326),
+            Self::Monad => Some(143),
+            Self::Morph => Some(2818),
+            Self::Optimism => Some(10),
+            Self::Plasma => Some(9745),
+            Self::Polygon => Some(137),
+            Self::Rootstock => Some(30),
+            Self::Sei => Some(1329),
+            Self::Stable => Some(988),
+            Self::Tempo => Some(4217),
+            Self::Unichain => Some(130),
+            Self::XLayer => Some(196),
+            Self::Solana | Self::Tron => None,
+        }
+    }
+
+    /// Underlying network transport.
+    pub fn transport(&self) -> NetworkTransport {
+        match self {
+            Self::Solana => NetworkTransport::Solana,
+            Self::Tron => NetworkTransport::Tron,
+            _ => NetworkTransport::Evm,
+        }
+    }
+
+    /// Lowercased chain name used as the secondary key in the USDT0 OFT
+    /// registry for chains where `chainId` is null.
+    pub fn registry_name(&self) -> &'static str {
+        match self {
+            Self::Arbitrum => "arbitrum",
+            Self::Berachain => "berachain",
+            Self::Conflux => "conflux",
+            Self::Corn => "corn",
+            Self::Ethereum => "ethereum",
+            Self::Flare => "flare",
+            Self::Hedera => "hedera",
+            Self::HyperEvm => "hyperevm",
+            Self::Ink => "ink",
+            Self::Mantle => "mantle",
+            Self::MegaEth => "megaeth",
+            Self::Monad => "monad",
+            Self::Morph => "morph",
+            Self::Optimism => "optimism",
+            Self::Plasma => "plasma",
+            Self::Polygon => "polygon",
+            Self::Rootstock => "rootstock",
+            Self::Sei => "sei",
+            Self::Stable => "stable",
+            Self::Tempo => "tempo",
+            Self::Unichain => "unichain",
+            Self::XLayer => "xlayer",
+            Self::Solana => "solana",
+            Self::Tron => "tron",
         }
     }
 
@@ -272,10 +328,13 @@ mod tests {
 
     #[macros::test_all]
     fn test_evm_chain_id() {
-        assert_eq!(Chain::Arbitrum.evm_chain_id(), 42161);
-        assert_eq!(Chain::Ethereum.evm_chain_id(), 1);
-        assert_eq!(Chain::Optimism.evm_chain_id(), 10);
-        assert_eq!(Chain::Polygon.evm_chain_id(), 137);
+        assert_eq!(Chain::Arbitrum.evm_chain_id(), Some(42161));
+        assert_eq!(Chain::Ethereum.evm_chain_id(), Some(1));
+        assert_eq!(Chain::Optimism.evm_chain_id(), Some(10));
+        assert_eq!(Chain::Polygon.evm_chain_id(), Some(137));
+        assert_eq!(Chain::Tempo.evm_chain_id(), Some(4217));
+        assert_eq!(Chain::Solana.evm_chain_id(), None);
+        assert_eq!(Chain::Tron.evm_chain_id(), None);
     }
 
     #[macros::test_all]
@@ -283,5 +342,25 @@ mod tests {
         assert!(Chain::Arbitrum.is_source_chain());
         assert!(!Chain::Ethereum.is_source_chain());
         assert!(!Chain::Optimism.is_source_chain());
+        assert!(!Chain::Solana.is_source_chain());
+        assert!(!Chain::Tron.is_source_chain());
+    }
+
+    #[macros::test_all]
+    fn test_transport() {
+        assert_eq!(Chain::Arbitrum.transport(), NetworkTransport::Evm);
+        assert_eq!(Chain::Ethereum.transport(), NetworkTransport::Evm);
+        assert_eq!(Chain::Tempo.transport(), NetworkTransport::Evm);
+        assert_eq!(Chain::Solana.transport(), NetworkTransport::Solana);
+        assert_eq!(Chain::Tron.transport(), NetworkTransport::Tron);
+    }
+
+    #[macros::test_all]
+    fn test_registry_name() {
+        assert_eq!(Chain::Arbitrum.registry_name(), "arbitrum");
+        assert_eq!(Chain::Ethereum.registry_name(), "ethereum");
+        assert_eq!(Chain::Tempo.registry_name(), "tempo");
+        assert_eq!(Chain::Solana.registry_name(), "solana");
+        assert_eq!(Chain::Tron.registry_name(), "tron");
     }
 }

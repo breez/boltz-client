@@ -238,6 +238,7 @@ impl BoltzService {
             Chain::Rootstock,
             Chain::Sei,
             Chain::Stable,
+            Chain::Tempo,
             Chain::Unichain,
             Chain::XLayer,
         ]
