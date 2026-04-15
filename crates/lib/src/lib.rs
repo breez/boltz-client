@@ -172,25 +172,38 @@ impl BoltzService {
 
     /// Get a quote for converting sats to USDT.
     /// Pure quote — no side effects, no swap created.
+    ///
+    /// `max_slippage_bps` overrides [`BoltzConfig::slippage_bps`] for this
+    /// quote only. Must still fall within the `10..=MAX_SLIPPAGE_BPS` range.
+    /// The resolved value is snapshotted onto the returned [`PreparedSwap`]
+    /// and persisted with the swap so the claim-time DEX quote check
+    /// honours the per-swap tolerance rather than the live config value.
     pub async fn prepare_reverse_swap(
         &self,
         destination: &str,
         chain: Chain,
         usdt_amount: u64,
+        max_slippage_bps: Option<u32>,
     ) -> Result<PreparedSwap, BoltzError> {
-        self.executor.prepare(destination, chain, usdt_amount).await
+        self.executor
+            .prepare(destination, chain, usdt_amount, max_slippage_bps)
+            .await
     }
 
     /// Get a quote starting from input sats (computes expected USDT output).
     /// Pure quote — no side effects, no swap created.
+    ///
+    /// See [`prepare_reverse_swap`](Self::prepare_reverse_swap) for the
+    /// `max_slippage_bps` override semantics.
     pub async fn prepare_reverse_swap_from_sats(
         &self,
         destination: &str,
         chain: Chain,
         invoice_amount_sats: u64,
+        max_slippage_bps: Option<u32>,
     ) -> Result<PreparedSwap, BoltzError> {
         self.executor
-            .prepare_from_sats(destination, chain, invoice_amount_sats)
+            .prepare_from_sats(destination, chain, invoice_amount_sats, max_slippage_bps)
             .await
     }
 

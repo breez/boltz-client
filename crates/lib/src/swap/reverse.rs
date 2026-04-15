@@ -111,12 +111,9 @@ impl ReverseSwapExecutor {
         destination: &str,
         chain: Chain,
         usdt_amount: u64,
+        max_slippage_bps: Option<u32>,
     ) -> Result<PreparedSwap, BoltzError> {
-        if self.config.slippage_bps < 10 || self.config.slippage_bps > MAX_SLIPPAGE_BPS {
-            return Err(BoltzError::Generic(format!(
-                "slippage_bps must be >= 10 and <= {MAX_SLIPPAGE_BPS}"
-            )));
-        }
+        let slippage_bps = resolve_slippage_bps(max_slippage_bps, self.config.slippage_bps)?;
 
         validate_destination(&chain, destination)?;
 
@@ -186,7 +183,7 @@ impl ReverseSwapExecutor {
             invoice_amount_sats: fee_calc.invoice_sats,
             boltz_fee_sats: fee_calc.boltz_fee_sats,
             estimated_onchain_amount: fee_calc.onchain_sats,
-            slippage_bps: self.config.slippage_bps,
+            slippage_bps,
             pair_hash: tbtc_pair.hash.clone(),
             expires_at: now.saturating_add(60),
         })
@@ -211,12 +208,9 @@ impl ReverseSwapExecutor {
         destination: &str,
         chain: Chain,
         invoice_amount_sats: u64,
+        max_slippage_bps: Option<u32>,
     ) -> Result<PreparedSwap, BoltzError> {
-        if self.config.slippage_bps < 10 || self.config.slippage_bps > MAX_SLIPPAGE_BPS {
-            return Err(BoltzError::Generic(format!(
-                "slippage_bps must be >= 10 and <= {MAX_SLIPPAGE_BPS}"
-            )));
-        }
+        let slippage_bps = resolve_slippage_bps(max_slippage_bps, self.config.slippage_bps)?;
 
         validate_destination(&chain, destination)?;
 
@@ -301,7 +295,7 @@ impl ReverseSwapExecutor {
             boltz_fee_sats: fee_calc.boltz_fee_sats,
             estimated_onchain_amount: fee_calc.onchain_sats,
 
-            slippage_bps: self.config.slippage_bps,
+            slippage_bps,
             pair_hash: tbtc_pair.hash.clone(),
             expires_at: now.saturating_add(60),
         })
@@ -407,6 +401,7 @@ impl ReverseSwapExecutor {
             invoice_amount_sats: prepared.invoice_amount_sats,
             onchain_amount: resp.onchain_amount,
             expected_usdt_amount: prepared.usdt_amount,
+            slippage_bps: prepared.slippage_bps,
             timeout_block_height: resp.timeout_block_height,
             lockup_tx_id: None,
             claim_tx_hash: None,
@@ -467,6 +462,7 @@ impl ReverseSwapExecutor {
             invoice_amount_sats: 0,
             onchain_amount: onchain_sats,
             expected_usdt_amount: 0,
+            slippage_bps: self.config.slippage_bps,
             timeout_block_height: timelock,
             lockup_tx_id: Some(recoverable.lockup_tx_hash.clone()),
             claim_tx_hash: None,
@@ -738,15 +734,15 @@ impl ReverseSwapExecutor {
         skip_drift_check: bool,
     ) -> Result<String, BoltzError> {
         let (dex_calls, min_amount_out, raw_quote_usdt) = self
-            .fetch_and_encode_dex_quote(tbtc_evm_amount, &addrs.router.to_string())
+            .fetch_and_encode_dex_quote(
+                tbtc_evm_amount,
+                &addrs.router.to_string(),
+                swap.slippage_bps,
+            )
             .await?;
 
         if !skip_drift_check {
-            check_quote_drift(
-                swap.expected_usdt_amount,
-                raw_quote_usdt,
-                self.config.slippage_bps,
-            )?;
+            check_quote_drift(swap.expected_usdt_amount, raw_quote_usdt, swap.slippage_bps)?;
         }
 
         // Same-chain claim is Arbitrum-only, which is always EVM, so the
@@ -894,7 +890,7 @@ impl ReverseSwapExecutor {
             .nativeFee
             .try_into()
             .map_err(|_| BoltzError::Generic("LZ fee too large".into()))?;
-        let fee_with_slippage = apply_slippage_up(native_fee, u128::from(self.config.slippage_bps));
+        let fee_with_slippage = apply_slippage_up(native_fee, u128::from(swap.slippage_bps));
 
         // Quote DEX: how much tBTC for the ETH messaging fee
         let fee_dex = pick_best_quote_with_data(
@@ -959,7 +955,7 @@ impl ReverseSwapExecutor {
             check_quote_drift(
                 swap.expected_usdt_amount,
                 raw_dest_amount,
-                self.config.slippage_bps,
+                swap.slippage_bps,
             )?;
         }
 
@@ -969,7 +965,7 @@ impl ReverseSwapExecutor {
         // price risk, so protecting them separately is simpler. The effective compound
         // slippage is ~(1-s)², e.g. ~1.99% when slippage_bps is 1%.
         #[expect(clippy::arithmetic_side_effects)]
-        let slippage_factor = 10000 - u128::from(self.config.slippage_bps);
+        let slippage_factor = 10000 - u128::from(swap.slippage_bps);
         #[expect(clippy::arithmetic_side_effects)]
         let min_usdt_out = trade_best.amount * slippage_factor / 10000;
         if min_usdt_out == 0 {
@@ -1475,6 +1471,7 @@ impl ReverseSwapExecutor {
         &self,
         tbtc_evm_amount: U256,
         router_address: &str,
+        slippage_bps: u32,
     ) -> Result<(Vec<contracts::Call>, U256, u128), BoltzError> {
         let amount_in: u128 = tbtc_evm_amount
             .try_into()
@@ -1498,7 +1495,7 @@ impl ReverseSwapExecutor {
             ));
         }
         let raw_quote_amount = best.amount;
-        let slippage_factor = 10000 - u128::from(self.config.slippage_bps);
+        let slippage_factor = 10000 - u128::from(slippage_bps);
         let min_amount_out_u128 = best.amount * slippage_factor / 10000;
         if min_amount_out_u128 == 0 {
             return Err(BoltzError::Generic(
@@ -1809,6 +1806,21 @@ fn apply_slippage_up(amount: u128, slippage_bps: u128) -> u128 {
     amount * (10000 + slippage_bps) / 10000
 }
 
+/// Pick the slippage tolerance for a new swap. Returns the per-swap
+/// `override_bps` when `Some`, otherwise falls back to `config_default`.
+/// Enforces the same `10..=MAX_SLIPPAGE_BPS` bounds in both cases so a bad
+/// per-swap value can't bypass the validation that previously ran on the
+/// config-level default.
+fn resolve_slippage_bps(override_bps: Option<u32>, config_default: u32) -> Result<u32, BoltzError> {
+    let bps = override_bps.unwrap_or(config_default);
+    if !(10..=MAX_SLIPPAGE_BPS).contains(&bps) {
+        return Err(BoltzError::Generic(format!(
+            "slippage_bps must be >= 10 and <= {MAX_SLIPPAGE_BPS}"
+        )));
+    }
+    Ok(bps)
+}
+
 // ─── DEX quote selection ─────────────────────────────────────────────────
 // - "in" direction (quoting by input):  pick highest output (best return)
 // - "out" direction (quoting by output): pick lowest input  (cheapest route)
@@ -2071,6 +2083,52 @@ mod tests {
         // Recovery swaps have expected=0, should always pass
         // (but in practice skip_drift_check=true is used for recovery)
         assert!(check_quote_drift(0, 500_000, 100).is_ok());
+    }
+
+    // ─── Slippage override resolution ────────────────────────────────
+
+    #[macros::test_all]
+    fn resolve_slippage_override_wins_over_config() {
+        assert_eq!(resolve_slippage_bps(Some(250), 100).unwrap(), 250);
+    }
+
+    #[macros::test_all]
+    fn resolve_slippage_falls_back_to_config_when_none() {
+        assert_eq!(resolve_slippage_bps(None, 100).unwrap(), 100);
+    }
+
+    #[macros::test_all]
+    fn resolve_slippage_accepts_bounds() {
+        assert_eq!(resolve_slippage_bps(Some(10), 100).unwrap(), 10);
+        assert_eq!(
+            resolve_slippage_bps(Some(MAX_SLIPPAGE_BPS), 100).unwrap(),
+            MAX_SLIPPAGE_BPS
+        );
+    }
+
+    #[macros::test_all]
+    fn resolve_slippage_rejects_below_min() {
+        assert!(resolve_slippage_bps(Some(9), 100).is_err());
+    }
+
+    #[macros::test_all]
+    fn resolve_slippage_rejects_above_max() {
+        assert!(resolve_slippage_bps(Some(MAX_SLIPPAGE_BPS + 1), 100).is_err());
+    }
+
+    #[macros::test_all]
+    fn resolve_slippage_rejects_out_of_range_config_default() {
+        // Override is None but config default is out of range — validation
+        // applies to the resolved value regardless of origin.
+        assert!(resolve_slippage_bps(None, 5).is_err());
+        assert!(resolve_slippage_bps(None, MAX_SLIPPAGE_BPS + 1).is_err());
+    }
+
+    #[macros::test_all]
+    fn resolve_slippage_override_accepted_even_when_config_is_out_of_range() {
+        // If a caller explicitly sets a valid per-swap override, a broken
+        // config default must not poison the prepare call.
+        assert_eq!(resolve_slippage_bps(Some(150), 10_000).unwrap(), 150);
     }
 
     // ─── OFT approval gate tests ─────────────────────────────────────

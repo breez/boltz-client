@@ -417,10 +417,10 @@ async fn prepare(
 ) -> Result<boltz_client::PreparedSwap> {
     match (usdt, sats) {
         (Some(usdt_amount), _) => Ok(svc
-            .prepare_reverse_swap(destination, chain, usdt_amount)
+            .prepare_reverse_swap(destination, chain, usdt_amount, None)
             .await?),
         (_, Some(sats_amount)) => Ok(svc
-            .prepare_reverse_swap_from_sats(destination, chain, sats_amount)
+            .prepare_reverse_swap_from_sats(destination, chain, sats_amount, None)
             .await?),
         _ => bail!("Either --usdt or --sats must be provided"),
     }

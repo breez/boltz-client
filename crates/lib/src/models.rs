@@ -37,6 +37,10 @@ pub struct BoltzSwap {
     pub onchain_amount: u64,
     /// Expected USDT output (6 decimals).
     pub expected_usdt_amount: u64,
+    /// DEX slippage tolerance (basis points) snapshot at `prepare` time.
+    /// Used for the claim-time quote drift check and on-chain `minOut`
+    /// values so per-swap overrides survive across service restarts.
+    pub slippage_bps: u32,
 
     // Timing
     pub timeout_block_height: u64,
@@ -306,6 +310,7 @@ mod tests {
             invoice_amount_sats: 100_000,
             onchain_amount: 99_500,
             expected_usdt_amount: 71_000_000,
+            slippage_bps: 100,
             timeout_block_height: 123_456,
             lockup_tx_id: None,
             claim_tx_hash: None,

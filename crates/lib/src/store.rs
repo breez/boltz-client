@@ -116,6 +116,7 @@ mod tests {
             invoice_amount_sats: 100_000,
             onchain_amount: 99_500,
             expected_usdt_amount: 71_000_000,
+            slippage_bps: 100,
             timeout_block_height: 123_456,
             lockup_tx_id: None,
             claim_tx_hash: None,
