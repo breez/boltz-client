@@ -22,6 +22,7 @@ pub fn regtest_config() -> BoltzConfig {
         referral_id: "regtest".to_string(),
         slippage_bps: 100,
         oft_deployments_url: boltz_client::DEFAULT_OFT_DEPLOYMENTS_URL.to_string(),
+        solana_rpc_url: boltz_client::DEFAULT_SOLANA_RPC_URL.to_string(),
     }
 }
 
