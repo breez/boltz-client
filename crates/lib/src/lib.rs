@@ -270,6 +270,14 @@ impl BoltzService {
         self.executor.get_limits().await
     }
 
+    /// Destination-chain USDT0 token contract address, when the USDT0
+    /// deployments registry publishes one for this chain. `None` for
+    /// adapter-only deployments (Ethereum mainnet) or for chains not yet
+    /// present in the registry.
+    pub fn token_address(&self, chain: &Chain) -> Option<String> {
+        self.executor.token_address(chain)
+    }
+
     /// Accept a degraded DEX quote and proceed with claiming.
     ///
     /// Call this after receiving a [`BoltzSwapEvent::QuoteDegraded`] event.

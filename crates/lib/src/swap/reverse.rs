@@ -91,6 +91,14 @@ impl ReverseSwapExecutor {
         })
     }
 
+    /// Look up the destination-chain USDT0 token contract address, when one
+    /// is published in the OFT deployments registry.
+    pub fn token_address(&self, chain: &Chain) -> Option<String> {
+        self.oft_deployments
+            .token_address_for(chain)
+            .map(str::to_string)
+    }
+
     /// Prepare a reverse swap quote. No side effects.
     ///
     /// Works backwards from the caller's target USDT amount:

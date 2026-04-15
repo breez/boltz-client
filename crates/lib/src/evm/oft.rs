@@ -27,6 +27,12 @@ const DEFAULT_OFT_NAME: &str = "usdt0";
 /// legacy-mesh deployment.
 const PRIMARY_OFT_CONTRACT_NAMES: &[&str] = &["OFT", "OFT Adapter", "OFT Program"];
 
+/// Contract name under which the USDT0 token address is published in the
+/// deployments registry. Not every chain publishes one: on Ethereum (and
+/// similar adapter-only deployments) the OFT wraps the canonical USDT and
+/// there is no separate `Token` entry.
+const TOKEN_CONTRACT_NAME: &str = "Token";
+
 /// Flat per-route fee charged by the legacy mesh USDT0 bridge, in basis
 /// points. The legacy `quoteOFT` staticcall does not deduct this, so any
 /// inverse-quote (destination amount → required source amount) for a legacy
@@ -86,6 +92,11 @@ pub struct OftChainInfo {
     /// OFT contract address (hex with 0x prefix for EVM; native encoding
     /// for Solana/TON/Tron).
     pub oft_address: String,
+    /// USDT0 token contract address when published in the deployments
+    /// registry. `None` for adapter-only deployments (e.g. Ethereum mainnet)
+    /// where the OFT wraps the canonical USDT and no separate token entry
+    /// exists in the registry.
+    pub token_address: Option<String>,
     /// Which mesh this entry came from.
     pub mesh: Usdt0Kind,
 }
@@ -194,6 +205,15 @@ impl OftDeployments {
         }
     }
 
+    /// Return the USDT0 token contract address for a destination chain when
+    /// the deployments registry publishes one. `None` for chains where only
+    /// an OFT adapter is published (e.g. Ethereum mainnet, where the adapter
+    /// wraps the canonical USDT token whose address lives outside this
+    /// registry), or for chains not resolved at all.
+    pub fn token_address_for(&self, chain: &Chain) -> Option<&str> {
+        self.get_for(chain)?.token_address.as_deref()
+    }
+
     /// Get the source OFT contract address for a chain on a given mesh.
     ///
     /// The native and legacy meshes are independent bridges that ship from
@@ -234,6 +254,7 @@ fn resolve_chain(chain: &OftApiChain, mesh: Usdt0Kind) -> Option<ResolvedChain> 
     let info = OftChainInfo {
         lz_eid,
         oft_address: contract.address.clone(),
+        token_address: find_token_contract(&chain.contracts).map(|c| c.address.clone()),
         mesh,
     };
 
@@ -254,6 +275,10 @@ fn find_primary_contract(contracts: &[OftApiContract]) -> Option<&OftApiContract
     PRIMARY_OFT_CONTRACT_NAMES
         .iter()
         .find_map(|name| contracts.iter().find(|c| c.name == *name))
+}
+
+fn find_token_contract(contracts: &[OftApiContract]) -> Option<&OftApiContract> {
+    contracts.iter().find(|c| c.name == TOKEN_CONTRACT_NAME)
 }
 
 // ─── API response types ─────────────────────────────────────────────────
@@ -376,6 +401,10 @@ mod tests {
             arb.oft_address,
             "0x14E4A1B13bf7F943c8ff7C51fb60FA964A298D92"
         );
+        assert_eq!(
+            arb.token_address.as_deref(),
+            Some("0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9")
+        );
         assert_eq!(arb.mesh, Usdt0Kind::Native);
 
         let eth = deployments.get(1).expect("ethereum native");
@@ -383,7 +412,19 @@ mod tests {
             eth.oft_address,
             "0x6C96dE32CEa08842dcc4058c14d3aaAD7Fa41dee"
         );
+        // Ethereum only publishes an adapter — no separate Token entry.
+        assert!(eth.token_address.is_none());
         assert_eq!(eth.mesh, Usdt0Kind::Native);
+    }
+
+    #[macros::test_all]
+    fn token_address_for_resolves_native_and_returns_none_for_adapter_only() {
+        let deployments = OftDeployments::parse(SAMPLE_DEPLOYMENTS).unwrap();
+        assert_eq!(
+            deployments.token_address_for(&Chain::Arbitrum),
+            Some("0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9")
+        );
+        assert_eq!(deployments.token_address_for(&Chain::Ethereum), None);
     }
 
     #[macros::test_all]
