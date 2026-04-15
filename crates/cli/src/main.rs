@@ -552,7 +552,7 @@ fn init_logging(data_dir: &Path) -> Result<()> {
 }
 
 // ─── File-backed BoltzStorage ─────────────────────────────────────────────
-// Persists key indices to `{data_dir}/key_index_{chain_id}` and swap state to
+// Persists the key index to `{data_dir}/key_index` and swap state to
 // `{data_dir}/swaps/{swap_id}.json` so that active swaps survive CLI restarts.
 //
 // Known limitations (acceptable for a CLI tool):
@@ -573,8 +573,8 @@ impl FileBoltzStorage {
         }
     }
 
-    fn index_path(&self, chain_id: u64) -> PathBuf {
-        self.data_dir.join(format!("key_index_{chain_id}"))
+    fn index_path(&self) -> PathBuf {
+        self.data_dir.join("key_index")
     }
 
     fn swaps_dir(&self) -> PathBuf {
@@ -585,8 +585,8 @@ impl FileBoltzStorage {
         self.swaps_dir().join(format!("{id}.json"))
     }
 
-    fn read_index(&self, chain_id: u64) -> Result<u32, BoltzError> {
-        match fs::read_to_string(self.index_path(chain_id)) {
+    fn read_index(&self) -> Result<u32, BoltzError> {
+        match fs::read_to_string(self.index_path()) {
             Ok(s) => s
                 .trim()
                 .parse()
@@ -596,8 +596,8 @@ impl FileBoltzStorage {
         }
     }
 
-    fn write_index(&self, chain_id: u64, index: u32) -> Result<(), BoltzError> {
-        fs::write(self.index_path(chain_id), index.to_string())
+    fn write_index(&self, index: u32) -> Result<(), BoltzError> {
+        fs::write(self.index_path(), index.to_string())
             .map_err(|e| BoltzError::Store(format!("Failed to write key index: {e}")))
     }
 
@@ -667,19 +667,19 @@ impl BoltzStorage for FileBoltzStorage {
         Ok(active)
     }
 
-    async fn increment_key_index(&self, chain_id: u64) -> Result<u32, BoltzError> {
-        let current = self.read_index(chain_id)?;
+    async fn increment_key_index(&self) -> Result<u32, BoltzError> {
+        let current = self.read_index()?;
         let next = current
             .checked_add(1)
             .ok_or_else(|| BoltzError::Store("Key index overflow".to_string()))?;
-        self.write_index(chain_id, next)?;
+        self.write_index(next)?;
         Ok(current)
     }
 
-    async fn set_key_index_if_higher(&self, chain_id: u64, value: u32) -> Result<(), BoltzError> {
-        let current = self.read_index(chain_id)?;
+    async fn set_key_index_if_higher(&self, value: u32) -> Result<(), BoltzError> {
+        let current = self.read_index()?;
         if value > current {
-            self.write_index(chain_id, value)?;
+            self.write_index(value)?;
         }
         Ok(())
     }

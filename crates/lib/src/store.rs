@@ -20,17 +20,17 @@ pub trait BoltzStorage: Send + Sync {
     /// Return all swaps with non-terminal status.
     async fn list_active_swaps(&self) -> Result<Vec<BoltzSwap>, BoltzError>;
     /// Atomically reserve the next key index and return it.
-    async fn increment_key_index(&self, chain_id: u64) -> Result<u32, BoltzError>;
+    async fn increment_key_index(&self) -> Result<u32, BoltzError>;
     /// Set the key index to `value` if it is greater than the current index.
     /// Used by recovery to fast-forward past already-used indices.
-    async fn set_key_index_if_higher(&self, chain_id: u64, value: u32) -> Result<(), BoltzError>;
+    async fn set_key_index_if_higher(&self, value: u32) -> Result<(), BoltzError>;
 }
 
 /// In-memory store for testing.
 #[derive(Default)]
 pub struct MemoryBoltzStorage {
     swaps: tokio::sync::Mutex<std::collections::HashMap<String, BoltzSwap>>,
-    key_indices: tokio::sync::Mutex<std::collections::HashMap<u64, u32>>,
+    key_index: tokio::sync::Mutex<u32>,
 }
 
 impl MemoryBoltzStorage {
@@ -74,9 +74,8 @@ impl BoltzStorage for MemoryBoltzStorage {
             .collect())
     }
 
-    async fn increment_key_index(&self, chain_id: u64) -> Result<u32, BoltzError> {
-        let mut indices = self.key_indices.lock().await;
-        let idx = indices.entry(chain_id).or_insert(0);
+    async fn increment_key_index(&self) -> Result<u32, BoltzError> {
+        let mut idx = self.key_index.lock().await;
         let current = *idx;
         *idx = current
             .checked_add(1)
@@ -84,11 +83,10 @@ impl BoltzStorage for MemoryBoltzStorage {
         Ok(current)
     }
 
-    async fn set_key_index_if_higher(&self, chain_id: u64, value: u32) -> Result<(), BoltzError> {
-        let mut indices = self.key_indices.lock().await;
-        let current = indices.entry(chain_id).or_insert(0);
-        if value > *current {
-            *current = value;
+    async fn set_key_index_if_higher(&self, value: u32) -> Result<(), BoltzError> {
+        let mut idx = self.key_index.lock().await;
+        if value > *idx {
+            *idx = value;
         }
         Ok(())
     }
@@ -180,10 +178,10 @@ mod tests {
     async fn test_key_index_management() {
         let store = MemoryBoltzStorage::new();
 
-        let idx0 = store.increment_key_index(42161).await.unwrap();
+        let idx0 = store.increment_key_index().await.unwrap();
         assert_eq!(idx0, 0);
 
-        let idx1 = store.increment_key_index(42161).await.unwrap();
+        let idx1 = store.increment_key_index().await.unwrap();
         assert_eq!(idx1, 1);
     }
 

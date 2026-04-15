@@ -208,10 +208,7 @@ impl BoltzService {
         &self,
         prepared: &PreparedSwap,
     ) -> Result<CreatedSwap, BoltzError> {
-        let key_index = self
-            .store
-            .increment_key_index(self.executor.config.chain_id)
-            .await?;
+        let key_index = self.store.increment_key_index().await?;
 
         let swap = self.executor.create(prepared, key_index).await?;
         let created = CreatedSwap {
@@ -311,7 +308,7 @@ impl BoltzService {
 
         if let Some(highest) = stats.highest_key_index {
             self.store
-                .set_key_index_if_higher(self.executor.config.chain_id, highest.saturating_add(1))
+                .set_key_index_if_higher(highest.saturating_add(1))
                 .await?;
         }
 
