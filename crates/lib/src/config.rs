@@ -44,10 +44,19 @@ impl AlchemyConfig {
 
 impl BoltzConfig {
     /// Returns a default configuration for Arbitrum mainnet.
-    pub fn mainnet(alchemy_config: AlchemyConfig, referral_id: String) -> Self {
+    ///
+    /// `alchemy_config` is populated with the Boltz-operated defaults
+    /// ([`DEFAULT_ALCHEMY_API_KEY`] / [`DEFAULT_ALCHEMY_GAS_POLICY_ID`]). These
+    /// are hardcoded for v1; long-term they will be fetched from a Boltz
+    /// endpoint at startup. Callers that need custom Alchemy credentials can
+    /// override `alchemy_config` on the returned struct.
+    pub fn mainnet(referral_id: String) -> Self {
         Self {
             api_url: "https://api.boltz.exchange".to_string(),
-            alchemy_config,
+            alchemy_config: AlchemyConfig {
+                api_key: DEFAULT_ALCHEMY_API_KEY.to_string(),
+                gas_policy_id: DEFAULT_ALCHEMY_GAS_POLICY_ID.to_string(),
+            },
             arbitrum_rpc_url: "https://arb1.arbitrum.io/rpc".to_string(),
             chain_id: ARBITRUM_CHAIN_ID,
             referral_id,
@@ -80,6 +89,15 @@ pub const MAX_SLIPPAGE_BPS: u32 = 500;
 
 /// Default URL for fetching OFT (USDT0) deployment data.
 pub const DEFAULT_OFT_DEPLOYMENTS_URL: &str = "https://docs.usdt0.to/api/deployments";
+
+/// Default Alchemy API key used for gas abstraction. Hardcoded as a
+/// Boltz-operated default so the SDK layer is oblivious to credentials;
+/// long-term this is expected to be fetched from a Boltz endpoint at startup.
+pub const DEFAULT_ALCHEMY_API_KEY: &str = "R-iU8US4vKEe2GH6VlCTg";
+
+/// Default Alchemy gas sponsorship policy ID paired with
+/// [`DEFAULT_ALCHEMY_API_KEY`].
+pub const DEFAULT_ALCHEMY_GAS_POLICY_ID: &str = "dcf46730-a11c-4869-a38b-35bcd73fe73f";
 
 /// Router contract address on Arbitrum — not available via the Boltz API.
 /// If upgraded, the old contract address remains valid.

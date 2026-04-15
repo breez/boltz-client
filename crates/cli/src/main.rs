@@ -13,8 +13,7 @@ use rustyline::hint::HistoryHinter;
 use rustyline::{Completer, Helper, Hinter, Validator, highlight::Highlighter};
 
 use boltz_client::{
-    AlchemyConfig, BoltzConfig, BoltzError, BoltzEventListener, BoltzService, BoltzStorage,
-    BoltzSwapEvent,
+    BoltzConfig, BoltzError, BoltzEventListener, BoltzService, BoltzStorage, BoltzSwapEvent,
 };
 
 #[derive(Clone, clap::ValueEnum)]
@@ -93,18 +92,6 @@ struct Cli {
     /// Data directory for persisting mnemonic and state.
     #[arg(long, env = "BOLTZ_DATA_DIR", default_value = "./.data-boltz")]
     data_dir: PathBuf,
-
-    /// Alchemy API key.
-    #[arg(long, env = "ALCHEMY_API_KEY", default_value = "R-iU8US4vKEe2GH6VlCTg")]
-    alchemy_api_key: String,
-
-    /// Alchemy gas policy ID.
-    #[arg(
-        long,
-        env = "ALCHEMY_GAS_POLICY_ID",
-        default_value = "dcf46730-a11c-4869-a38b-35bcd73fe73f"
-    )]
-    alchemy_gas_policy_id: String,
 
     /// Boltz referral ID.
     #[arg(long, env = "BOLTZ_REFERRAL_ID", default_value = "breez-sdk")]
@@ -203,13 +190,7 @@ async fn main() -> Result<()> {
     };
     let seed = mnemonic.to_seed("");
 
-    let mut config = BoltzConfig::mainnet(
-        AlchemyConfig {
-            api_key: cli.alchemy_api_key,
-            gas_policy_id: cli.alchemy_gas_policy_id,
-        },
-        cli.referral_id,
-    );
+    let mut config = BoltzConfig::mainnet(cli.referral_id);
     if let Some(slippage_bps) = cli.slippage_bps {
         config.slippage_bps = slippage_bps;
     }

@@ -185,13 +185,7 @@ mod tests {
 
     #[macros::test_all]
     fn test_api_client_construction() {
-        let config = BoltzConfig::mainnet(
-            crate::config::AlchemyConfig {
-                api_key: "test_key".to_string(),
-                gas_policy_id: "test_policy".to_string(),
-            },
-            "test_referral".to_string(),
-        );
+        let config = BoltzConfig::mainnet("test_referral".to_string());
         let client = BoltzApiClient::new(
             &config,
             Box::new(platform_utils::DefaultHttpClient::new(None)),
