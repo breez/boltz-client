@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::BoltzError;
 use crate::evm::contracts::{address_to_bytes32, parse_address};
-use crate::models::{Chain, NetworkTransport};
+use crate::models::NetworkTransport;
 
 const TRON_BASE58_LEN: usize = 25;
 const TRON_PAYLOAD_LEN: usize = 21;
@@ -31,11 +31,11 @@ pub fn encode_oft_recipient(
     }
 }
 
-/// Whether `addr` is a valid destination address for `chain`'s transport.
+/// Whether `addr` is a valid destination address for the given transport.
 /// Cheap to call from input-validation paths in callers.
 #[must_use]
-pub fn is_valid_destination_address(chain: &Chain, addr: &str) -> bool {
-    encode_oft_recipient(chain.transport(), addr).is_ok()
+pub fn is_valid_destination_address(transport: NetworkTransport, addr: &str) -> bool {
+    encode_oft_recipient(transport, addr).is_ok()
 }
 
 fn encode_evm(addr: &str) -> Result<FixedBytes<32>, BoltzError> {
@@ -221,26 +221,32 @@ mod tests {
     }
 
     #[macros::test_all]
-    fn validator_dispatches_per_chain() {
+    fn validator_dispatches_per_transport() {
         assert!(is_valid_destination_address(
-            &Chain::Arbitrum,
+            NetworkTransport::Evm,
             "0x1234567890AbCdEf1234567890aBcDeF12345678"
         ));
-        assert!(!is_valid_destination_address(&Chain::Arbitrum, "TInvalid"));
+        assert!(!is_valid_destination_address(
+            NetworkTransport::Evm,
+            "TInvalid"
+        ));
 
         assert!(is_valid_destination_address(
-            &Chain::Solana,
+            NetworkTransport::Solana,
             "11111111111111111111111111111111"
         ));
         assert!(!is_valid_destination_address(
-            &Chain::Solana,
+            NetworkTransport::Solana,
             "0x1234567890AbCdEf1234567890aBcDeF12345678"
         ));
 
         assert!(is_valid_destination_address(
-            &Chain::Tron,
+            NetworkTransport::Tron,
             "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
         ));
-        assert!(!is_valid_destination_address(&Chain::Tron, "TInvalid"));
+        assert!(!is_valid_destination_address(
+            NetworkTransport::Tron,
+            "TInvalid"
+        ));
     }
 }

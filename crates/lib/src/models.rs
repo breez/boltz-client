@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Persisted state for a single Boltz reverse swap.
@@ -20,7 +22,7 @@ pub struct BoltzSwap {
     /// User's final USDT destination.
     pub destination_address: String,
     /// Target chain for delivery.
-    pub destination_chain: Chain,
+    pub destination_chain: ChainId,
     /// Boltz's refund address (from swap response).
     pub refund_address: String,
 
@@ -80,7 +82,7 @@ impl BoltzSwapStatus {
 }
 
 /// Underlying transport for a chain. Determines recipient encoding, RPC
-/// dispatch, and OFT registry lookup keying.
+/// dispatch, and OFT source-contract selection.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum NetworkTransport {
     Evm,
@@ -88,110 +90,122 @@ pub enum NetworkTransport {
     Tron,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub enum Chain {
-    Arbitrum,
-    Berachain,
-    Conflux,
-    Corn,
-    Ethereum,
-    Flare,
-    Hedera,
-    HyperEvm,
-    Ink,
-    Mantle,
-    MegaEth,
-    Monad,
-    Morph,
-    Optimism,
-    Plasma,
-    Polygon,
-    Rootstock,
-    Sei,
-    Solana,
-    Stable,
-    Tempo,
-    Tron,
-    Unichain,
-    XLayer,
+/// Which USDT0 mesh a destination belongs to. Native-mesh and legacy-mesh
+/// deployments live on distinct source-side OFT contracts with different
+/// fee models, so the destination's mesh determines which source contract
+/// the claim path quotes and bridges through.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Usdt0Kind {
+    Native,
+    Legacy,
 }
 
-impl Chain {
-    /// EVM chain ID for this chain. `None` for non-EVM transports
-    /// (Solana, Tron), which the USDT0 deployments API returns with
-    /// `chainId: null`.
-    pub fn evm_chain_id(&self) -> Option<u64> {
-        match self {
-            Self::Arbitrum => Some(42161),
-            Self::Berachain => Some(80094),
-            Self::Conflux => Some(1030),
-            Self::Corn => Some(21_000_000),
-            Self::Ethereum => Some(1),
-            Self::Flare => Some(14),
-            Self::Hedera => Some(295),
-            Self::HyperEvm => Some(999),
-            Self::Ink => Some(57073),
-            Self::Mantle => Some(5000),
-            Self::MegaEth => Some(4326),
-            Self::Monad => Some(143),
-            Self::Morph => Some(2818),
-            Self::Optimism => Some(10),
-            Self::Plasma => Some(9745),
-            Self::Polygon => Some(137),
-            Self::Rootstock => Some(30),
-            Self::Sei => Some(1329),
-            Self::Stable => Some(988),
-            Self::Tempo => Some(4217),
-            Self::Unichain => Some(130),
-            Self::XLayer => Some(196),
-            Self::Solana | Self::Tron => None,
-        }
+/// Stable identifier for a destination chain. Holds the USDT0 chain name
+/// lowercased (e.g. `"arbitrum one"`, `"solana"`, `"tempo"`). Construct via
+/// [`ChainId::new`] to guarantee the canonical lowercased form.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ChainId(String);
+
+impl ChainId {
+    /// Build a `ChainId` from any string, lowercasing to the canonical form.
+    pub fn new(name: impl AsRef<str>) -> Self {
+        Self(name.as_ref().to_lowercase())
     }
 
-    /// Underlying network transport.
-    pub fn transport(&self) -> NetworkTransport {
-        match self {
-            Self::Solana => NetworkTransport::Solana,
-            Self::Tron => NetworkTransport::Tron,
-            _ => NetworkTransport::Evm,
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ChainId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for ChainId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Runtime metadata for a single destination chain. Built from the USDT0
+/// deployments API at service init and joined with the `NetworkTransport`
+/// inferred from the USDT0 entry.
+#[derive(Clone, Debug)]
+pub struct ChainSpec {
+    /// Canonical ID (lowercased USDT0 name). Stable join key.
+    pub id: ChainId,
+    /// Raw USDT0 name (`"Arbitrum One"`, `"Solana"`) — display-only.
+    pub display_name: String,
+    pub transport: NetworkTransport,
+    /// EVM chain ID. `None` for non-EVM transports (Solana, Tron), which
+    /// USDT0 returns with `chainId: null`.
+    pub evm_chain_id: Option<u64>,
+    /// `LayerZero` endpoint ID for this destination.
+    pub lz_eid: u32,
+    /// Destination-side OFT contract address (`0x…` for EVM, base58 for
+    /// Solana/Tron). Informational only — the claim path uses the
+    /// source-side OFT picked from [`SourceSpec::oft_for`].
+    pub oft_address: String,
+    /// USDT0 token contract address when the deployments registry publishes
+    /// one. `None` for adapter-only deployments (Ethereum mainnet, where the
+    /// adapter wraps the canonical USDT).
+    pub token_address: Option<String>,
+    /// Which mesh this entry came from.
+    pub mesh: Usdt0Kind,
+}
+
+/// Runtime metadata for the source chain (Arbitrum). Aggregates the native-
+/// and legacy-mesh OFT contracts on the same chain so the claim path can
+/// pick the one matching the destination's mesh.
+#[derive(Clone, Debug)]
+pub struct SourceSpec {
+    pub id: ChainId,
+    pub evm_chain_id: u64,
+    /// Source OFT contract on the native mesh. `None` if the source chain
+    /// doesn't participate in the native mesh.
+    pub native_oft_address: Option<String>,
+    /// Source OFT contract on the legacy mesh. `None` if the source chain
+    /// doesn't participate in the legacy mesh.
+    pub legacy_oft_address: Option<String>,
+}
+
+impl SourceSpec {
+    /// Pick the source OFT contract address for a destination on the given
+    /// mesh. Returns `None` if the source doesn't participate in that mesh.
+    pub fn oft_for(&self, mesh: Usdt0Kind) -> Option<&str> {
+        match mesh {
+            Usdt0Kind::Native => self.native_oft_address.as_deref(),
+            Usdt0Kind::Legacy => self.legacy_oft_address.as_deref(),
         }
     }
+}
 
-    /// Lowercased chain name used as the secondary key in the USDT0 OFT
-    /// registry for chains where `chainId` is null.
-    pub fn registry_name(&self) -> &'static str {
-        match self {
-            Self::Arbitrum => "arbitrum",
-            Self::Berachain => "berachain",
-            Self::Conflux => "conflux",
-            Self::Corn => "corn",
-            Self::Ethereum => "ethereum",
-            Self::Flare => "flare",
-            Self::Hedera => "hedera",
-            Self::HyperEvm => "hyperevm",
-            Self::Ink => "ink",
-            Self::Mantle => "mantle",
-            Self::MegaEth => "megaeth",
-            Self::Monad => "monad",
-            Self::Morph => "morph",
-            Self::Optimism => "optimism",
-            Self::Plasma => "plasma",
-            Self::Polygon => "polygon",
-            Self::Rootstock => "rootstock",
-            Self::Sei => "sei",
-            Self::Stable => "stable",
-            Self::Tempo => "tempo",
-            Self::Unichain => "unichain",
-            Self::XLayer => "xlayer",
-            Self::Solana => "solana",
-            Self::Tron => "tron",
-        }
+/// Runtime registry of the source chain and all supported destinations.
+/// Built once at service init from the USDT0 deployments API; stable for
+/// the process lifetime.
+#[derive(Clone, Debug)]
+pub struct ChainRegistry {
+    pub source: SourceSpec,
+    pub destinations: HashMap<ChainId, ChainSpec>,
+}
+
+impl ChainRegistry {
+    pub fn get(&self, id: &ChainId) -> Option<&ChainSpec> {
+        self.destinations.get(id)
     }
 
-    /// Whether this is the source chain (Arbitrum) where claims happen on-chain.
-    /// Non-Arbitrum destinations require OFT cross-chain bridging.
-    pub fn is_source_chain(&self) -> bool {
-        *self == Self::Arbitrum
+    /// Whether `id` refers to the source chain (i.e. same-chain delivery,
+    /// no OFT bridging needed).
+    pub fn is_source(&self, id: &ChainId) -> bool {
+        *id == self.source.id
+    }
+
+    /// All destination IDs, in arbitrary order.
+    pub fn supported_chains(&self) -> Vec<ChainId> {
+        self.destinations.keys().cloned().collect()
     }
 }
 
@@ -199,7 +213,7 @@ impl Chain {
 #[derive(Clone, Debug, Serialize)]
 pub struct PreparedSwap {
     pub destination_address: String,
-    pub destination_chain: Chain,
+    pub destination_chain: ChainId,
     /// Requested USDT output (6 decimals).
     pub usdt_amount: u64,
     /// Total sats to pay (includes all fees).
@@ -234,7 +248,7 @@ pub struct CompletedSwap {
     /// Actual USDT amount delivered (6 decimals).
     pub usdt_delivered: u64,
     pub destination_address: String,
-    pub destination_chain: Chain,
+    pub destination_chain: ChainId,
 }
 
 /// Min/max swap limits from the Boltz pairs endpoint.
@@ -302,7 +316,7 @@ mod tests {
             chain_id: 42161,
             claim_address: "0xabc".to_string(),
             destination_address: "0xdef".to_string(),
-            destination_chain: Chain::Arbitrum,
+            destination_chain: ChainId::new("arbitrum one"),
             refund_address: "0x123".to_string(),
             erc20swap_address: "0xswap".to_string(),
             router_address: "0xrouter".to_string(),
@@ -323,49 +337,23 @@ mod tests {
         assert_eq!(deserialized.id, "boltz-1");
         assert_eq!(deserialized.status, BoltzSwapStatus::Created);
         assert_eq!(deserialized.chain_id, 42161);
+        assert_eq!(deserialized.destination_chain.as_str(), "arbitrum one");
     }
 
     #[macros::test_all]
-    fn test_chain_equality() {
-        assert_eq!(Chain::Arbitrum, Chain::Arbitrum);
-        assert_ne!(Chain::Arbitrum, Chain::Ethereum);
+    fn chain_id_lowercases_on_construction() {
+        assert_eq!(ChainId::new("Arbitrum One").as_str(), "arbitrum one");
+        assert_eq!(ChainId::new("SOLANA").as_str(), "solana");
+        assert_eq!(ChainId::new("tempo").as_str(), "tempo");
     }
 
     #[macros::test_all]
-    fn test_evm_chain_id() {
-        assert_eq!(Chain::Arbitrum.evm_chain_id(), Some(42161));
-        assert_eq!(Chain::Ethereum.evm_chain_id(), Some(1));
-        assert_eq!(Chain::Optimism.evm_chain_id(), Some(10));
-        assert_eq!(Chain::Polygon.evm_chain_id(), Some(137));
-        assert_eq!(Chain::Tempo.evm_chain_id(), Some(4217));
-        assert_eq!(Chain::Solana.evm_chain_id(), None);
-        assert_eq!(Chain::Tron.evm_chain_id(), None);
-    }
-
-    #[macros::test_all]
-    fn test_is_source_chain() {
-        assert!(Chain::Arbitrum.is_source_chain());
-        assert!(!Chain::Ethereum.is_source_chain());
-        assert!(!Chain::Optimism.is_source_chain());
-        assert!(!Chain::Solana.is_source_chain());
-        assert!(!Chain::Tron.is_source_chain());
-    }
-
-    #[macros::test_all]
-    fn test_transport() {
-        assert_eq!(Chain::Arbitrum.transport(), NetworkTransport::Evm);
-        assert_eq!(Chain::Ethereum.transport(), NetworkTransport::Evm);
-        assert_eq!(Chain::Tempo.transport(), NetworkTransport::Evm);
-        assert_eq!(Chain::Solana.transport(), NetworkTransport::Solana);
-        assert_eq!(Chain::Tron.transport(), NetworkTransport::Tron);
-    }
-
-    #[macros::test_all]
-    fn test_registry_name() {
-        assert_eq!(Chain::Arbitrum.registry_name(), "arbitrum");
-        assert_eq!(Chain::Ethereum.registry_name(), "ethereum");
-        assert_eq!(Chain::Tempo.registry_name(), "tempo");
-        assert_eq!(Chain::Solana.registry_name(), "solana");
-        assert_eq!(Chain::Tron.registry_name(), "tron");
+    fn chain_id_round_trips_via_serde() {
+        let id = ChainId::new("Polygon PoS");
+        let json = serde_json::to_string(&id).unwrap();
+        // `#[serde(transparent)]` serialises as a bare string.
+        assert_eq!(json, r#""polygon pos""#);
+        let back: ChainId = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, id);
     }
 }

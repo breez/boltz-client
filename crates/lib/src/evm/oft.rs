@@ -1,24 +1,29 @@
-//! OFT deployment registry — fetches `LayerZero` endpoint IDs and OFT
-//! contract addresses from the USDT0 deployments API at runtime rather than
-//! hard-coding them, because the mesh composition changes over time.
+//! USDT0 deployments API → [`ChainRegistry`] builder.
 //!
-//! The USDT0 API exposes two meshes:
-//! - `native` — the `OFTv2` mesh that carries most EVM chains (Arbitrum,
-//!   Ethereum, Polygon, …).
-//! - `legacyMesh` — the older `OFTv1` mesh that still hosts Solana, TON, Tron,
-//!   Celo, plus duplicate entries for Arbitrum/Ethereum with a different OFT
+//! Destination chains are discovered at runtime from
+//! `https://docs.usdt0.to/api/deployments`, so adding a new EVM destination
+//! requires no client release: once USDT0 publishes it, the next service
+//! init picks it up. Non-EVM destinations (Solana, Tron) still require a
+//! code-level encoder in [`crate::evm::recipient`], but adding a new chain
+//! on an existing transport is pure data.
+//!
+//! The USDT0 response exposes two meshes:
+//! - `native` — the `OFTv2` mesh that carries most EVM chains.
+//! - `legacyMesh` — the older `OFTv1` mesh that hosts Solana, TON, Tron,
+//!   Celo, and duplicate Arbitrum/Ethereum entries with a different OFT
 //!   contract used when bridging into the legacy mesh.
 //!
-//! Non-EVM legacy chains (Solana, TON, Tron) have `chainId: null` in the API
-//! response, so they are kept in a separate name-keyed map.
+//! Non-EVM legacy chains have `chainId: null` in the response; we infer
+//! [`NetworkTransport`] from the lowercased name and drop entries for which
+//! no encoder exists.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use platform_utils::http::HttpClient;
 use serde::Deserialize;
 
 use crate::error::BoltzError;
-use crate::models::{Chain, NetworkTransport};
+use crate::models::{ChainId, ChainRegistry, ChainSpec, NetworkTransport, SourceSpec, Usdt0Kind};
 
 /// Default OFT token name to look up.
 const DEFAULT_OFT_NAME: &str = "usdt0";
@@ -74,201 +79,185 @@ pub fn ceil_div(numerator: u128, denominator: u128) -> Option<u128> {
     Some(bumped / denominator)
 }
 
-/// Which USDT0 mesh a chain belongs to. Native-mesh and legacy-mesh
-/// deployments live on distinct source-side OFT contracts with different
-/// fee models, so the destination's mesh determines which source contract
-/// the claim path quotes and bridges through.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Usdt0Kind {
-    Native,
-    Legacy,
-}
-
-/// Resolved OFT info for a single chain entry.
-#[derive(Clone, Debug)]
-pub struct OftChainInfo {
-    /// `LayerZero` endpoint ID for this chain.
-    pub lz_eid: u32,
-    /// OFT contract address (hex with 0x prefix for EVM; native encoding
-    /// for Solana/TON/Tron).
-    pub oft_address: String,
-    /// USDT0 token contract address when published in the deployments
-    /// registry. `None` for adapter-only deployments (e.g. Ethereum mainnet)
-    /// where the OFT wraps the canonical USDT and no separate token entry
-    /// exists in the registry.
-    pub token_address: Option<String>,
-    /// Which mesh this entry came from.
-    pub mesh: Usdt0Kind,
-}
-
-/// Cached OFT deployment data.
+/// Fetch the USDT0 deployments JSON from `url` and build a
+/// [`ChainRegistry`] anchored at `source_evm_chain_id` (Arbitrum in
+/// practice).
 ///
-/// Entries from the `native` array are stored by EVM chain ID. Entries from
-/// `legacyMesh` are split: EVM chains go in `legacy_evm_chains` (also keyed
-/// by chain ID), and chains without a numeric chain ID (Solana, TON, Tron)
-/// go in `legacy_named_chains` keyed by the lowercased chain name.
-#[derive(Clone, Debug)]
-pub struct OftDeployments {
-    native_chains: HashMap<u64, OftChainInfo>,
-    legacy_evm_chains: HashMap<u64, OftChainInfo>,
-    legacy_named_chains: HashMap<String, OftChainInfo>,
-}
+/// Fails if the fetch errors, the body is not parseable, the `usdt0` token
+/// config is missing, or `source_evm_chain_id` is not present in USDT0's
+/// `native` section.
+pub async fn fetch_chain_registry(
+    http_client: &dyn HttpClient,
+    url: &str,
+    source_evm_chain_id: u64,
+) -> Result<ChainRegistry, BoltzError> {
+    let response = http_client.get(url.to_string(), None).await?;
 
-impl OftDeployments {
-    /// Fetch OFT deployments from the given URL.
-    pub async fn fetch(http_client: &dyn HttpClient, url: &str) -> Result<Self, BoltzError> {
-        let response = http_client.get(url.to_string(), None).await?;
-
-        if !response.is_success() {
-            return Err(BoltzError::Api {
-                reason: format!("Failed to fetch OFT deployments: HTTP {}", response.status),
-                code: None,
-            });
-        }
-
-        Self::parse(&response.body)
+    if !response.is_success() {
+        return Err(BoltzError::Api {
+            reason: format!("Failed to fetch OFT deployments: HTTP {}", response.status),
+            code: None,
+        });
     }
 
-    fn parse(body: &str) -> Result<Self, BoltzError> {
-        let registry: OftRegistry = serde_json::from_str(body).map_err(|e| BoltzError::Api {
-            reason: format!("Failed to parse OFT deployments: {e}"),
+    parse_chain_registry(&response.body, source_evm_chain_id)
+}
+
+/// Parse a USDT0 deployments JSON body into a [`ChainRegistry`]. Split out
+/// from [`fetch_chain_registry`] for unit testing without an HTTP roundtrip.
+pub fn parse_chain_registry(
+    body: &str,
+    source_evm_chain_id: u64,
+) -> Result<ChainRegistry, BoltzError> {
+    let registry: OftRegistry = serde_json::from_str(body).map_err(|e| BoltzError::Api {
+        reason: format!("Failed to parse OFT deployments: {e}"),
+        code: None,
+    })?;
+
+    let token_config = registry
+        .0
+        .get(DEFAULT_OFT_NAME)
+        .ok_or_else(|| BoltzError::Api {
+            reason: format!("OFT token '{DEFAULT_OFT_NAME}' not found in deployments"),
             code: None,
         })?;
 
-        let token_config = registry
-            .0
-            .get(DEFAULT_OFT_NAME)
-            .ok_or_else(|| BoltzError::Api {
-                reason: format!("OFT token '{DEFAULT_OFT_NAME}' not found in deployments"),
-                code: None,
-            })?;
+    let source_evm_chain_id_u32 = source_evm_chain_id_as_u32(source_evm_chain_id)?;
 
-        let mut native_chains = HashMap::new();
-        for chain in &token_config.native {
-            if let Some((chain_id, info)) = resolve_evm_chain(chain, Usdt0Kind::Native) {
-                native_chains.insert(chain_id, info);
-            }
-        }
+    // Locate the source chain in the native section to derive its display
+    // name. The source must be present in the native mesh — if it isn't,
+    // there's no native destination to bridge to and the claim path is
+    // non-functional.
+    let source_native_entry = token_config
+        .native
+        .iter()
+        .find(|c| c.chain_id == Some(source_evm_chain_id_u32))
+        .ok_or_else(|| BoltzError::Api {
+            reason: format!(
+                "Source chain ID {source_evm_chain_id} not found in USDT0 native deployments",
+            ),
+            code: None,
+        })?;
+    let source_id = ChainId::new(&source_native_entry.name);
 
-        let mut legacy_evm_chains = HashMap::new();
-        let mut legacy_named_chains = HashMap::new();
-        for chain in &token_config.legacy_mesh {
-            match resolve_chain(chain, Usdt0Kind::Legacy) {
-                Some(ResolvedChain::Evm { chain_id, info }) => {
-                    legacy_evm_chains.insert(chain_id, info);
-                }
-                Some(ResolvedChain::Named { name, info }) => {
-                    legacy_named_chains.insert(name, info);
-                }
-                None => {}
-            }
-        }
+    let source_native_oft = resolve_chain_info(source_native_entry).map(|info| info.oft_address);
+    let source_legacy_oft = token_config
+        .legacy_mesh
+        .iter()
+        .find(|c| c.chain_id == Some(source_evm_chain_id_u32))
+        .and_then(resolve_chain_info)
+        .map(|info| info.oft_address);
 
-        Ok(Self {
-            native_chains,
-            legacy_evm_chains,
-            legacy_named_chains,
-        })
-    }
-
-    /// Look up a native-mesh chain by EVM chain ID.
-    ///
-    /// This is the default lookup for the current swap flow (all supported
-    /// destination chains are EVM on the native mesh).
-    pub fn get(&self, evm_chain_id: u64) -> Option<&OftChainInfo> {
-        self.native_chains.get(&evm_chain_id)
-    }
-
-    /// Look up a legacy-mesh chain by EVM chain ID (e.g. Arbitrum/Ethereum/Celo
-    /// legacy entries).
-    pub fn get_legacy(&self, evm_chain_id: u64) -> Option<&OftChainInfo> {
-        self.legacy_evm_chains.get(&evm_chain_id)
-    }
-
-    /// Look up a legacy-mesh chain by its registry name (case-insensitive).
-    ///
-    /// Needed for Solana, TON, and Tron, which the USDT0 API returns with
-    /// `chainId: null`.
-    pub fn get_by_name(&self, name: &str) -> Option<&OftChainInfo> {
-        self.legacy_named_chains.get(&name.to_lowercase())
-    }
-
-    /// Resolve the OFT entry for a `Chain`, dispatching on its transport:
-    /// EVM chains use the native-mesh `chainId` lookup; non-EVM chains
-    /// (Solana, Tron) use the legacy-mesh name lookup.
-    pub fn get_for(&self, chain: &Chain) -> Option<&OftChainInfo> {
-        match chain.transport() {
-            NetworkTransport::Evm => self.get(chain.evm_chain_id()?),
-            NetworkTransport::Solana | NetworkTransport::Tron => {
-                self.get_by_name(chain.registry_name())
-            }
-        }
-    }
-
-    /// Return the USDT0 token contract address for a destination chain when
-    /// the deployments registry publishes one. `None` for chains where only
-    /// an OFT adapter is published (e.g. Ethereum mainnet, where the adapter
-    /// wraps the canonical USDT token whose address lives outside this
-    /// registry), or for chains not resolved at all.
-    pub fn token_address_for(&self, chain: &Chain) -> Option<&str> {
-        self.get_for(chain)?.token_address.as_deref()
-    }
-
-    /// Get the source OFT contract address for a chain on a given mesh.
-    ///
-    /// The native and legacy meshes are independent bridges that ship from
-    /// different OFT contracts on the same source chain. Routes that bridge
-    /// into a legacy-mesh destination (Solana, Tron, Celo, …) must depart
-    /// from the legacy-mesh source contract; routes into a native-mesh
-    /// destination must depart from the native-mesh contract. Callers
-    /// derive the mesh from the destination's [`OftChainInfo::mesh`].
-    pub fn source_oft_address(&self, source_chain_id: u64, mesh: Usdt0Kind) -> Option<&str> {
-        let map = match mesh {
-            Usdt0Kind::Native => &self.native_chains,
-            Usdt0Kind::Legacy => &self.legacy_evm_chains,
-        };
-        map.get(&source_chain_id)
-            .map(|info| info.oft_address.as_str())
-    }
-}
-
-// ─── Internal helpers ───────────────────────────────────────────────────
-
-enum ResolvedChain {
-    Evm { chain_id: u64, info: OftChainInfo },
-    Named { name: String, info: OftChainInfo },
-}
-
-fn resolve_evm_chain(chain: &OftApiChain, mesh: Usdt0Kind) -> Option<(u64, OftChainInfo)> {
-    match resolve_chain(chain, mesh)? {
-        ResolvedChain::Evm { chain_id, info } => Some((chain_id, info)),
-        ResolvedChain::Named { .. } => None,
-    }
-}
-
-fn resolve_chain(chain: &OftApiChain, mesh: Usdt0Kind) -> Option<ResolvedChain> {
-    let lz_eid_str = chain.lz_eid.as_ref()?;
-    let lz_eid: u32 = lz_eid_str.parse().ok()?;
-    let contract = find_primary_contract(&chain.contracts)?;
-
-    let info = OftChainInfo {
-        lz_eid,
-        oft_address: contract.address.clone(),
-        token_address: find_token_contract(&chain.contracts).map(|c| c.address.clone()),
-        mesh,
+    let source = SourceSpec {
+        id: source_id.clone(),
+        evm_chain_id: source_evm_chain_id,
+        native_oft_address: source_native_oft,
+        legacy_oft_address: source_legacy_oft,
     };
 
-    if let Some(chain_id) = chain.chain_id {
-        Some(ResolvedChain::Evm {
-            chain_id: u64::from(chain_id),
-            info,
-        })
-    } else {
-        Some(ResolvedChain::Named {
-            name: chain.name.to_lowercase(),
-            info,
-        })
+    // Build destinations. Native-mesh entries are inserted first so that a
+    // chain appearing in both sections keeps the native spec. An EVM chain
+    // can show up in both sections under different names ("Arbitrum One" in
+    // native, "Arbitrum" in legacyMesh) — dedup by `chainId`, not by name,
+    // so the legacy duplicate doesn't land as a second destination.
+    let mut destinations: HashMap<ChainId, ChainSpec> = HashMap::new();
+    let mut seen_evm_chain_ids: HashSet<u64> = HashSet::new();
+
+    for entry in &token_config.native {
+        if let Some(spec) = build_chain_spec(entry, Usdt0Kind::Native) {
+            if let Some(cid) = spec.evm_chain_id {
+                seen_evm_chain_ids.insert(cid);
+            }
+            destinations.insert(spec.id.clone(), spec);
+        }
     }
+    for entry in &token_config.legacy_mesh {
+        if let Some(spec) = build_chain_spec(entry, Usdt0Kind::Legacy) {
+            if let Some(cid) = spec.evm_chain_id
+                && seen_evm_chain_ids.contains(&cid)
+            {
+                continue;
+            }
+            destinations.entry(spec.id.clone()).or_insert(spec);
+        }
+    }
+
+    // The source chain must be reachable as a destination (same-chain
+    // delivery path in the claim flow). Verify it landed in the map under
+    // the same ID we derived for `SourceSpec`.
+    if !destinations.contains_key(&source_id) {
+        return Err(BoltzError::Api {
+            reason: format!(
+                "Source chain '{source_id}' missing from USDT0 destinations after registry build",
+            ),
+            code: None,
+        });
+    }
+
+    Ok(ChainRegistry {
+        source,
+        destinations,
+    })
+}
+
+fn source_evm_chain_id_as_u32(source: u64) -> Result<u32, BoltzError> {
+    source
+        .try_into()
+        .map_err(|_| BoltzError::Generic(format!("Source chain ID {source} exceeds u32")))
+}
+
+/// Build a `ChainSpec` for a single USDT0 entry, or `None` if the entry is
+/// unsupported (missing `lzEid`, missing primary OFT contract, or non-EVM
+/// transport with no encoder).
+fn build_chain_spec(entry: &OftApiChain, mesh: Usdt0Kind) -> Option<ChainSpec> {
+    let (transport, evm_chain_id) = classify_transport(entry)?;
+    let info = resolve_chain_info(entry)?;
+
+    Some(ChainSpec {
+        id: ChainId::new(&entry.name),
+        display_name: entry.name.clone(),
+        transport,
+        evm_chain_id,
+        lz_eid: info.lz_eid,
+        oft_address: info.oft_address,
+        token_address: info.token_address,
+        mesh,
+    })
+}
+
+/// Infer the underlying transport from a USDT0 entry:
+/// - `chainId: Some(…)` → EVM.
+/// - `chainId: null` + known non-EVM name → matching variant.
+/// - Anything else → `None`, causing the entry to be dropped from the
+///   registry (no code-level encoder).
+fn classify_transport(entry: &OftApiChain) -> Option<(NetworkTransport, Option<u64>)> {
+    if let Some(id) = entry.chain_id {
+        return Some((NetworkTransport::Evm, Some(u64::from(id))));
+    }
+    match entry.name.to_lowercase().as_str() {
+        "solana" => Some((NetworkTransport::Solana, None)),
+        "tron" => Some((NetworkTransport::Tron, None)),
+        _ => None,
+    }
+}
+
+/// Flat OFT fields the registry needs from one USDT0 entry.
+struct ResolvedOftInfo {
+    lz_eid: u32,
+    oft_address: String,
+    token_address: Option<String>,
+}
+
+fn resolve_chain_info(entry: &OftApiChain) -> Option<ResolvedOftInfo> {
+    let lz_eid_str = entry.lz_eid.as_ref()?;
+    let lz_eid: u32 = lz_eid_str.parse().ok()?;
+    let contract = find_primary_contract(&entry.contracts)?;
+
+    Some(ResolvedOftInfo {
+        lz_eid,
+        oft_address: contract.address.clone(),
+        token_address: find_token_contract(&entry.contracts).map(|c| c.address.clone()),
+    })
 }
 
 fn find_primary_contract(contracts: &[OftApiContract]) -> Option<&OftApiContract> {
@@ -317,6 +306,8 @@ mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
     use super::*;
+
+    const ARBITRUM_CHAIN_ID: u64 = 42161;
 
     const SAMPLE_DEPLOYMENTS: &str = r#"{
         "usdt0": {
@@ -386,249 +377,210 @@ mod tests {
                     "contracts": [
                         {"name": "OFT", "address": "TFG4wBaDQ8sHWWP1ACeSGnoNR6RRzevLPt", "explorer": "https://tronscan.org/"}
                     ]
+                },
+                {
+                    "name": "TON",
+                    "lzEid": "30343",
+                    "contracts": [
+                        {"name": "OFT", "address": "EQCxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "explorer": "https://tonviewer.com/"}
+                    ]
                 }
             ]
         }
     }"#;
 
-    #[macros::test_all]
-    fn parses_native_evm_entries() {
-        let deployments = OftDeployments::parse(SAMPLE_DEPLOYMENTS).unwrap();
-
-        let arb = deployments.get(42161).expect("arbitrum native");
-        assert_eq!(arb.lz_eid, 30110);
-        assert_eq!(
-            arb.oft_address,
-            "0x14E4A1B13bf7F943c8ff7C51fb60FA964A298D92"
-        );
-        assert_eq!(
-            arb.token_address.as_deref(),
-            Some("0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9")
-        );
-        assert_eq!(arb.mesh, Usdt0Kind::Native);
-
-        let eth = deployments.get(1).expect("ethereum native");
-        assert_eq!(
-            eth.oft_address,
-            "0x6C96dE32CEa08842dcc4058c14d3aaAD7Fa41dee"
-        );
-        // Ethereum only publishes an adapter — no separate Token entry.
-        assert!(eth.token_address.is_none());
-        assert_eq!(eth.mesh, Usdt0Kind::Native);
+    fn sample_registry() -> ChainRegistry {
+        parse_chain_registry(SAMPLE_DEPLOYMENTS, ARBITRUM_CHAIN_ID).unwrap()
     }
 
     #[macros::test_all]
-    fn token_address_for_resolves_native_and_returns_none_for_adapter_only() {
-        let deployments = OftDeployments::parse(SAMPLE_DEPLOYMENTS).unwrap();
-        assert_eq!(
-            deployments.token_address_for(&Chain::Arbitrum),
-            Some("0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9")
-        );
-        assert_eq!(deployments.token_address_for(&Chain::Ethereum), None);
-    }
+    fn native_evm_entries_are_registered() {
+        let registry = sample_registry();
 
-    #[macros::test_all]
-    fn skips_native_entries_without_chain_id() {
-        let deployments = OftDeployments::parse(SAMPLE_DEPLOYMENTS).unwrap();
-        // HyperCore has no chainId and no lzEid — must not appear anywhere.
-        assert!(deployments.get_by_name("hypercore").is_none());
-    }
-
-    #[macros::test_all]
-    fn parses_legacy_evm_entries_with_separate_oft_address() {
-        let deployments = OftDeployments::parse(SAMPLE_DEPLOYMENTS).unwrap();
-
-        let arb_legacy = deployments.get_legacy(42161).expect("arbitrum legacy");
-        assert_eq!(
-            arb_legacy.oft_address,
-            "0x77652D5aba086137b595875263FC200182919B92"
-        );
-        assert_eq!(arb_legacy.mesh, Usdt0Kind::Legacy);
-
-        // Native Arbitrum must be a different address.
-        let arb_native = deployments.get(42161).unwrap();
-        assert_ne!(arb_native.oft_address, arb_legacy.oft_address);
-
-        let celo = deployments.get_legacy(42220).expect("celo legacy");
-        assert_eq!(celo.lz_eid, 30125);
-        assert_eq!(celo.mesh, Usdt0Kind::Legacy);
-    }
-
-    #[macros::test_all]
-    fn parses_legacy_named_entries_for_non_evm_chains() {
-        let deployments = OftDeployments::parse(SAMPLE_DEPLOYMENTS).unwrap();
-
-        let solana = deployments.get_by_name("Solana").expect("solana by name");
-        assert_eq!(solana.lz_eid, 30168);
-        assert_eq!(
-            solana.oft_address,
-            "Fuww9mfc8ntAwxPUzFia7VJFAdvLppyZwhPJoXySZXf7"
-        );
-        assert_eq!(solana.mesh, Usdt0Kind::Legacy);
-
-        // Lookup is case-insensitive.
-        assert!(deployments.get_by_name("SOLANA").is_some());
-        assert!(deployments.get_by_name("solana").is_some());
-
-        let tron = deployments.get_by_name("tron").expect("tron by name");
-        assert_eq!(tron.lz_eid, 30420);
-        assert_eq!(tron.oft_address, "TFG4wBaDQ8sHWWP1ACeSGnoNR6RRzevLPt");
-    }
-
-    #[macros::test_all]
-    fn legacy_entries_do_not_leak_into_native_lookup() {
-        let deployments = OftDeployments::parse(SAMPLE_DEPLOYMENTS).unwrap();
-
-        assert!(deployments.get(42220).is_none()); // Celo is legacy-only
-        assert!(deployments.get_by_name("arbitrum one").is_none()); // native entries aren't named
-    }
-
-    #[macros::test_all]
-    fn get_for_resolves_tempo_via_registry_chain_id() {
-        let deployments = OftDeployments::parse(SAMPLE_DEPLOYMENTS).unwrap();
-        let tempo = deployments.get_for(&Chain::Tempo).expect("tempo");
+        let tempo = registry.get(&ChainId::new("tempo")).expect("tempo");
+        assert_eq!(tempo.transport, NetworkTransport::Evm);
+        assert_eq!(tempo.evm_chain_id, Some(4217));
         assert_eq!(tempo.lz_eid, 30410);
+        assert_eq!(tempo.mesh, Usdt0Kind::Native);
         assert_eq!(
             tempo.oft_address,
             "0xaf37E8B6C9ED7f6318979f56Fc287d76c30847ff"
         );
-        assert_eq!(tempo.mesh, Usdt0Kind::Native);
+        assert_eq!(
+            tempo.token_address.as_deref(),
+            Some("0x20C00000000000000000000014f22CA97301EB73")
+        );
+        assert_eq!(tempo.display_name, "Tempo");
     }
 
     #[macros::test_all]
-    fn get_for_dispatches_evm_to_native_mesh() {
-        let deployments = OftDeployments::parse(SAMPLE_DEPLOYMENTS).unwrap();
+    fn native_duplicate_in_legacy_prefers_native() {
+        // Arbitrum appears in both `native` (as "Arbitrum One") and
+        // `legacyMesh` (as "Arbitrum"). Native precedence means the "arbitrum
+        // one" key wins with the native OFT address, and the legacy entry's
+        // alias "arbitrum" does not leak into destinations as a second
+        // Arbitrum (dedup-by-chainId).
+        let registry = sample_registry();
 
-        let arb = deployments.get_for(&Chain::Arbitrum).expect("arbitrum");
-        assert_eq!(arb.lz_eid, 30110);
+        let arb = registry
+            .get(&ChainId::new("arbitrum one"))
+            .expect("arbitrum one");
         assert_eq!(arb.mesh, Usdt0Kind::Native);
-        // Must be the native-mesh entry, not the legacy-mesh duplicate.
         assert_eq!(
             arb.oft_address,
             "0x14E4A1B13bf7F943c8ff7C51fb60FA964A298D92"
         );
 
-        let eth = deployments.get_for(&Chain::Ethereum).expect("ethereum");
-        assert_eq!(
-            eth.oft_address,
-            "0x6C96dE32CEa08842dcc4058c14d3aaAD7Fa41dee"
+        assert!(
+            registry.get(&ChainId::new("arbitrum")).is_none(),
+            "legacy-mesh alias `arbitrum` must not leak as a second destination"
         );
     }
 
     #[macros::test_all]
-    fn get_for_dispatches_non_evm_to_named_legacy() {
-        let deployments = OftDeployments::parse(SAMPLE_DEPLOYMENTS).unwrap();
+    fn legacy_only_evm_chain_falls_through_to_legacy_mesh() {
+        // Celo is only in `legacyMesh`, so it lands in the destinations
+        // map with `mesh == Legacy`.
+        let registry = sample_registry();
 
-        let solana = deployments.get_for(&Chain::Solana).expect("solana");
+        let celo = registry.get(&ChainId::new("celo")).expect("celo");
+        assert_eq!(celo.mesh, Usdt0Kind::Legacy);
+        assert_eq!(celo.transport, NetworkTransport::Evm);
+        assert_eq!(celo.evm_chain_id, Some(42220));
+        assert_eq!(celo.lz_eid, 30125);
+    }
+
+    #[macros::test_all]
+    fn non_evm_legacy_chains_infer_transport_from_name() {
+        let registry = sample_registry();
+
+        let solana = registry.get(&ChainId::new("solana")).expect("solana");
+        assert_eq!(solana.transport, NetworkTransport::Solana);
+        assert_eq!(solana.evm_chain_id, None);
         assert_eq!(solana.lz_eid, 30168);
-        assert_eq!(solana.mesh, Usdt0Kind::Legacy);
 
-        let tron = deployments.get_for(&Chain::Tron).expect("tron");
-        assert_eq!(tron.lz_eid, 30420);
-        assert_eq!(tron.mesh, Usdt0Kind::Legacy);
+        let tron = registry.get(&ChainId::new("tron")).expect("tron");
+        assert_eq!(tron.transport, NetworkTransport::Tron);
+        assert_eq!(tron.evm_chain_id, None);
     }
 
     #[macros::test_all]
-    fn get_for_returns_none_when_evm_chain_id_missing_from_native_mesh() {
-        let deployments = OftDeployments::parse(SAMPLE_DEPLOYMENTS).unwrap();
-        // Polygon isn't in the sample fixture — must miss cleanly, not panic.
-        assert!(deployments.get_for(&Chain::Polygon).is_none());
+    fn unsupported_non_evm_family_is_dropped() {
+        // TON is present in the fixture but has no NetworkTransport variant,
+        // so `classify_transport` returns None and the entry is skipped.
+        let registry = sample_registry();
+        assert!(registry.get(&ChainId::new("ton")).is_none());
     }
 
     #[macros::test_all]
-    fn source_oft_address_returns_native_for_native_mesh() {
-        let deployments = OftDeployments::parse(SAMPLE_DEPLOYMENTS).unwrap();
+    fn entry_without_lz_eid_is_dropped() {
+        // HyperCore in the fixture has no `lzEid` and no `chainId`. It would
+        // classify as non-EVM, but since its name isn't in the encoder map,
+        // it drops anyway — and even if the name were recognised, the missing
+        // `lzEid` would keep it out.
+        let registry = sample_registry();
+        assert!(registry.get(&ChainId::new("hypercore")).is_none());
+    }
+
+    #[macros::test_all]
+    fn source_spec_aggregates_native_and_legacy_oft_addresses() {
+        let registry = sample_registry();
+
+        assert_eq!(registry.source.id, ChainId::new("arbitrum one"));
+        assert_eq!(registry.source.evm_chain_id, ARBITRUM_CHAIN_ID);
         assert_eq!(
-            deployments.source_oft_address(42161, Usdt0Kind::Native),
+            registry.source.native_oft_address.as_deref(),
             Some("0x14E4A1B13bf7F943c8ff7C51fb60FA964A298D92")
         );
-    }
-
-    #[macros::test_all]
-    fn source_oft_address_returns_legacy_for_legacy_mesh() {
-        let deployments = OftDeployments::parse(SAMPLE_DEPLOYMENTS).unwrap();
         assert_eq!(
-            deployments.source_oft_address(42161, Usdt0Kind::Legacy),
+            registry.source.legacy_oft_address.as_deref(),
             Some("0x77652D5aba086137b595875263FC200182919B92")
         );
     }
 
     #[macros::test_all]
-    fn source_oft_address_native_and_legacy_differ() {
-        // The native and legacy meshes deploy different OFT contracts on
-        // the same source chain — bridging into a legacy-mesh destination
-        // must depart from the legacy contract, not the native one.
-        let deployments = OftDeployments::parse(SAMPLE_DEPLOYMENTS).unwrap();
-        let native = deployments
-            .source_oft_address(42161, Usdt0Kind::Native)
-            .unwrap();
-        let legacy = deployments
-            .source_oft_address(42161, Usdt0Kind::Legacy)
-            .unwrap();
-        assert_ne!(native, legacy);
-    }
+    fn source_spec_oft_for_picks_by_mesh() {
+        let registry = sample_registry();
 
-    #[macros::test_all]
-    fn source_oft_address_missing_chain_returns_none() {
-        let deployments = OftDeployments::parse(SAMPLE_DEPLOYMENTS).unwrap();
-        // Polygon isn't in the fixture under either mesh.
-        assert!(
-            deployments
-                .source_oft_address(137, Usdt0Kind::Native)
-                .is_none()
-        );
-        assert!(
-            deployments
-                .source_oft_address(137, Usdt0Kind::Legacy)
-                .is_none()
-        );
-    }
-
-    #[macros::test_all]
-    fn legacy_mesh_source_amount_matches_known_vector() {
-        // 1_000_000_000 -> ceil(1_000_000_000 * 10_000 / 9_997) = 1_000_300_091.
         assert_eq!(
-            legacy_mesh_source_amount(1_000_000_000),
-            Some(1_000_300_091)
+            registry.source.oft_for(Usdt0Kind::Native),
+            Some("0x14E4A1B13bf7F943c8ff7C51fb60FA964A298D92")
+        );
+        assert_eq!(
+            registry.source.oft_for(Usdt0Kind::Legacy),
+            Some("0x77652D5aba086137b595875263FC200182919B92")
         );
     }
 
     #[macros::test_all]
-    fn legacy_mesh_source_amount_zero() {
-        assert_eq!(legacy_mesh_source_amount(0), Some(0));
+    fn is_source_true_for_registry_source_id() {
+        let registry = sample_registry();
+        assert!(registry.is_source(&ChainId::new("arbitrum one")));
+        assert!(!registry.is_source(&ChainId::new("tempo")));
+        assert!(!registry.is_source(&ChainId::new("solana")));
     }
 
     #[macros::test_all]
-    fn legacy_mesh_source_amount_rounds_up() {
-        // 1 unit out → ceil(10_000 / 9_997) = 2 units in (the 0.0003-unit
-        // remainder is rounded up so the destination receives at least the
-        // requested amount).
-        assert_eq!(legacy_mesh_source_amount(1), Some(2));
+    fn supported_chains_lists_registered_destinations_only() {
+        let registry = sample_registry();
+        let chains = registry.supported_chains();
+
+        assert!(chains.contains(&ChainId::new("arbitrum one")));
+        assert!(chains.contains(&ChainId::new("ethereum")));
+        assert!(chains.contains(&ChainId::new("tempo")));
+        assert!(chains.contains(&ChainId::new("celo")));
+        assert!(chains.contains(&ChainId::new("solana")));
+        assert!(chains.contains(&ChainId::new("tron")));
+        // TON and HyperCore are unsupported and must be absent.
+        assert!(!chains.contains(&ChainId::new("ton")));
+        assert!(!chains.contains(&ChainId::new("hypercore")));
     }
 
     #[macros::test_all]
-    fn legacy_mesh_source_amount_returns_none_on_overflow() {
-        // u128::MAX * 10_000 overflows.
-        assert_eq!(legacy_mesh_source_amount(u128::MAX), None);
+    fn missing_source_chain_errors() {
+        // Source chain ID 99999 is not in the fixture → init must fail hard.
+        let err = parse_chain_registry(SAMPLE_DEPLOYMENTS, 99999).unwrap_err();
+        match err {
+            BoltzError::Api { reason, .. } => {
+                assert!(reason.contains("Source chain ID 99999"), "reason: {reason}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[macros::test_all]
-    fn ceil_div_basic_cases() {
-        assert_eq!(ceil_div(0, 5), Some(0));
-        assert_eq!(ceil_div(6, 3), Some(2)); // exact
-        assert_eq!(ceil_div(7, 3), Some(3)); // rounds up
-        assert_eq!(ceil_div(1, 1), Some(1));
-    }
-
-    #[macros::test_all]
-    fn ceil_div_division_by_zero_is_none() {
-        assert_eq!(ceil_div(42, 0), None);
-    }
-
-    #[macros::test_all]
-    fn ceil_div_overflow_is_none() {
-        // u128::MAX + (3 - 1) overflows.
-        assert_eq!(ceil_div(u128::MAX, 3), None);
+    fn unknown_evm_chain_requires_zero_code_changes() {
+        // Smoke test: an EVM entry the client has never seen before still
+        // lands in the registry keyed by its lowercased name, fully wired up.
+        let body = r#"{
+            "usdt0": {
+                "native": [
+                    {
+                        "name": "Arbitrum One",
+                        "chainId": 42161,
+                        "lzEid": "30110",
+                        "contracts": [
+                            {"name": "OFT", "address": "0x14E4A1B13bf7F943c8ff7C51fb60FA964A298D92", "explorer": ""}
+                        ]
+                    },
+                    {
+                        "name": "FutureChain",
+                        "chainId": 9999,
+                        "lzEid": "30999",
+                        "contracts": [
+                            {"name": "OFT", "address": "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "explorer": ""}
+                        ]
+                    }
+                ]
+            }
+        }"#;
+        let registry = parse_chain_registry(body, ARBITRUM_CHAIN_ID).unwrap();
+        let future = registry
+            .get(&ChainId::new("futurechain"))
+            .expect("futurechain");
+        assert_eq!(future.transport, NetworkTransport::Evm);
+        assert_eq!(future.evm_chain_id, Some(9999));
+        assert_eq!(future.lz_eid, 30999);
     }
 
     #[macros::test_all]
@@ -647,25 +599,36 @@ mod tests {
                 ]
             }
         }"#;
-        let deployments = OftDeployments::parse(body).unwrap();
-        assert!(deployments.get(42161).is_some());
-        assert!(deployments.get_legacy(42161).is_none());
+        let registry = parse_chain_registry(body, ARBITRUM_CHAIN_ID).unwrap();
+        assert!(
+            registry
+                .get(&ChainId::new("arbitrum one"))
+                .is_some_and(|s| s.mesh == Usdt0Kind::Native)
+        );
+        assert!(registry.source.legacy_oft_address.is_none());
     }
 
     #[macros::test_all]
     fn primary_contract_name_precedence_prefers_oft_over_adapter() {
         // When a chain advertises both `OFT` and `OFT Adapter`, the resolver
         // must pick `OFT` (first entry in `PRIMARY_OFT_CONTRACT_NAMES`),
-        // regardless of the order they appear in the API's `contracts` array.
-        // Guards against a future reorder of the precedence list or a
-        // `.find()` → `.rfind()` slip.
+        // regardless of array order. Guards against a future reorder of the
+        // precedence list or a `.find()` → `.rfind()` slip.
         let body = r#"{
             "usdt0": {
                 "native": [
                     {
+                        "name": "Arbitrum One",
+                        "chainId": 42161,
+                        "lzEid": "30110",
+                        "contracts": [
+                            {"name": "OFT", "address": "0x14E4A1B13bf7F943c8ff7C51fb60FA964A298D92", "explorer": ""}
+                        ]
+                    },
+                    {
                         "name": "Synthetic",
-                        "chainId": 99999,
-                        "lzEid": "30999",
+                        "chainId": 88888,
+                        "lzEid": "30888",
                         "contracts": [
                             {"name": "OFT Adapter", "address": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "explorer": ""},
                             {"name": "OFT", "address": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "explorer": ""}
@@ -674,47 +637,74 @@ mod tests {
                 ]
             }
         }"#;
-        let deployments = OftDeployments::parse(body).unwrap();
-        let chain = deployments.get(99999).expect("synthetic chain");
+        let registry = parse_chain_registry(body, ARBITRUM_CHAIN_ID).unwrap();
+        let spec = registry.get(&ChainId::new("synthetic")).expect("synthetic");
         assert_eq!(
-            chain.oft_address, "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            spec.oft_address, "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "must prefer `OFT` over `OFT Adapter` regardless of array order"
         );
     }
 
     #[macros::test_all]
     fn primary_contract_falls_back_to_adapter_when_oft_absent() {
-        // Ethereum-style: no `OFT` entry, only `OFT Adapter`. The resolver
-        // must fall through the precedence list and pick the Adapter.
-        let body = r#"{
-            "usdt0": {
-                "native": [
-                    {
-                        "name": "EthLike",
-                        "chainId": 1,
-                        "lzEid": "30101",
-                        "contracts": [
-                            {"name": "OFT Adapter", "address": "0xadadadadadadadadadadadadadadadadadadadad", "explorer": ""}
-                        ]
-                    }
-                ]
-            }
-        }"#;
-        let deployments = OftDeployments::parse(body).unwrap();
-        let chain = deployments.get(1).expect("eth-like chain");
+        let registry = sample_registry();
+        let eth = registry.get(&ChainId::new("ethereum")).expect("ethereum");
         assert_eq!(
-            chain.oft_address,
-            "0xadadadadadadadadadadadadadadadadadadadad"
+            eth.oft_address,
+            "0x6C96dE32CEa08842dcc4058c14d3aaAD7Fa41dee"
         );
+        // Ethereum only publishes an adapter — no separate Token entry.
+        assert!(eth.token_address.is_none());
     }
 
     #[macros::test_all]
     fn missing_token_config_fails() {
         let body = r#"{"other": {"native": [], "legacyMesh": []}}"#;
-        let err = OftDeployments::parse(body).unwrap_err();
+        let err = parse_chain_registry(body, ARBITRUM_CHAIN_ID).unwrap_err();
         match err {
             BoltzError::Api { reason, .. } => assert!(reason.contains("usdt0")),
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[macros::test_all]
+    fn legacy_mesh_source_amount_matches_known_vector() {
+        assert_eq!(
+            legacy_mesh_source_amount(1_000_000_000),
+            Some(1_000_300_091)
+        );
+    }
+
+    #[macros::test_all]
+    fn legacy_mesh_source_amount_zero() {
+        assert_eq!(legacy_mesh_source_amount(0), Some(0));
+    }
+
+    #[macros::test_all]
+    fn legacy_mesh_source_amount_rounds_up() {
+        assert_eq!(legacy_mesh_source_amount(1), Some(2));
+    }
+
+    #[macros::test_all]
+    fn legacy_mesh_source_amount_returns_none_on_overflow() {
+        assert_eq!(legacy_mesh_source_amount(u128::MAX), None);
+    }
+
+    #[macros::test_all]
+    fn ceil_div_basic_cases() {
+        assert_eq!(ceil_div(0, 5), Some(0));
+        assert_eq!(ceil_div(6, 3), Some(2));
+        assert_eq!(ceil_div(7, 3), Some(3));
+        assert_eq!(ceil_div(1, 1), Some(1));
+    }
+
+    #[macros::test_all]
+    fn ceil_div_division_by_zero_is_none() {
+        assert_eq!(ceil_div(42, 0), None);
+    }
+
+    #[macros::test_all]
+    fn ceil_div_overflow_is_none() {
+        assert_eq!(ceil_div(u128::MAX, 3), None);
     }
 }

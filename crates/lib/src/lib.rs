@@ -26,7 +26,7 @@ pub use store::{BoltzStorage, MemoryBoltzStorage};
 use api::BoltzApiClient;
 use api::ws::SwapStatusSubscriber;
 use evm::alchemy::AlchemyGasClient;
-use evm::oft::OftDeployments;
+use evm::oft::fetch_chain_registry;
 use evm::provider::EvmProvider;
 use evm::signing::EvmSigner;
 use solana::rpc::SolanaRpcClient;
@@ -48,6 +48,7 @@ pub struct BoltzService {
     swap_manager: SwapManager,
     event_emitter: Arc<EventEmitter>,
     ws_subscriber: Arc<SwapStatusSubscriber>,
+    chain_registry: Arc<ChainRegistry>,
 }
 
 impl BoltzService {
@@ -87,11 +88,18 @@ impl BoltzService {
             Box::new(DefaultHttpClient::new(None)),
         );
 
-        // OFT deployments are fetched once and cached for the service lifetime.
-        // They change rarely; a service restart picks up any updates.
-        let oft_deployments =
-            OftDeployments::fetch(&DefaultHttpClient::new(None), &config.oft_deployments_url)
-                .await?;
+        // Chain registry is fetched once from the USDT0 deployments API and
+        // cached for the service lifetime. A service restart picks up any
+        // upstream updates — including new destination chains without
+        // shipping a new client.
+        let chain_registry = Arc::new(
+            fetch_chain_registry(
+                &DefaultHttpClient::new(None),
+                &config.oft_deployments_url,
+                config.chain_id,
+            )
+            .await?,
+        );
 
         // Fetch contract addresses from the Boltz API, matching by chain ID
         let contracts = api_client.get_contracts().await?;
@@ -118,7 +126,7 @@ impl BoltzService {
             key_manager,
             alchemy_client,
             evm_provider,
-            oft_deployments,
+            chain_registry.clone(),
             config,
             erc20swap_address,
             solana_rpc,
@@ -140,6 +148,7 @@ impl BoltzService {
             swap_manager,
             event_emitter,
             ws_subscriber,
+            chain_registry,
         })
     }
 
@@ -181,7 +190,7 @@ impl BoltzService {
     pub async fn prepare_reverse_swap(
         &self,
         destination: &str,
-        chain: Chain,
+        chain: ChainId,
         usdt_amount: u64,
         max_slippage_bps: Option<u32>,
     ) -> Result<PreparedSwap, BoltzError> {
@@ -198,7 +207,7 @@ impl BoltzService {
     pub async fn prepare_reverse_swap_from_sats(
         &self,
         destination: &str,
-        chain: Chain,
+        chain: ChainId,
         invoice_amount_sats: u64,
         max_slippage_bps: Option<u32>,
     ) -> Result<PreparedSwap, BoltzError> {
@@ -235,47 +244,31 @@ impl BoltzService {
         Ok(created)
     }
 
-    /// Get supported destination chains.
-    pub fn supported_chains(&self) -> Vec<Chain> {
-        vec![
-            Chain::Arbitrum,
-            Chain::Berachain,
-            Chain::Conflux,
-            Chain::Corn,
-            Chain::Ethereum,
-            Chain::Flare,
-            Chain::Hedera,
-            Chain::HyperEvm,
-            Chain::Ink,
-            Chain::Mantle,
-            Chain::MegaEth,
-            Chain::Monad,
-            Chain::Morph,
-            Chain::Optimism,
-            Chain::Plasma,
-            Chain::Polygon,
-            Chain::Rootstock,
-            Chain::Sei,
-            Chain::Solana,
-            Chain::Stable,
-            Chain::Tempo,
-            Chain::Tron,
-            Chain::Unichain,
-            Chain::XLayer,
-        ]
+    /// All destination chain IDs published by USDT0 and supported by this
+    /// client. Populated from the USDT0 deployments fetch at init time.
+    pub fn supported_chains(&self) -> Vec<ChainId> {
+        self.chain_registry.supported_chains()
+    }
+
+    /// Full metadata for a destination chain (display name, transport, OFT
+    /// addresses, mesh, …). Returns `None` for an unknown ID.
+    pub fn chain_spec(&self, id: &ChainId) -> Option<&ChainSpec> {
+        self.chain_registry.get(id)
+    }
+
+    /// Destinations whose transport accepts `address` as a valid recipient.
+    /// Use this to drive UX flows that pick a chain from an address.
+    pub fn chains_accepting(&self, address: &str) -> Vec<&ChainSpec> {
+        self.chain_registry
+            .destinations
+            .values()
+            .filter(|spec| is_valid_destination_address(spec.transport, address))
+            .collect()
     }
 
     /// Get current Boltz swap limits (min/max sats).
     pub async fn get_limits(&self) -> Result<SwapLimits, BoltzError> {
         self.executor.get_limits().await
-    }
-
-    /// Destination-chain USDT0 token contract address, when the USDT0
-    /// deployments registry publishes one for this chain. `None` for
-    /// adapter-only deployments (Ethereum mainnet) or for chains not yet
-    /// present in the registry.
-    pub fn token_address(&self, chain: &Chain) -> Option<String> {
-        self.executor.token_address(chain)
     }
 
     /// Accept a degraded DEX quote and proceed with claiming.

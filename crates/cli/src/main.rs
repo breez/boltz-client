@@ -14,66 +14,8 @@ use rustyline::{Completer, Helper, Hinter, Validator, highlight::Highlighter};
 
 use boltz_client::{
     BoltzConfig, BoltzError, BoltzEventListener, BoltzService, BoltzStorage, BoltzSwapEvent,
+    ChainId,
 };
-
-#[derive(Clone, clap::ValueEnum)]
-enum Chain {
-    Arbitrum,
-    Berachain,
-    Conflux,
-    Corn,
-    Ethereum,
-    Flare,
-    Hedera,
-    HyperEvm,
-    Ink,
-    Mantle,
-    MegaEth,
-    Monad,
-    Morph,
-    Optimism,
-    Plasma,
-    Polygon,
-    Rootstock,
-    Sei,
-    Solana,
-    Stable,
-    Tempo,
-    Tron,
-    Unichain,
-    XLayer,
-}
-
-impl From<Chain> for boltz_client::Chain {
-    fn from(c: Chain) -> Self {
-        match c {
-            Chain::Arbitrum => Self::Arbitrum,
-            Chain::Berachain => Self::Berachain,
-            Chain::Conflux => Self::Conflux,
-            Chain::Corn => Self::Corn,
-            Chain::Ethereum => Self::Ethereum,
-            Chain::Flare => Self::Flare,
-            Chain::Hedera => Self::Hedera,
-            Chain::HyperEvm => Self::HyperEvm,
-            Chain::Ink => Self::Ink,
-            Chain::Mantle => Self::Mantle,
-            Chain::MegaEth => Self::MegaEth,
-            Chain::Monad => Self::Monad,
-            Chain::Morph => Self::Morph,
-            Chain::Optimism => Self::Optimism,
-            Chain::Plasma => Self::Plasma,
-            Chain::Polygon => Self::Polygon,
-            Chain::Rootstock => Self::Rootstock,
-            Chain::Sei => Self::Sei,
-            Chain::Solana => Self::Solana,
-            Chain::Stable => Self::Stable,
-            Chain::Tempo => Self::Tempo,
-            Chain::Tron => Self::Tron,
-            Chain::Unichain => Self::Unichain,
-            Chain::XLayer => Self::XLayer,
-        }
-    }
-}
 
 const PHRASE_FILE_NAME: &str = "phrase";
 const HISTORY_FILE_NAME: &str = "history.txt";
@@ -112,6 +54,9 @@ enum Command {
     Limits,
 
     /// Get a quote for a LN -> USDT swap (no commitment).
+    ///
+    /// The destination chain is picked interactively from the set of chains
+    /// whose transport accepts the given address.
     Prepare {
         /// USDT amount (e.g. 1.5 for 1.50 USDT). Mutually exclusive with --sats.
         #[arg(long, value_parser = parse_usdt_amount, conflicts_with = "sats")]
@@ -119,11 +64,9 @@ enum Command {
         /// Input amount in sats. Mutually exclusive with --usdt.
         #[arg(long, conflicts_with = "usdt")]
         sats: Option<u64>,
-        /// Destination EVM address.
+        /// Destination address (any transport — the CLI filters supported
+        /// chains by the address format).
         destination: String,
-        /// Destination chain.
-        #[arg(value_enum)]
-        chain: Chain,
     },
 
     /// Full swap flow: prepare -> create -> wait for payment -> complete.
@@ -134,11 +77,9 @@ enum Command {
         /// Input amount in sats. Mutually exclusive with --usdt.
         #[arg(long, conflicts_with = "usdt")]
         sats: Option<u64>,
-        /// Destination EVM address.
+        /// Destination address (any transport — the CLI filters supported
+        /// chains by the address format).
         destination: String,
-        /// Destination chain.
-        #[arg(value_enum)]
-        chain: Chain,
     },
 
     /// Accept a degraded quote for a swap stuck waiting for approval.
@@ -275,7 +216,7 @@ async fn execute_command(command: Command, svc: &BoltzService, seed: &[u8]) -> R
     match command {
         Command::Exit => Ok(false),
         Command::Info => {
-            cmd_info(seed)?;
+            cmd_info(svc, seed)?;
             Ok(true)
         }
         Command::Limits => {
@@ -286,9 +227,9 @@ async fn execute_command(command: Command, svc: &BoltzService, seed: &[u8]) -> R
             usdt,
             sats,
             destination,
-            chain,
         } => {
-            let prepared = prepare(svc, &destination, chain.into(), usdt, sats).await?;
+            let chain = pick_chain_for_address(svc, &destination)?;
+            let prepared = prepare(svc, &destination, chain, usdt, sats).await?;
             print_json(&prepared);
             Ok(true)
         }
@@ -296,9 +237,9 @@ async fn execute_command(command: Command, svc: &BoltzService, seed: &[u8]) -> R
             usdt,
             sats,
             destination,
-            chain,
         } => {
-            cmd_swap(svc, &destination, chain.into(), usdt, sats).await?;
+            let chain = pick_chain_for_address(svc, &destination)?;
+            cmd_swap(svc, &destination, chain, usdt, sats).await?;
             Ok(true)
         }
         Command::Accept { swap_id } => {
@@ -357,7 +298,7 @@ async fn init_service(config: BoltzConfig, seed: &[u8], data_dir: &Path) -> Resu
     Ok(svc)
 }
 
-fn cmd_info(seed: &[u8]) -> Result<()> {
+fn cmd_info(svc: &BoltzService, seed: &[u8]) -> Result<()> {
     let km = boltz_client::EvmKeyManager::from_seed(seed)?;
     let chain_id = u32::try_from(boltz_client::ARBITRUM_CHAIN_ID).context("Chain ID overflow")?;
     let gas = km.derive_gas_signer(chain_id)?;
@@ -374,10 +315,15 @@ fn cmd_info(seed: &[u8]) -> Result<()> {
     );
     println!("  Preimage key[0] addr:   {}", preimage_key.address_hex());
 
-    let chains: Vec<String> = <Chain as clap::ValueEnum>::value_variants()
-        .iter()
-        .filter_map(|v| clap::ValueEnum::to_possible_value(v).map(|p| p.get_name().to_string()))
+    let mut chains: Vec<String> = svc
+        .supported_chains()
+        .into_iter()
+        .map(|id| {
+            svc.chain_spec(&id)
+                .map_or_else(|| id.to_string(), |s| s.display_name.clone())
+        })
         .collect();
+    chains.sort();
     println!("\nSupported destination chains:\n  {}", chains.join(", "));
 
     Ok(())
@@ -392,7 +338,7 @@ async fn cmd_limits(svc: &BoltzService) -> Result<()> {
 async fn prepare(
     svc: &BoltzService,
     destination: &str,
-    chain: boltz_client::Chain,
+    chain: ChainId,
     usdt: Option<u64>,
     sats: Option<u64>,
 ) -> Result<boltz_client::PreparedSwap> {
@@ -407,10 +353,60 @@ async fn prepare(
     }
 }
 
+/// Pick a destination chain by asking which supported chains can accept the
+/// given address, then prompting the user to choose by number.
+///
+/// Filters via [`BoltzService::chains_accepting`] so the list contains only
+/// transports compatible with the address format. Auto-selects if exactly
+/// one chain matches; errors if none do.
+fn pick_chain_for_address(svc: &BoltzService, destination: &str) -> Result<ChainId> {
+    let mut candidates: Vec<(String, ChainId)> = svc
+        .chains_accepting(destination)
+        .into_iter()
+        .map(|spec| (spec.display_name.clone(), spec.id.clone()))
+        .collect();
+    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+
+    match candidates.len() {
+        0 => bail!(
+            "No supported chain accepts the address '{destination}'. Run `info` for the list."
+        ),
+        1 => {
+            let (name, id) = candidates.into_iter().next().unwrap();
+            println!("Only one chain supports this address: {name} — proceeding.");
+            Ok(id)
+        }
+        _ => {
+            println!("\nWhich chain?");
+            for (i, (name, _)) in candidates.iter().enumerate() {
+                println!("  {:>2}. {}", i.saturating_add(1), name);
+            }
+            loop {
+                print!("> ");
+                io::stdout().flush()?;
+                let mut input = String::new();
+                io::stdin().read_line(&mut input)?;
+                let trimmed = input.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match trimmed.parse::<usize>() {
+                    Ok(n) if n >= 1 && n <= candidates.len() => {
+                        let idx = n.saturating_sub(1);
+                        let (_, id) = candidates.into_iter().nth(idx).unwrap();
+                        return Ok(id);
+                    }
+                    _ => println!("Enter a number between 1 and {}.", candidates.len()),
+                }
+            }
+        }
+    }
+}
+
 async fn cmd_swap(
     svc: &BoltzService,
     destination: &str,
-    chain: boltz_client::Chain,
+    chain: ChainId,
     usdt: Option<u64>,
     sats: Option<u64>,
 ) -> Result<()> {

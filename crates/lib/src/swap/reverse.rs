@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use alloy_primitives::{Bytes, FixedBytes, U256};
 use lightning_invoice::Bolt11Invoice;
@@ -18,13 +18,14 @@ use crate::evm::contracts::{
     encode_claim_erc20_execute_oft, parse_address, quote_calldata_to_call,
 };
 use crate::evm::lz_options::build_extra_options;
-use crate::evm::oft::{OftDeployments, Usdt0Kind, legacy_mesh_source_amount};
+use crate::evm::oft::legacy_mesh_source_amount;
 use crate::evm::provider::EvmProvider;
 use crate::evm::recipient::{encode_oft_recipient, is_valid_destination_address};
 use crate::evm::signing::EvmSigner;
 use crate::keys::EvmKeyManager;
 use crate::models::{
-    BoltzSwap, BoltzSwapStatus, Chain, NetworkTransport, PreparedSwap, SwapLimits,
+    BoltzSwap, BoltzSwapStatus, ChainId, ChainRegistry, ChainSpec, NetworkTransport, PreparedSwap,
+    SwapLimits, Usdt0Kind,
 };
 use crate::recover::{self, RecoverableSwap};
 use crate::solana::ata::derive_ata;
@@ -43,7 +44,7 @@ pub(crate) struct ReverseSwapExecutor {
     pub(crate) key_manager: EvmKeyManager,
     alchemy_client: AlchemyGasClient,
     pub(crate) evm_provider: EvmProvider,
-    oft_deployments: OftDeployments,
+    pub(crate) chain_registry: Arc<ChainRegistry>,
     pub(crate) config: BoltzConfig,
     pub(crate) erc20swap_address: String,
     /// Used only when the destination chain is Solana, to query whether the
@@ -64,7 +65,7 @@ impl ReverseSwapExecutor {
         key_manager: EvmKeyManager,
         alchemy_client: AlchemyGasClient,
         evm_provider: EvmProvider,
-        oft_deployments: OftDeployments,
+        chain_registry: Arc<ChainRegistry>,
         config: BoltzConfig,
         erc20swap_address: String,
         solana_rpc: SolanaRpcClient,
@@ -74,7 +75,7 @@ impl ReverseSwapExecutor {
             key_manager,
             alchemy_client,
             evm_provider,
-            oft_deployments,
+            chain_registry,
             config,
             erc20swap_address,
             solana_rpc,
@@ -91,12 +92,12 @@ impl ReverseSwapExecutor {
         })
     }
 
-    /// Look up the destination-chain USDT0 token contract address, when one
-    /// is published in the OFT deployments registry.
-    pub fn token_address(&self, chain: &Chain) -> Option<String> {
-        self.oft_deployments
-            .token_address_for(chain)
-            .map(str::to_string)
+    /// Look up a destination `ChainSpec`, raising a hard error if the ID is
+    /// unknown. Used by every path that needs per-chain metadata.
+    fn resolve_destination(&self, id: &ChainId) -> Result<&ChainSpec, BoltzError> {
+        self.chain_registry
+            .get(id)
+            .ok_or_else(|| BoltzError::Generic(format!("Unsupported destination chain '{id}'")))
     }
 
     /// Prepare a reverse swap quote. No side effects.
@@ -117,13 +118,14 @@ impl ReverseSwapExecutor {
     pub async fn prepare(
         &self,
         destination: &str,
-        chain: Chain,
+        chain: ChainId,
         usdt_amount: u64,
         max_slippage_bps: Option<u32>,
     ) -> Result<PreparedSwap, BoltzError> {
         let slippage_bps = resolve_slippage_bps(max_slippage_bps, self.config.slippage_bps)?;
 
-        validate_destination(&chain, destination)?;
+        let spec = self.resolve_destination(&chain)?;
+        validate_destination(spec, destination)?;
 
         let tbtc_pair = self.fetch_tbtc_pair().await?;
 
@@ -131,11 +133,11 @@ impl ReverseSwapExecutor {
         // pair. Solana destinations may need an ATA-creation hint, which
         // affects the messaging fee and must feed every quote and the final
         // `SendData` so the router signature matches on-chain execution.
-        let extra_options = self.compute_extra_options(&chain, destination).await?;
+        let extra_options = self.compute_extra_options(spec, destination).await?;
 
         // Compute the total tBTC claim amount (in sats) needed to fund
         // the destination-side delivery.
-        let total_tbtc_sats = if chain.is_source_chain() {
+        let total_tbtc_sats = if self.chain_registry.is_source(&chain) {
             // Same-chain: single DEX quote for how much tBTC to buy
             // `usdt_amount` USDT, then floor to sats.
             let tbtc_wei = self.fetch_quote_out_tbtc(usdt_amount).await?;
@@ -146,10 +148,10 @@ impl ReverseSwapExecutor {
             // convert the USDT leg and the LZ messaging-fee leg to tBTC
             // sats independently.
             let required_usdt = self
-                .estimate_oft_required_send_amount(&chain, u128::from(usdt_amount), &extra_options)
+                .estimate_oft_required_send_amount(spec, u128::from(usdt_amount), &extra_options)
                 .await?;
             let (msg_fee_native, _) = self
-                .quote_oft_messaging_fee(&chain, required_usdt, &extra_options)
+                .quote_oft_messaging_fee(spec, required_usdt, &extra_options)
                 .await?;
 
             let required_usdt_u64 = u64::try_from(required_usdt)
@@ -214,13 +216,14 @@ impl ReverseSwapExecutor {
     pub async fn prepare_from_sats(
         &self,
         destination: &str,
-        chain: Chain,
+        chain: ChainId,
         invoice_amount_sats: u64,
         max_slippage_bps: Option<u32>,
     ) -> Result<PreparedSwap, BoltzError> {
         let slippage_bps = resolve_slippage_bps(max_slippage_bps, self.config.slippage_bps)?;
 
-        validate_destination(&chain, destination)?;
+        let spec = self.resolve_destination(&chain)?;
+        validate_destination(spec, destination)?;
 
         let tbtc_pair = self.fetch_tbtc_pair().await?;
 
@@ -245,9 +248,9 @@ impl ReverseSwapExecutor {
         // Compute LayerZero executor options for this destination — same
         // reasoning as `prepare`: any ATA-creation hint must feed every quote
         // call for the returned fee to match on-chain execution.
-        let extra_options = self.compute_extra_options(&chain, destination).await?;
+        let extra_options = self.compute_extra_options(spec, destination).await?;
 
-        let usdt_output = if chain.is_source_chain() {
+        let usdt_output = if self.chain_registry.is_source(&chain) {
             // Same-chain: single forward DEX quote tBTC → USDT.
             self.fetch_quote_in_usdt(tbtc_evm_units).await?
         } else {
@@ -256,7 +259,7 @@ impl ReverseSwapExecutor {
             // via a second DEX quote and subtract in tBTC-sat domain.
             let initial_usdt = self.fetch_quote_in_usdt(tbtc_evm_units).await?;
             let (msg_fee_native, _) = self
-                .quote_oft_messaging_fee(&chain, u128::from(initial_usdt), &extra_options)
+                .quote_oft_messaging_fee(spec, u128::from(initial_usdt), &extra_options)
                 .await?;
 
             let msg_fee_tbtc_sats = if msg_fee_native == 0 {
@@ -288,7 +291,7 @@ impl ReverseSwapExecutor {
                 .ok_or_else(|| BoltzError::Generic("tBTC amount overflow".into()))?;
             let adjusted_usdt = self.fetch_quote_in_usdt(adjusted_tbtc_evm_units).await?;
             let (_, oft_received) = self
-                .quote_oft_messaging_fee(&chain, u128::from(adjusted_usdt), &extra_options)
+                .quote_oft_messaging_fee(spec, u128::from(adjusted_usdt), &extra_options)
                 .await?;
             u64::try_from(oft_received)
                 .map_err(|_| BoltzError::Generic("USDT amount overflow".into()))?
@@ -462,7 +465,7 @@ impl ReverseSwapExecutor {
             chain_id: self.config.chain_id,
             claim_address: format!("0x{}", hex::encode(recoverable.claim_address.as_slice())),
             destination_address: destination_address.to_string(),
-            destination_chain: Chain::Arbitrum,
+            destination_chain: self.chain_registry.source.id.clone(),
             refund_address: format!("0x{}", hex::encode(recoverable.refund_address.as_slice())),
             erc20swap_address: self.erc20swap_address.clone(),
             router_address: ARBITRUM_ROUTER_ADDRESS.to_string(),
@@ -607,7 +610,7 @@ impl ReverseSwapExecutor {
             .fetch_erc20swap_version(&swap.erc20swap_address)
             .await?;
 
-        let addrs = ClaimAddresses::parse(swap)?;
+        let addrs = ClaimAddresses::parse(swap, &self.chain_registry)?;
         let tbtc_evm_amount = U256::from(swap.onchain_amount)
             .checked_mul(U256::from(SATS_TO_TBTC_FACTOR))
             .ok_or_else(|| BoltzError::Generic("tBTC EVM amount overflow".into()))?;
@@ -701,7 +704,7 @@ impl ReverseSwapExecutor {
         timelock: U256,
         skip_drift_check: bool,
     ) -> Result<String, BoltzError> {
-        if swap.destination_chain == Chain::Arbitrum {
+        if self.chain_registry.is_source(&swap.destination_chain) {
             self.try_claim_same_chain(
                 swap,
                 gas_signer,
@@ -822,25 +825,21 @@ impl ReverseSwapExecutor {
         timelock: U256,
         skip_drift_check: bool,
     ) -> Result<String, BoltzError> {
-        let dst_info = self
-            .oft_deployments
-            .get_for(&swap.destination_chain)
-            .ok_or_else(|| {
-                BoltzError::Generic(format!(
-                    "No OFT deployment for destination chain {:?}",
-                    swap.destination_chain
-                ))
-            })?;
+        let dst_info = self.resolve_destination(&swap.destination_chain)?;
         let dst_eid = dst_info.lz_eid;
 
         // The legacy and native USDT0 meshes deploy distinct OFT contracts
         // on the source chain — pick the one matching the destination's mesh
         // so quoting and sending bridge through the right contract.
         let source_oft_address = self
-            .oft_deployments
-            .source_oft_address(self.config.chain_id, dst_info.mesh)
+            .chain_registry
+            .source
+            .oft_for(dst_info.mesh)
             .ok_or_else(|| {
-                BoltzError::Generic("No OFT deployment for source chain (Arbitrum)".into())
+                BoltzError::Generic(format!(
+                    "Source chain has no {:?} mesh OFT deployment",
+                    dst_info.mesh
+                ))
             })?;
         let oft_addr = parse_address(source_oft_address)?;
 
@@ -857,7 +856,7 @@ impl ReverseSwapExecutor {
         // option with `solanaAtaRentExemptLamports` so the destination
         // executor creates the recipient's token account on arrival.
         let extra_options = self
-            .compute_extra_options(&swap.destination_chain, &swap.destination_address)
+            .compute_extra_options(dst_info, &swap.destination_address)
             .await?;
 
         // ─── Pass 1: estimate LZ fee cost ─────────────────────────────
@@ -1190,7 +1189,7 @@ impl ReverseSwapExecutor {
     /// because the legacy bridge fee is not deducted by the staticcall.
     async fn estimate_oft_required_send_amount(
         &self,
-        chain: &Chain,
+        spec: &ChainSpec,
         target_amount: u128,
         extra_options: &Bytes,
     ) -> Result<u128, BoltzError> {
@@ -1201,9 +1200,7 @@ impl ReverseSwapExecutor {
         // Legacy-mesh routes: skip the binary search and apply the closed-form
         // 3 bps inverse. The legacy `quoteOFT` does not deduct the bridge fee,
         // so the search would converge to a too-low source amount.
-        if let Some(dst_info) = self.oft_deployments.get_for(chain)
-            && dst_info.mesh == Usdt0Kind::Legacy
-        {
+        if spec.mesh == Usdt0Kind::Legacy {
             return legacy_mesh_source_amount(target_amount)
                 .ok_or_else(|| BoltzError::Generic("Legacy mesh source amount overflow".into()));
         }
@@ -1219,7 +1216,7 @@ impl ReverseSwapExecutor {
         let mut attempts = 0u32;
         loop {
             let (_, received) = self
-                .quote_oft_messaging_fee(chain, high, extra_options)
+                .quote_oft_messaging_fee(spec, high, extra_options)
                 .await?;
             if received >= target_amount {
                 break;
@@ -1249,7 +1246,7 @@ impl ReverseSwapExecutor {
         while low < high {
             let mid = low + (high - low) / 2;
             let (_, received) = self
-                .quote_oft_messaging_fee(chain, mid, extra_options)
+                .quote_oft_messaging_fee(spec, mid, extra_options)
                 .await?;
             if received >= target_amount {
                 high = mid;
@@ -1270,26 +1267,27 @@ impl ReverseSwapExecutor {
     /// account creation, which materially affects the fee.
     async fn quote_oft_messaging_fee(
         &self,
-        chain: &Chain,
+        spec: &ChainSpec,
         usdt_amount: u128,
         extra_options: &Bytes,
     ) -> Result<(u128, u128), BoltzError> {
-        let dst_info = self.oft_deployments.get_for(chain).ok_or_else(|| {
-            BoltzError::Generic(format!("No OFT deployment for destination chain {chain:?}"))
-        })?;
         // Match the source OFT to the destination's mesh: legacy and native
         // USDT0 use distinct contracts on the source chain.
-        let source_oft_address = self
-            .oft_deployments
-            .source_oft_address(self.config.chain_id, dst_info.mesh)
-            .ok_or_else(|| {
-                BoltzError::Generic("No OFT deployment for source chain (Arbitrum)".into())
-            })?;
+        let source_oft_address =
+            self.chain_registry
+                .source
+                .oft_for(spec.mesh)
+                .ok_or_else(|| {
+                    BoltzError::Generic(format!(
+                        "Source chain has no {:?} mesh OFT deployment",
+                        spec.mesh
+                    ))
+                })?;
 
         // The recipient is irrelevant for messaging-fee estimation; an all-zero
         // 32-byte placeholder is fine for both EVM and non-EVM destinations.
         let send_param = contracts::build_oft_send_param(
-            dst_info.lz_eid,
+            spec.lz_eid,
             FixedBytes::<32>::ZERO,
             U256::from(usdt_amount),
             U256::ZERO,
@@ -1340,10 +1338,10 @@ impl ReverseSwapExecutor {
     /// calls.
     async fn compute_extra_options(
         &self,
-        chain: &Chain,
+        spec: &ChainSpec,
         destination: &str,
     ) -> Result<Bytes, BoltzError> {
-        if chain.transport() != NetworkTransport::Solana {
+        if spec.transport != NetworkTransport::Solana {
             return Ok(Bytes::new());
         }
 
@@ -1579,10 +1577,15 @@ struct ClaimAddresses {
 }
 
 impl ClaimAddresses {
-    fn parse(swap: &BoltzSwap) -> Result<Self, BoltzError> {
-        let transport = swap.destination_chain.transport();
-        let destination_bytes32 = encode_oft_recipient(transport, &swap.destination_address)?;
-        let destination_evm = match transport {
+    fn parse(swap: &BoltzSwap, registry: &ChainRegistry) -> Result<Self, BoltzError> {
+        let spec = registry.get(&swap.destination_chain).ok_or_else(|| {
+            BoltzError::Generic(format!(
+                "Unknown destination chain '{}' for swap {}",
+                swap.destination_chain, swap.id
+            ))
+        })?;
+        let destination_bytes32 = encode_oft_recipient(spec.transport, &swap.destination_address)?;
+        let destination_evm = match spec.transport {
             NetworkTransport::Evm => Some(parse_address(&swap.destination_address)?),
             NetworkTransport::Solana | NetworkTransport::Tron => None,
         };
@@ -1745,12 +1748,13 @@ fn tbtc_wei_to_sats_u64(tbtc_wei: u128) -> Result<u64, BoltzError> {
 /// Validate the destination address for the given chain's transport before
 /// committing to a swap. Dispatches to the per-transport parser in
 /// `crate::evm::recipient`.
-fn validate_destination(chain: &Chain, destination: &str) -> Result<(), BoltzError> {
-    if is_valid_destination_address(chain, destination) {
+fn validate_destination(spec: &ChainSpec, destination: &str) -> Result<(), BoltzError> {
+    if is_valid_destination_address(spec.transport, destination) {
         Ok(())
     } else {
         Err(BoltzError::Generic(format!(
-            "Invalid destination address '{destination}' for {chain:?}"
+            "Invalid destination address '{destination}' for {}",
+            spec.display_name
         )))
     }
 }
