@@ -164,7 +164,7 @@ pub fn parse_chain_registry(
     let mut seen_evm_chain_ids: HashSet<u64> = HashSet::new();
 
     for entry in &token_config.native {
-        if let Some(spec) = build_chain_spec(entry, Usdt0Kind::Native) {
+        if let Some(spec) = build_chain_spec(entry, Usdt0Kind::Native, &source_id) {
             if let Some(cid) = spec.evm_chain_id {
                 seen_evm_chain_ids.insert(cid);
             }
@@ -172,7 +172,7 @@ pub fn parse_chain_registry(
         }
     }
     for entry in &token_config.legacy_mesh {
-        if let Some(spec) = build_chain_spec(entry, Usdt0Kind::Legacy) {
+        if let Some(spec) = build_chain_spec(entry, Usdt0Kind::Legacy, &source_id) {
             if let Some(cid) = spec.evm_chain_id
                 && seen_evm_chain_ids.contains(&cid)
             {
@@ -209,12 +209,19 @@ fn source_evm_chain_id_as_u32(source: u64) -> Result<u32, BoltzError> {
 /// Build a `ChainSpec` for a single USDT0 entry, or `None` if the entry is
 /// unsupported (missing `lzEid`, missing primary OFT contract, or non-EVM
 /// transport with no encoder).
-fn build_chain_spec(entry: &OftApiChain, mesh: Usdt0Kind) -> Option<ChainSpec> {
+fn build_chain_spec(
+    entry: &OftApiChain,
+    mesh: Usdt0Kind,
+    source_id: &ChainId,
+) -> Option<ChainSpec> {
     let (transport, evm_chain_id) = classify_transport(entry)?;
     let info = resolve_chain_info(entry)?;
+    let id = ChainId::new(&entry.name);
+    let is_source = id == *source_id;
 
     Some(ChainSpec {
-        id: ChainId::new(&entry.name),
+        id,
+        is_source,
         display_name: entry.name.clone(),
         transport,
         evm_chain_id,
@@ -336,6 +343,24 @@ mod tests {
                     "contracts": [
                         {"name": "Token", "address": "0x20C00000000000000000000014f22CA97301EB73", "explorer": "https://explore.mainnet.tempo.xyz/"},
                         {"name": "OFT", "address": "0xaf37E8B6C9ED7f6318979f56Fc287d76c30847ff", "explorer": "https://explore.mainnet.tempo.xyz/"}
+                    ]
+                },
+                {
+                    "name": "Optimism",
+                    "chainId": 10,
+                    "lzEid": "30111",
+                    "contracts": [
+                        {"name": "Token", "address": "0x01bFF41798a0BcF287b996046Ca68b395DbC1071", "explorer": "https://optimistic.etherscan.io/"},
+                        {"name": "OFT", "address": "0xF03b4d9AC1D5d1E7c4cEf54C2A313b9fe051A0aD", "explorer": "https://optimistic.etherscan.io/"}
+                    ]
+                },
+                {
+                    "name": "Polygon PoS",
+                    "chainId": 137,
+                    "lzEid": "30109",
+                    "contracts": [
+                        {"name": "Token", "address": "0xc2132D05D31c914a87C6611C10748AEb04B58e8F", "explorer": "https://polygonscan.com/"},
+                        {"name": "OFT", "address": "0x6BA10300f0DC58B7a1e4c0e41f5daBb7D7829e13", "explorer": "https://polygonscan.com/"}
                     ]
                 },
                 {
@@ -510,6 +535,61 @@ mod tests {
             registry.source.oft_for(Usdt0Kind::Legacy),
             Some("0x77652D5aba086137b595875263FC200182919B92")
         );
+    }
+
+    #[macros::test_all]
+    fn asset_symbol_returns_usdt_for_source_chain() {
+        // Arbitrum is the source. Same-chain delivery hands the user
+        // canonical Tether USDT directly — no OFT bridge involved.
+        let registry = sample_registry();
+        let arb = registry
+            .get(&ChainId::new("arbitrum one"))
+            .expect("arbitrum one");
+        assert!(arb.is_source);
+        assert_eq!(arb.asset_symbol(), "USDT");
+    }
+
+    #[macros::test_all]
+    fn asset_symbol_returns_usdt_for_adapter_only_destination() {
+        // Ethereum publishes only `OFT Adapter` (no `Token` entry), so the
+        // adapter unwraps to canonical underlying USDT on delivery.
+        let registry = sample_registry();
+        let eth = registry.get(&ChainId::new("ethereum")).expect("ethereum");
+        assert!(!eth.is_source);
+        assert!(eth.token_address.is_none());
+        assert_eq!(eth.asset_symbol(), "USDT");
+    }
+
+    #[macros::test_all]
+    fn asset_symbol_returns_usdt0_for_distinct_oft_destinations() {
+        // Destinations where USDT0 publishes its own OFT ERC20 (distinct
+        // from any canonical Tether contract on that chain) must be
+        // labeled USDT0 so users don't end up with two indistinguishable
+        // "USDT" balances in their wallet.
+        let registry = sample_registry();
+        for id in ["tempo", "optimism"] {
+            let spec = registry
+                .get(&ChainId::new(id))
+                .unwrap_or_else(|| panic!("{id}"));
+            assert!(!spec.is_source, "{id}");
+            assert!(spec.token_address.is_some(), "{id}");
+            assert_eq!(spec.asset_symbol(), "USDT0", "{id}");
+        }
+    }
+
+    #[macros::test_all]
+    fn asset_symbol_returns_usdt_for_canonical_oft_destinations() {
+        // Polygon PoS is in the canonical allowlist because USDT0's
+        // `Token` entry there is the canonical Tether contract, not a
+        // distinct OFT deployment — users receive regular USDT.
+        let registry = sample_registry();
+        let polygon = registry
+            .get(&ChainId::new("polygon pos"))
+            .expect("polygon pos");
+        assert!(!polygon.is_source);
+        assert_eq!(polygon.evm_chain_id, Some(137));
+        assert!(polygon.token_address.is_some());
+        assert_eq!(polygon.asset_symbol(), "USDT");
     }
 
     #[macros::test_all]
