@@ -416,6 +416,8 @@ impl ReverseSwapExecutor {
             timeout_block_height: resp.timeout_block_height,
             lockup_tx_id: None,
             claim_tx_hash: None,
+            delivered_amount: None,
+            lz_guid: None,
             created_at: now,
             updated_at: now,
         })
@@ -477,6 +479,8 @@ impl ReverseSwapExecutor {
             timeout_block_height: timelock,
             lockup_tx_id: Some(recoverable.lockup_tx_hash.clone()),
             claim_tx_hash: None,
+            delivered_amount: None,
+            lz_guid: None,
             created_at: now,
             updated_at: now,
         })

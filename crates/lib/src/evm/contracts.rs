@@ -1,5 +1,5 @@
 use alloy_primitives::{Address, FixedBytes, U256};
-use alloy_sol_types::{SolCall, SolValue, sol};
+use alloy_sol_types::{SolCall, SolEvent, SolValue, sol};
 
 use crate::api::types::QuoteCalldata;
 use crate::error::BoltzError;
@@ -154,6 +154,24 @@ sol! {
     /// therefore requires an ERC20 allowance from `msg.sender`. Mint/burn
     /// variants (e.g. Arbitrum's native-mesh USDT0 OFT) return false.
     function approvalRequired() external view returns (bool);
+
+    // ─── Events ──────────────────────────────────────────────────────────
+
+    /// Standard ERC20 transfer event.
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /// `LayerZero` v2 OFT send event. Emitted on the source chain by both
+    /// the native-mesh and legacy-mesh USDT0 OFT contracts on Arbitrum with
+    /// the same signature. `amountReceivedLD` is the amount that will be
+    /// credited on the destination chain (for USDT0 under LZ v2, equal to
+    /// what arrives).
+    event OFTSent(
+        bytes32 indexed guid,
+        uint32 dstEid,
+        address indexed fromAddress,
+        uint256 amountSentLD,
+        uint256 amountReceivedLD
+    );
 }
 
 /// Convert a Boltz encode API `QuoteCalldata` to a Router `Call`.
@@ -601,6 +619,126 @@ pub fn parse_hex_bytes(hex_str: &str) -> Result<Vec<u8>, BoltzError> {
     })
 }
 
+// ─── Delivered-amount decoding ──────────────────────────────────────────
+
+/// How to interpret the claim tx receipt when extracting the delivered amount.
+#[derive(Debug, Clone)]
+pub enum DeliveredAmountSource {
+    /// Same-chain (Arbitrum) delivery: find a `Transfer(_, user, value)` log
+    /// on the USDT token. `user` is the final recipient EVM address;
+    /// `token` is the USDT token contract address.
+    ArbitrumTransfer { token: Address, user: Address },
+    /// Bridged delivery via `LayerZero` OFT: find an `OFTSent` log emitted
+    /// by the mesh-appropriate source OFT contract and read
+    /// `amountReceivedLD`.
+    OftSent { oft_contract: Address },
+}
+
+/// Result of decoding the delivered amount from a claim receipt's logs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveredAmount {
+    /// Amount delivered on the destination chain (token base units).
+    pub amount: u64,
+    /// `LayerZero` message GUID as `0x`-prefixed hex, present only for
+    /// bridged swaps (`OFTSent` path).
+    pub lz_guid: Option<String>,
+}
+
+/// Decode the delivered amount from a successful claim transaction's logs.
+///
+/// Returns `None` when no matching log is found; callers should treat this as
+/// unknown rather than failure (logs at warn level and leaves the field
+/// unset).
+pub fn decode_delivered_from_logs(
+    logs: &[crate::evm::provider::LogEntry],
+    source: &DeliveredAmountSource,
+) -> Option<DeliveredAmount> {
+    match source {
+        DeliveredAmountSource::ArbitrumTransfer { token, user } => {
+            decode_arbitrum_transfer(logs, *token, *user)
+        }
+        DeliveredAmountSource::OftSent { oft_contract } => decode_oft_sent(logs, *oft_contract),
+    }
+}
+
+fn decode_arbitrum_transfer(
+    logs: &[crate::evm::provider::LogEntry],
+    token: Address,
+    user: Address,
+) -> Option<DeliveredAmount> {
+    let topic0 = format!("0x{}", hex::encode(Transfer::SIGNATURE_HASH.as_slice()));
+    let user_topic = address_to_topic(&user.into_array());
+
+    for log in logs {
+        if !addresses_equal(&log.address, &token) {
+            continue;
+        }
+        if log.topics.len() < 3 {
+            continue;
+        }
+        if !topics_equal(&log.topics[0], &topic0) {
+            continue;
+        }
+        if !topics_equal(&log.topics[2], &user_topic) {
+            continue;
+        }
+        let data_bytes = parse_hex_bytes(&log.data).ok()?;
+        let value = <U256>::abi_decode(&data_bytes).ok()?;
+        let amount: u64 = value.try_into().ok()?;
+        return Some(DeliveredAmount {
+            amount,
+            lz_guid: None,
+        });
+    }
+    None
+}
+
+fn decode_oft_sent(
+    logs: &[crate::evm::provider::LogEntry],
+    oft_contract: Address,
+) -> Option<DeliveredAmount> {
+    let topic0 = format!("0x{}", hex::encode(OFTSent::SIGNATURE_HASH.as_slice()));
+
+    for log in logs {
+        if !addresses_equal(&log.address, &oft_contract) {
+            continue;
+        }
+        if log.topics.len() < 3 {
+            continue;
+        }
+        if !topics_equal(&log.topics[0], &topic0) {
+            continue;
+        }
+        let data_bytes = parse_hex_bytes(&log.data).ok()?;
+        // data = abi.encode(uint32 dstEid, uint256 amountSentLD, uint256 amountReceivedLD)
+        let (_dst_eid, _amount_sent, amount_received) =
+            <(u32, U256, U256)>::abi_decode(&data_bytes).ok()?;
+        let amount: u64 = amount_received.try_into().ok()?;
+        let guid_hex = log.topics[1]
+            .strip_prefix("0x")
+            .unwrap_or(&log.topics[1])
+            .to_lowercase();
+        return Some(DeliveredAmount {
+            amount,
+            lz_guid: Some(format!("0x{guid_hex}")),
+        });
+    }
+    None
+}
+
+fn addresses_equal(hex_addr: &str, addr: &Address) -> bool {
+    let Ok(parsed) = parse_address(hex_addr) else {
+        return false;
+    };
+    parsed == *addr
+}
+
+fn topics_equal(a: &str, b: &str) -> bool {
+    let a_clean = a.strip_prefix("0x").unwrap_or(a);
+    let b_clean = b.strip_prefix("0x").unwrap_or(b);
+    a_clean.eq_ignore_ascii_case(b_clean)
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "browser-tests")]
@@ -990,5 +1128,199 @@ mod tests {
         assert_eq!(sp.extraOptions, extra);
         assert!(sp.composeMsg.is_empty());
         assert!(sp.oftCmd.is_empty());
+    }
+
+    // ─── Delivered-amount decoding tests ─────────────────────────────
+
+    use crate::evm::provider::LogEntry;
+
+    const NATIVE_OFT: &str = "0x14E4A1B13bf7F943c8ff7C51fb60FA964A298D92";
+    const LEGACY_OFT: &str = "0x77652D5aba086137b595875263FC200182919B92";
+    const USDT_TOKEN: &str = "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9";
+
+    fn mk_log(address: &str, topics: Vec<String>, data: &str) -> LogEntry {
+        LogEntry {
+            address: address.to_string(),
+            topics,
+            data: data.to_string(),
+            block_number: "0x1".to_string(),
+            transaction_hash: "0x0".to_string(),
+        }
+    }
+
+    fn transfer_topic0() -> String {
+        format!("0x{}", hex::encode(Transfer::SIGNATURE_HASH.as_slice()))
+    }
+
+    fn oft_sent_topic0() -> String {
+        format!("0x{}", hex::encode(OFTSent::SIGNATURE_HASH.as_slice()))
+    }
+
+    /// Real legacy-mesh `OFTSent` payload from Arbitrum tx
+    /// 0x99b6dbaf789231089316fb51838db6fa2af61093c0c239579a01cc82f6d7d2a1.
+    /// dstEid=0x75ad, amountSentLD=0x1e86d9, amountReceivedLD=0x1e8481.
+    const LEGACY_OFT_DATA: &str = "0x00000000000000000000000000000000000000000000000000000000000075ad00000000000000000000000000000000000000000000000000000000001e86d900000000000000000000000000000000000000000000000000000000001e8481";
+
+    const LEGACY_GUID: &str = "0xfa94e9d0c5fb3816e30e5718deac0d3e1d526cff806e66a9092940f23d59e386";
+
+    const LEGACY_FROM_TOPIC: &str =
+        "0x0000000000000000000000008de29a04dee5894d7bd536a7b4c924560f2dff57";
+
+    fn encode_uint256(value: u128) -> String {
+        let bytes = U256::from(value).abi_encode();
+        format!("0x{}", hex::encode(bytes))
+    }
+
+    #[macros::test_all]
+    fn test_decode_legacy_mesh_oft_sent() {
+        let log = mk_log(
+            LEGACY_OFT,
+            vec![
+                oft_sent_topic0(),
+                LEGACY_GUID.to_string(),
+                LEGACY_FROM_TOPIC.to_string(),
+            ],
+            LEGACY_OFT_DATA,
+        );
+
+        let oft_contract = parse_address(LEGACY_OFT).unwrap();
+        let result =
+            decode_delivered_from_logs(&[log], &DeliveredAmountSource::OftSent { oft_contract })
+                .unwrap();
+
+        assert_eq!(result.amount, 0x001e_8481);
+        assert_eq!(result.lz_guid.as_deref(), Some(LEGACY_GUID));
+    }
+
+    #[macros::test_all]
+    fn test_decode_native_mesh_oft_sent() {
+        // Synthetic: same event shape, different contract address and values.
+        let guid = "0x1111111111111111111111111111111111111111111111111111111111111111";
+        let from_topic = "0x00000000000000000000000000000000000000000000000000000000000000aa";
+        let data = {
+            // dstEid=30101 (Ethereum), amountSent=1_000_000, amountRecv=1_000_000 (native, no fee)
+            let eid = U256::from(30101u64).abi_encode();
+            let sent = U256::from(1_000_000u64).abi_encode();
+            let recv = U256::from(1_000_000u64).abi_encode();
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&eid);
+            bytes.extend_from_slice(&sent);
+            bytes.extend_from_slice(&recv);
+            format!("0x{}", hex::encode(bytes))
+        };
+
+        let log = mk_log(
+            NATIVE_OFT,
+            vec![oft_sent_topic0(), guid.to_string(), from_topic.to_string()],
+            &data,
+        );
+
+        let oft_contract = parse_address(NATIVE_OFT).unwrap();
+        let result =
+            decode_delivered_from_logs(&[log], &DeliveredAmountSource::OftSent { oft_contract })
+                .unwrap();
+
+        assert_eq!(result.amount, 1_000_000);
+        assert_eq!(result.lz_guid.as_deref(), Some(guid));
+    }
+
+    #[macros::test_all]
+    fn test_decode_arbitrum_transfer_to_user() {
+        let user = parse_address("0x1234567890abcdef1234567890abcdef12345678").unwrap();
+        let user_topic = address_to_topic(&user.into_array());
+        let from_topic = "0x000000000000000000000000000000000000000000000000000000000000beef";
+
+        let log = mk_log(
+            USDT_TOKEN,
+            vec![transfer_topic0(), from_topic.to_string(), user_topic],
+            &encode_uint256(42_000_000),
+        );
+
+        let token = parse_address(USDT_TOKEN).unwrap();
+        let result = decode_delivered_from_logs(
+            &[log],
+            &DeliveredAmountSource::ArbitrumTransfer { token, user },
+        )
+        .unwrap();
+
+        assert_eq!(result.amount, 42_000_000);
+        assert_eq!(result.lz_guid, None);
+    }
+
+    #[macros::test_all]
+    fn test_decode_arbitrum_transfer_picks_correct_to() {
+        // Two Transfer logs on USDT, only one goes to the user.
+        let user = parse_address("0x1234567890abcdef1234567890abcdef12345678").unwrap();
+        let user_topic = address_to_topic(&user.into_array());
+        let other = parse_address("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let other_topic = address_to_topic(&other.into_array());
+        let zero_topic = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+        let log_other = mk_log(
+            USDT_TOKEN,
+            vec![transfer_topic0(), zero_topic.to_string(), other_topic],
+            &encode_uint256(999),
+        );
+        let log_user = mk_log(
+            USDT_TOKEN,
+            vec![transfer_topic0(), zero_topic.to_string(), user_topic],
+            &encode_uint256(77_777),
+        );
+
+        let token = parse_address(USDT_TOKEN).unwrap();
+        let result = decode_delivered_from_logs(
+            &[log_other, log_user],
+            &DeliveredAmountSource::ArbitrumTransfer { token, user },
+        )
+        .unwrap();
+
+        assert_eq!(result.amount, 77_777);
+    }
+
+    #[macros::test_all]
+    fn test_decode_no_match_returns_none() {
+        // An OFTSent-looking log from the wrong contract is not a match.
+        let unrelated = "0x0000000000000000000000000000000000000dead";
+        let guid = "0x2222222222222222222222222222222222222222222222222222222222222222";
+        let from_topic = "0x00000000000000000000000000000000000000000000000000000000000000aa";
+        let log = mk_log(
+            unrelated,
+            vec![oft_sent_topic0(), guid.to_string(), from_topic.to_string()],
+            LEGACY_OFT_DATA,
+        );
+
+        let oft_contract = parse_address(NATIVE_OFT).unwrap();
+        let result =
+            decode_delivered_from_logs(&[log], &DeliveredAmountSource::OftSent { oft_contract });
+        assert!(result.is_none());
+    }
+
+    #[macros::test_all]
+    fn test_decode_ignores_transfer_to_wrong_user() {
+        let user = parse_address("0x1234567890abcdef1234567890abcdef12345678").unwrap();
+        let other = parse_address("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let other_topic = address_to_topic(&other.into_array());
+        let zero_topic = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+        let log = mk_log(
+            USDT_TOKEN,
+            vec![transfer_topic0(), zero_topic.to_string(), other_topic],
+            &encode_uint256(999),
+        );
+
+        let token = parse_address(USDT_TOKEN).unwrap();
+        let result = decode_delivered_from_logs(
+            &[log],
+            &DeliveredAmountSource::ArbitrumTransfer { token, user },
+        );
+        assert!(result.is_none());
+    }
+
+    #[macros::test_all]
+    fn test_decode_empty_logs_returns_none() {
+        let oft_contract = parse_address(LEGACY_OFT).unwrap();
+        let result =
+            decode_delivered_from_logs(&[], &DeliveredAmountSource::OftSent { oft_contract });
+        assert!(result.is_none());
     }
 }

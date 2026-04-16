@@ -5,8 +5,13 @@ use platform_utils::tokio;
 use tokio::sync::{Mutex, mpsc, watch};
 
 use crate::api::ws::{SwapStatusSubscriber, SwapStatusUpdate};
+use crate::config::ARBITRUM_USDT_ADDRESS;
 use crate::error::BoltzError;
 use crate::events::{BoltzSwapEvent, EventEmitter};
+use crate::evm::contracts::{
+    DeliveredAmount, DeliveredAmountSource, decode_delivered_from_logs, parse_address,
+};
+use crate::evm::provider::TxReceipt;
 use crate::models::{BoltzSwap, BoltzSwapStatus};
 use crate::recover;
 use crate::store::BoltzStorage;
@@ -272,10 +277,6 @@ impl SwapManager {
             // marking Completed. Without a tx hash we can't meaningfully verify
             // (the on-chain lock check can't distinguish our claim from a Boltz
             // refund), so trust the WS event and log a warning.
-            //
-            // TODO: Parse Transfer event logs from the receipt to record the
-            // actual USDT amount delivered (may differ from estimate due to
-            // slippage).
             "invoice.settled" | "transaction.claimed" => {
                 if let Some(ref tx_hash) = swap.claim_tx_hash {
                     let reached_terminal =
@@ -412,6 +413,7 @@ impl SwapManager {
                     if receipt.is_success() {
                         tracing::info!(swap_id, tx_hash, "Claim receipt confirmed");
                         if let Ok(Some(mut swap)) = store.get_swap(swap_id).await {
+                            apply_delivered_amount(executor, &mut swap, &receipt, tx_hash);
                             update_swap_status(
                                 &**store,
                                 event_emitter,
@@ -529,4 +531,55 @@ pub(crate) async fn update_swap_status(
     emitter
         .emit(&BoltzSwapEvent::SwapUpdated { swap: swap.clone() })
         .await;
+}
+
+/// Decode the delivered amount (and LZ GUID for bridged swaps) from a
+/// successful claim receipt's logs and write it onto `swap` in memory.
+/// The caller is responsible for persisting `swap` afterwards.
+fn apply_delivered_amount(
+    executor: &ReverseSwapExecutor,
+    swap: &mut BoltzSwap,
+    receipt: &TxReceipt,
+    tx_hash: &str,
+) {
+    let Some(source) = delivered_source_for(executor, swap) else {
+        tracing::warn!(
+            swap_id = swap.id,
+            tx_hash,
+            dest = %swap.destination_chain,
+            "No delivered-amount source resolvable for destination"
+        );
+        return;
+    };
+
+    match decode_delivered_from_logs(&receipt.logs, &source) {
+        Some(DeliveredAmount { amount, lz_guid }) => {
+            swap.delivered_amount = Some(amount);
+            swap.lz_guid = lz_guid;
+        }
+        None => {
+            tracing::warn!(
+                swap_id = swap.id,
+                tx_hash,
+                dest = %swap.destination_chain,
+                "No matching log in claim receipt; delivered_amount left unset"
+            );
+        }
+    }
+}
+
+fn delivered_source_for(
+    executor: &ReverseSwapExecutor,
+    swap: &BoltzSwap,
+) -> Option<DeliveredAmountSource> {
+    let registry = &executor.chain_registry;
+    if registry.is_source(&swap.destination_chain) {
+        let token = parse_address(ARBITRUM_USDT_ADDRESS).ok()?;
+        let user = parse_address(&swap.destination_address).ok()?;
+        return Some(DeliveredAmountSource::ArbitrumTransfer { token, user });
+    }
+    let spec = registry.get(&swap.destination_chain)?;
+    let oft_addr = registry.source.oft_for(spec.mesh)?;
+    let oft_contract = parse_address(oft_addr).ok()?;
+    Some(DeliveredAmountSource::OftSent { oft_contract })
 }

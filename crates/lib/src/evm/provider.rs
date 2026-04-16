@@ -39,6 +39,8 @@ pub struct TxReceipt {
     pub block_hash: String,
     pub block_number: String,
     pub gas_used: String,
+    #[serde(default)]
+    pub logs: Vec<LogEntry>,
 }
 
 impl TxReceipt {
@@ -467,6 +469,7 @@ mod tests {
             block_hash: "0x".to_string(),
             block_number: "0x1".to_string(),
             gas_used: "0x0".to_string(),
+            logs: vec![],
         };
         assert!(receipt.is_success());
 

@@ -50,6 +50,14 @@ pub struct BoltzSwap {
     // Results
     pub lockup_tx_id: Option<String>,
     pub claim_tx_hash: Option<String>,
+    /// Actual USDT amount delivered on the destination chain (6 decimals).
+    /// `None` until the claim receipt is processed. For bridged destinations
+    /// this is the OFT `amountReceivedLD`; for Arbitrum delivery it's the
+    /// final ERC20 `Transfer` value to the user.
+    pub delivered_amount: Option<u64>,
+    /// `LayerZero` message GUID (`0x`-prefixed hex) for bridged swaps.
+    /// `None` for Arbitrum-destination swaps (no bridge).
+    pub lz_guid: Option<String>,
 
     // Timestamps (unix seconds)
     pub created_at: u64,
@@ -328,6 +336,8 @@ mod tests {
             timeout_block_height: 123_456,
             lockup_tx_id: None,
             claim_tx_hash: None,
+            delivered_amount: None,
+            lz_guid: None,
             created_at: 1_700_000_000,
             updated_at: 1_700_000_000,
         };
