@@ -176,27 +176,18 @@ impl ChainSpec {
     ///   - Source chain (same-chain delivery; no OFT bridging).
     ///   - Adapter-only deployments (`token_address.is_none()`) where the
     ///     OFT adapter unwraps the canonical underlying USDT (e.g.
-    ///     Ethereum mainnet).
-    ///   - Chains in [`CANONICAL_USDT_EVM_CHAIN_IDS`] where USDT0's
-    ///     `Token` entry is the canonical Tether ERC20 on that chain.
+    ///     Ethereum mainnet, and legacy-mesh chains like Tron/Solana/Celo
+    ///     that bridge into the pre-existing canonical USDT on that chain).
     ///
-    /// Returns `"USDT0"` everywhere else — the `LayerZero` OFT token is a
-    /// distinct ERC20/SPL, not fungible with any canonical Tether
-    /// contract on that chain. Labeling it accurately prevents users
-    /// from ending up with two "USDT" balances in their wallet (the
-    /// canonical deployment they already held, and the distinct USDT0
-    /// token they just received).
-    ///
-    /// The USDT0 deployments API does not expose this distinction, so
-    /// the canonical-Tether case list must be maintained manually when
-    /// USDT0 adds a new chain that reuses Tether's canonical ERC20.
+    /// Returns `"USDT0"` everywhere else — any native-mesh destination
+    /// that publishes its own `Token` entry receives the distinct USDT0
+    /// ERC20/SPL, not canonical Tether, even when other clients label it
+    /// plain "USDT" (they do so because USDT0 is the only USDT-branded
+    /// token they surface on that chain). Labeling it accurately here
+    /// prevents users from conflating a USDT0 balance with any canonical
+    /// Tether deployment they may also hold.
     pub fn asset_symbol(&self) -> &'static str {
         if self.is_source || self.token_address.is_none() {
-            return "USDT";
-        }
-        if let Some(chain_id) = self.evm_chain_id
-            && CANONICAL_USDT_EVM_CHAIN_IDS.contains(&chain_id)
-        {
             return "USDT";
         }
         "USDT0"
@@ -228,17 +219,6 @@ impl SourceSpec {
         }
     }
 }
-
-/// EVM chain IDs where USDT0's `Token` entry is canonical Tether USDT
-/// (not a distinct OFT deployment). Users on these chains receive the
-/// same ERC20 Tether already issues natively there, so the asset label
-/// is `"USDT"` even though the bridge routes through the USDT0 mesh.
-///
-/// Keep this list aligned with the USDT0 deployments: most chains deploy
-/// a distinct OFT token (CREATE2-derived, distinct from any canonical
-/// Tether contract), but a few (Polygon `PoS`) reuse canonical Tether as
-/// the USDT0 token. The deployments API does not flag this.
-pub const CANONICAL_USDT_EVM_CHAIN_IDS: &[u64] = &[137];
 
 /// Runtime registry of the source chain and all supported destinations.
 /// Built once at service init from the USDT0 deployments API; stable for

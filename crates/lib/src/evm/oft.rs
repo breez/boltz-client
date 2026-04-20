@@ -578,10 +578,11 @@ mod tests {
     }
 
     #[macros::test_all]
-    fn asset_symbol_returns_usdt_for_canonical_oft_destinations() {
-        // Polygon PoS is in the canonical allowlist because USDT0's
-        // `Token` entry there is the canonical Tether contract, not a
-        // distinct OFT deployment — users receive regular USDT.
+    fn asset_symbol_returns_usdt0_for_polygon_pos() {
+        // Polygon PoS is a native-mesh destination with its own `Token`
+        // entry, so users receive the distinct USDT0 OFT — not canonical
+        // Tether — even though other clients sometimes label it plain
+        // "USDT" on Polygon.
         let registry = sample_registry();
         let polygon = registry
             .get(&ChainId::new("polygon pos"))
@@ -589,7 +590,7 @@ mod tests {
         assert!(!polygon.is_source);
         assert_eq!(polygon.evm_chain_id, Some(137));
         assert!(polygon.token_address.is_some());
-        assert_eq!(polygon.asset_symbol(), "USDT");
+        assert_eq!(polygon.asset_symbol(), "USDT0");
     }
 
     #[macros::test_all]
