@@ -252,6 +252,24 @@ impl SwapStatusSubscriber {
     }
 
     async fn handle_message(text: &str, global_tx: &mpsc::Sender<SwapStatusUpdate>) {
+        // Filter out control messages that don't fit the typed `WsMessage`
+        // shape — subscribe/unsubscribe acks carry `args` as an array of
+        // swap-id strings (not `WsSwapUpdate`s) and would otherwise noise
+        // the debug log on every subscription.
+        #[derive(serde::Deserialize)]
+        struct WsEnvelope {
+            #[serde(default)]
+            event: Option<String>,
+        }
+        if let Ok(env) = serde_json::from_str::<WsEnvelope>(text)
+            && matches!(
+                env.event.as_deref(),
+                Some("ping" | "pong" | "subscribe" | "unsubscribe")
+            )
+        {
+            return;
+        }
+
         let msg: WsMessage = match serde_json::from_str(text) {
             Ok(m) => m,
             Err(e) => {
@@ -259,12 +277,6 @@ impl SwapStatusSubscriber {
                 return;
             }
         };
-
-        if let Some(ref event) = msg.event
-            && (event == "ping" || event == "pong")
-        {
-            return;
-        }
 
         if msg.channel.as_deref() != Some("swap.update") {
             return;
@@ -311,10 +323,23 @@ mod tests {
     }
 
     #[macros::async_test_all]
-    async fn test_handle_message_ping_ignored() {
-        let (tx, _rx) = mpsc::channel(32);
+    async fn test_handle_message_control_events_ignored() {
+        let (tx, mut rx) = mpsc::channel(32);
         SwapStatusSubscriber::handle_message(r#"{"event":"ping"}"#, &tx).await;
         SwapStatusSubscriber::handle_message(r#"{"event":"pong"}"#, &tx).await;
+        // Subscribe/unsubscribe acks carry `args` as string arrays (swap IDs),
+        // which would fail typed parsing — the envelope peek must drop them.
+        SwapStatusSubscriber::handle_message(
+            r#"{"event":"subscribe","channel":"swap.update","args":["swap1"]}"#,
+            &tx,
+        )
+        .await;
+        SwapStatusSubscriber::handle_message(
+            r#"{"event":"unsubscribe","channel":"swap.update","args":["swap1"]}"#,
+            &tx,
+        )
+        .await;
+        assert!(rx.try_recv().is_err());
     }
 
     #[macros::async_test_all]
