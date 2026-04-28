@@ -8,8 +8,8 @@ use crate::api::BoltzApiClient;
 use crate::api::types::{EncodeRequest, QuoteResponse, ReversePairInfo};
 use crate::config::{
     ARBITRUM_ERC20SWAP_DEPLOY_BLOCK, ARBITRUM_ROUTER_ADDRESS, ARBITRUM_TBTC_ADDRESS,
-    ARBITRUM_USDT_ADDRESS, BoltzConfig, MAX_SLIPPAGE_BPS, SATS_TO_TBTC_FACTOR, SOLANA_USDT0_MINT,
-    ZERO_ADDRESS,
+    ARBITRUM_USDT_ADDRESS, BoltzConfig, MAX_SLIPPAGE_BPS, PROBE_INVOICE_EXPIRY_SECS,
+    SATS_TO_TBTC_FACTOR, SOLANA_USDT0_MINT, ZERO_ADDRESS,
 };
 use crate::error::BoltzError;
 use crate::evm::alchemy::{AlchemyGasClient, EvmCall};
@@ -421,6 +421,91 @@ impl ReverseSwapExecutor {
             created_at: now,
             updated_at: now,
         })
+    }
+
+    /// Create a throwaway hold invoice for Lightning fee estimation.
+    ///
+    /// Returns just the BOLT11 invoice string. The preimage is freshly
+    /// random and **immediately discarded**, so the invoice cannot be
+    /// claimed and **must not be paid**. Useful when the caller needs an
+    /// LN routing fee estimate against a real BOLT11 invoice without
+    /// committing to a real swap.
+    ///
+    /// Compared to [`create`](Self::create) this skips:
+    /// - HD key index consumption (random preimage hash, no derivation)
+    /// - Local-store writes (no `BoltzSwap` is constructed or returned)
+    /// - WS swap tracking (caller is expected not to subscribe)
+    ///
+    /// Sets `invoiceExpiry` to [`PROBE_INVOICE_EXPIRY_SECS`] so the
+    /// unfunded swap's server-side state on Boltz self-clears as quickly
+    /// as the API allows.
+    ///
+    /// The `claim_address` and `claim_public_key` fields reuse the gas
+    /// signer's keys — Boltz only needs a valid secp256k1 point and EVM
+    /// address there, and since the swap will never be claimed, the
+    /// relationship between those and the (random) preimage hash is
+    /// irrelevant.
+    pub async fn create_probe_invoice(
+        &self,
+        prepared: &PreparedSwap,
+    ) -> Result<String, BoltzError> {
+        if current_unix_timestamp() >= prepared.expires_at {
+            return Err(BoltzError::QuoteExpired);
+        }
+        let chain_id_u32 = to_chain_id_u32(self.config.chain_id)?;
+        let gas_signer = self.key_manager.derive_gas_signer(chain_id_u32)?;
+
+        // 32 random bytes — no derivation, no recoverability needed: the
+        // invoice will never be paid, so a recoverable preimage would only
+        // serve to burn an HD index.
+        let mut preimage_hash = [0u8; 32];
+        getrandom::getrandom(&mut preimage_hash).map_err(|e| {
+            BoltzError::Generic(format!("Failed to generate random preimage hash: {e}"))
+        })?;
+
+        let create_req = crate::api::types::CreateReverseSwapRequest {
+            from: "BTC".to_string(),
+            to: "TBTC".to_string(),
+            preimage_hash: hex::encode(preimage_hash),
+            claim_address: gas_signer.address_hex(),
+            invoice_amount: prepared.invoice_amount_sats,
+            pair_hash: prepared.pair_hash.clone(),
+            referral_id: self.config.referral_id.clone(),
+            claim_public_key: hex::encode(&gas_signer.public_key),
+            description: None,
+            invoice_expiry: Some(PROBE_INVOICE_EXPIRY_SECS),
+        };
+
+        let resp = self
+            .api_client
+            .create_reverse_swap(&create_req)
+            .await
+            .map_err(|e| match e {
+                BoltzError::Api {
+                    code: Some(409), ..
+                } => BoltzError::DuplicatePreimage,
+                other => other,
+            })?;
+
+        // Validate the returned invoice amount matches what we asked for —
+        // a malicious server could otherwise return an invoice for a
+        // different amount, leading to a wrong fee estimate.
+        let decoded_invoice: Bolt11Invoice = resp
+            .invoice
+            .parse()
+            .map_err(|e| BoltzError::Generic(format!("Failed to parse BOLT11 invoice: {e}")))?;
+        let decoded_amount_sats = decoded_invoice
+            .amount_milli_satoshis()
+            .ok_or_else(|| BoltzError::Generic("BOLT11 invoice missing amount".to_string()))?
+            / 1000;
+        if decoded_amount_sats != prepared.invoice_amount_sats {
+            return Err(BoltzError::Generic(format!(
+                "Invoice amount ({decoded_amount_sats} sats) does not match requested amount ({} sats)",
+                prepared.invoice_amount_sats,
+            )));
+        }
+
+        Ok(resp.invoice)
     }
 
     /// Scan the blockchain for unclaimed swaps.
@@ -1354,8 +1439,7 @@ impl ReverseSwapExecutor {
         let cache_hit = self
             .ata_cache
             .lock()
-            .map(|guard| guard.contains(destination))
-            .unwrap_or(false);
+            .is_ok_and(|guard| guard.contains(destination));
         if cache_hit {
             return Ok(Bytes::new());
         }

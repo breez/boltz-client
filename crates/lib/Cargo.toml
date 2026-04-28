@@ -38,6 +38,11 @@ k256.workspace = true
 sha2 = "0.10"
 tiny-keccak = { version = "2", features = ["keccak"] }
 
+# OS-backed CSPRNG for probe-invoice preimage hashes (`create_probe_invoice`).
+# Already a transitive dep via alloy-signer-local; declared here for direct use.
+# WASM target override below adds the `js` feature for browser entropy.
+getrandom = "0.2"
+
 # Base58 decoding for Solana / Tron destination addresses
 bs58 = { version = "0.5", default-features = false, features = ["alloc"] }
 

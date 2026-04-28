@@ -139,3 +139,8 @@ pub const RECOVERY_SCAN_BATCH_SIZE: u64 = 100_000;
 /// Maximum number of preimage key indices to derive during recovery.
 /// Matches the web app's `maxIterations` constant.
 pub const RECOVERY_MAX_KEY_INDEX: u32 = 100_000;
+
+/// Invoice expiry (seconds) used for probe-only reverse swap invoices.
+/// Matches Boltz's documented minimum from `GET /v2/swap/reverse/expiry` so
+/// the unfunded swap's server-side state self-clears as quickly as possible.
+pub const PROBE_INVOICE_EXPIRY_SECS: u64 = 60;

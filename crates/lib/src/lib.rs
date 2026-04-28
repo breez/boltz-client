@@ -244,6 +244,33 @@ impl BoltzService {
         Ok(created)
     }
 
+    /// Create a throwaway hold invoice for Lightning fee estimation.
+    ///
+    /// Returns the BOLT11 invoice string only. The invoice **must not be
+    /// paid**: a fresh random preimage is used and discarded, so any
+    /// payment to this invoice would lock funds with no way to claim.
+    ///
+    /// Useful when the caller needs an LN routing fee estimate against a
+    /// real BOLT11 invoice without committing to a real swap — for
+    /// example, when the final invoice's amount has to account for the
+    /// routing fee, which itself can only be estimated against a real
+    /// invoice. Pass the returned invoice to a fee-estimation API, then
+    /// call [`create_reverse_swap`](Self::create_reverse_swap) for the
+    /// real swap.
+    ///
+    /// Unlike [`create_reverse_swap`](Self::create_reverse_swap), this:
+    /// - does not consume an HD key index (no `increment_key_index`),
+    /// - does not write to local storage (no `insert_swap`),
+    /// - does not subscribe to swap WebSocket events,
+    /// - sets a short `invoiceExpiry` so Boltz's server-side state
+    ///   self-clears as quickly as the API allows.
+    pub async fn create_probe_invoice(
+        &self,
+        prepared: &PreparedSwap,
+    ) -> Result<String, BoltzError> {
+        self.executor.create_probe_invoice(prepared).await
+    }
+
     /// All destination chain IDs published by USDT0 and supported by this
     /// client. Populated from the USDT0 deployments fetch at init time.
     pub fn supported_chains(&self) -> Vec<ChainId> {
