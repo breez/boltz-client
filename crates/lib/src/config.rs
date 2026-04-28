@@ -15,7 +15,13 @@ pub struct BoltzConfig {
     /// Referral ID — sent as HTTP header on pairs endpoint (required to unlock TBTC pair)
     /// and as `referralId` field in swap creation requests (attribution tracking).
     pub referral_id: String,
-    /// DEX slippage tolerance in basis points (default: 100 = 1%).
+    /// User-facing slippage tolerance in basis points (default: 100 = 1%).
+    /// Anchored on the prepare-time quote: a claim only proceeds if the
+    /// user is guaranteed to receive at least
+    /// `expected * (1 - slippage_bps / 10000)` on the destination chain.
+    /// Drift between prepare and claim, internal fee buffers, and OFT
+    /// fees all surface either as a normal completion above this floor
+    /// or as a `QuoteDegraded` event — never as a quiet under-delivery.
     pub slippage_bps: u32,
     /// URL for fetching OFT (USDT0) deployment data.
     pub oft_deployments_url: String,

@@ -833,17 +833,61 @@ impl ReverseSwapExecutor {
         timelock: U256,
         skip_drift_check: bool,
     ) -> Result<String, BoltzError> {
-        let (dex_calls, min_amount_out, raw_quote_usdt) = self
-            .fetch_and_encode_dex_quote(
-                tbtc_evm_amount,
-                &addrs.router.to_string(),
-                swap.slippage_bps,
+        let amount_in: u128 = tbtc_evm_amount
+            .try_into()
+            .map_err(|_| BoltzError::Generic("tBTC amount too large".into()))?;
+
+        let quotes = self
+            .api_client
+            .get_quote_in(
+                "ARB",
+                ARBITRUM_TBTC_ADDRESS,
+                ARBITRUM_USDT_ADDRESS,
+                amount_in,
             )
             .await?;
+        let best = pick_best_quote_with_data(&quotes, QuoteDirection::In)?;
+        if best.amount == 0 {
+            return Err(BoltzError::InvalidQuote(
+                "DEX quote returned zero USDT".into(),
+            ));
+        }
+        let raw_quote_usdt = best.amount;
 
         if !skip_drift_check {
             check_quote_drift(swap.expected_usdt_amount, raw_quote_usdt, swap.slippage_bps)?;
         }
+
+        let min_amount_out_u128 = compute_claim_floor(
+            raw_quote_usdt,
+            swap.expected_usdt_amount,
+            swap.slippage_bps,
+            skip_drift_check,
+        );
+        if min_amount_out_u128 == 0 {
+            return Err(BoltzError::Generic(
+                "Amount too small: slippage-adjusted minimum is zero".into(),
+            ));
+        }
+        let min_amount_out = U256::from(min_amount_out_u128);
+
+        let encode_resp = self
+            .api_client
+            .encode_quote(
+                "ARB",
+                &EncodeRequest {
+                    recipient: addrs.router.to_string(),
+                    amount_in,
+                    amount_out_min: min_amount_out_u128,
+                    data: best.data.clone(),
+                },
+            )
+            .await?;
+        let dex_calls: Vec<contracts::Call> = encode_resp
+            .calls
+            .iter()
+            .map(quote_calldata_to_call)
+            .collect::<Result<Vec<_>, _>>()?;
 
         // Same-chain claim is Arbitrum-only, which is always EVM, so the
         // destination must round-trip as a 20-byte EVM address. Surface a
@@ -981,7 +1025,14 @@ impl ReverseSwapExecutor {
             .quote_send(source_oft_address, &quoted_send_param)
             .await?;
 
-        // Apply slippage buffer to messaging fee
+        // Buffer the messaging fee against Pass-1 → execution drift in the
+        // LayerZero native fee. The user's slippage knob doubles as the
+        // buffer size: it determines how much fee variance we absorb before
+        // reverting. Crucially this does NOT affect the user-facing
+        // promise — `min_amount_ld_slipped` below is anchored on
+        // `expected_usdt_amount`, so a bigger buffer just shrinks
+        // `raw_dest_amount` and is caught by the drift check, never by
+        // delivering less than `expected × (1 − s)`.
         let native_fee: u128 = msg_fee
             .nativeFee
             .try_into()
@@ -1030,24 +1081,26 @@ impl ReverseSwapExecutor {
             return Err(BoltzError::InvalidQuote("DEX returned zero USDT".into()));
         }
 
-        // ─── Drift check ─────────────────────────────────────────────
-        // Quote OFT with the raw DEX output (pre-slippage) to estimate
-        // what the user would receive on the destination chain. Using
-        // the slippage-reduced amount here would compound the reduction:
-        // once in the OFT input and again in the drift threshold.
+        // ─── End-to-end OFT floor ────────────────────────────────────
+        // Quote OFT once with the raw trade amount to learn what the user
+        // would actually receive on the destination chain. This single
+        // value drives both the drift abort and the on-chain `minAmountLd`
+        // floor — slippage is applied exactly once, end-to-end, against
+        // the destination amount the user perceives.
+        let oft_quote_param = contracts::build_oft_send_param(
+            dst_eid,
+            addrs.destination_bytes32,
+            U256::from(trade_best.amount),
+            U256::ZERO,
+            extra_options.clone(),
+        );
+        let (_, oft_receipt) = self.quote_oft(source_oft_address, &oft_quote_param).await?;
+        let raw_dest_amount: u128 = oft_receipt
+            .amountReceivedLD
+            .try_into()
+            .map_err(|_| BoltzError::Generic("OFT amount too large".into()))?;
+
         if !skip_drift_check {
-            let drift_param = contracts::build_oft_send_param(
-                dst_eid,
-                addrs.destination_bytes32,
-                U256::from(trade_best.amount),
-                U256::ZERO,
-                extra_options.clone(),
-            );
-            let (_, drift_receipt) = self.quote_oft(source_oft_address, &drift_param).await?;
-            let raw_dest_amount: u128 = drift_receipt
-                .amountReceivedLD
-                .try_into()
-                .map_err(|_| BoltzError::Generic("OFT amount too large".into()))?;
             check_quote_drift(
                 swap.expected_usdt_amount,
                 raw_dest_amount,
@@ -1055,50 +1108,34 @@ impl ReverseSwapExecutor {
             )?;
         }
 
-        // ─── Slippage-adjusted OFT quote for transaction ─────────────
-        // Slippage is applied independently to each leg (DEX swap and OFT bridge)
-        // rather than splitting a single budget across both. Each leg has independent
-        // price risk, so protecting them separately is simpler. The effective compound
-        // slippage is ~(1-s)², e.g. ~1.99% when slippage_bps is 1%.
-        #[expect(clippy::arithmetic_side_effects)]
-        let slippage_factor = 10000 - u128::from(swap.slippage_bps);
-        #[expect(clippy::arithmetic_side_effects)]
-        let min_usdt_out = trade_best.amount * slippage_factor / 10000;
-        if min_usdt_out == 0 {
-            return Err(BoltzError::Generic(
-                "Amount too small: slippage-adjusted USDT minimum is zero".into(),
-            ));
-        }
-
-        let final_send_param = contracts::build_oft_send_param(
-            dst_eid,
-            addrs.destination_bytes32,
-            U256::from(min_usdt_out),
-            U256::ZERO,
-            extra_options.clone(),
+        let min_amount_ld_slipped = compute_claim_floor(
+            raw_dest_amount,
+            swap.expected_usdt_amount,
+            swap.slippage_bps,
+            skip_drift_check,
         );
-        let (_, final_receipt) = self
-            .quote_oft(source_oft_address, &final_send_param)
-            .await?;
-
-        let mut final_quoted_param = final_send_param.clone();
-        final_quoted_param.minAmountLD = final_receipt.amountReceivedLD;
-        let final_msg_fee = self
-            .quote_send(source_oft_address, &final_quoted_param)
-            .await?;
-
-        let min_amount_ld_raw: u128 = final_receipt
-            .amountReceivedLD
-            .try_into()
-            .map_err(|_| BoltzError::Generic("OFT amount too large".into()))?;
-
-        #[expect(clippy::arithmetic_side_effects)]
-        let min_amount_ld_slipped = min_amount_ld_raw * slippage_factor / 10000;
         if min_amount_ld_slipped == 0 {
             return Err(BoltzError::Generic(
                 "Amount too small: cross-chain slippage-adjusted minimum is zero".into(),
             ));
         }
+
+        // The DEX-leg `amount_out_min` is set to a loose sentinel: the
+        // user's slippage budget is enforced atomically by the OFT contract
+        // via `minAmountLd`. Any DEX output too small to clear that floor
+        // reverts the whole atomic tx, so a tight DEX min only adds revert
+        // frequency without adding user protection. `1` (rather than `0`)
+        // keeps the encode API happy and rejects pathological zero-output
+        // DEX paths.
+        let min_usdt_out: u128 = 1;
+
+        // Quote send for the LZ fee with the actual trade amount and the
+        // signed-floor min — this is the message that will execute on-chain.
+        let mut final_quoted_param = oft_quote_param.clone();
+        final_quoted_param.minAmountLD = U256::from(min_amount_ld_slipped);
+        let final_msg_fee = self
+            .quote_send(source_oft_address, &final_quoted_param)
+            .await?;
 
         // ─── Encode DEX calls ─────────────────────────────────────────
         // Trade calls: tBTC -> USDT
@@ -1555,65 +1592,6 @@ impl ReverseSwapExecutor {
         let version = contracts::decode_version_return(&result)?;
         Ok(version.to_string())
     }
-
-    /// Fetch a DEX quote for `tbtc_evm_amount` → USDT and encode it into
-    /// calldata. Returns `(calls, min_amount_out, raw_quote_amount)` where
-    /// `raw_quote_amount` is the best quote *before* slippage is applied
-    /// (used for drift detection).
-    #[expect(clippy::arithmetic_side_effects)]
-    async fn fetch_and_encode_dex_quote(
-        &self,
-        tbtc_evm_amount: U256,
-        router_address: &str,
-        slippage_bps: u32,
-    ) -> Result<(Vec<contracts::Call>, U256, u128), BoltzError> {
-        let amount_in: u128 = tbtc_evm_amount
-            .try_into()
-            .map_err(|_| BoltzError::Generic("tBTC amount too large".to_string()))?;
-
-        let quotes = self
-            .api_client
-            .get_quote_in(
-                "ARB",
-                ARBITRUM_TBTC_ADDRESS,
-                ARBITRUM_USDT_ADDRESS,
-                amount_in,
-            )
-            .await?;
-        // "in" direction: pick the highest output (best return for our
-        // input).
-        let best = pick_best_quote_with_data(&quotes, QuoteDirection::In)?;
-        if best.amount == 0 {
-            return Err(BoltzError::InvalidQuote(
-                "DEX quote returned zero USDT".to_string(),
-            ));
-        }
-        let raw_quote_amount = best.amount;
-        let slippage_factor = 10000 - u128::from(slippage_bps);
-        let min_amount_out_u128 = best.amount * slippage_factor / 10000;
-        if min_amount_out_u128 == 0 {
-            return Err(BoltzError::Generic(
-                "Amount too small: slippage-adjusted minimum is zero".into(),
-            ));
-        }
-        let min_amount_out = U256::from(min_amount_out_u128);
-
-        let encode_req = EncodeRequest {
-            recipient: router_address.to_string(),
-            amount_in,
-            amount_out_min: min_amount_out_u128,
-            data: best.data.clone(),
-        };
-        let encode_resp = self.api_client.encode_quote("ARB", &encode_req).await?;
-
-        let calls = encode_resp
-            .calls
-            .iter()
-            .map(quote_calldata_to_call)
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok((calls, min_amount_out, raw_quote_amount))
-    }
 }
 
 // ─── OFT approval gate (pure) ────────────────────────────────────────────
@@ -1904,6 +1882,34 @@ fn check_quote_drift(
 #[expect(clippy::arithmetic_side_effects)]
 fn apply_slippage_up(amount: u128, slippage_bps: u128) -> u128 {
     amount * (10000 + slippage_bps) / 10000
+}
+
+/// Apply slippage downward (for output floors).
+/// Returns `amount * (10000 - slippage_bps) / 10000`.
+#[expect(clippy::arithmetic_side_effects)]
+fn apply_slippage_down(amount: u128, slippage_bps: u32) -> u128 {
+    amount * u128::from(10000u32 - slippage_bps) / 10000
+}
+
+/// Compute the on-chain output floor for a claim. In normal mode the
+/// floor is anchored on `expected_amount` (locked at prepare time) so the
+/// user is guaranteed to receive at least `expected × (1 − slippage)`
+/// end-to-end — drift between prepare and claim, and any internal buffers
+/// that shrink the live quote, are caught by the drift check rather than
+/// quietly delivering less than the user agreed to. Recovery mode has
+/// no prepare-time expected amount, so the floor falls back to the live
+/// quote.
+fn compute_claim_floor(
+    raw_quote: u128,
+    expected_amount: u64,
+    slippage_bps: u32,
+    skip_drift_check: bool,
+) -> u128 {
+    if skip_drift_check {
+        apply_slippage_down(raw_quote, slippage_bps)
+    } else {
+        apply_slippage_down(u128::from(expected_amount), slippage_bps)
+    }
 }
 
 /// Pick the slippage tolerance for a new swap. Returns the per-swap
@@ -2229,6 +2235,86 @@ mod tests {
         // If a caller explicitly sets a valid per-swap override, a broken
         // config default must not poison the prepare call.
         assert_eq!(resolve_slippage_bps(Some(150), 10_000).unwrap(), 150);
+    }
+
+    // ─── Slippage helpers ────────────────────────────────────────────
+
+    #[macros::test_all]
+    fn apply_slippage_down_zero_bps_is_identity() {
+        assert_eq!(apply_slippage_down(1_000_000, 0), 1_000_000);
+    }
+
+    #[macros::test_all]
+    fn apply_slippage_down_one_percent() {
+        assert_eq!(apply_slippage_down(1_000_000, 100), 990_000);
+    }
+
+    #[macros::test_all]
+    fn apply_slippage_down_max_bound() {
+        assert_eq!(apply_slippage_down(1_000_000, MAX_SLIPPAGE_BPS), 950_000);
+    }
+
+    #[macros::test_all]
+    fn apply_slippage_down_floors_to_zero_for_tiny_amounts() {
+        assert_eq!(apply_slippage_down(1, 100), 0);
+    }
+
+    #[macros::test_all]
+    fn apply_slippage_down_is_single_application_not_compound() {
+        // End-to-end semantics check for the cross-chain claim path:
+        // applying slippage once must yield `amount * (1 - s)`, NOT
+        // `amount * (1 - s)²`. Regression guard against any future
+        // re-introduction of per-leg compounding.
+        let raw = 1_000_000_u128;
+        let single = apply_slippage_down(raw, 100); // 990_000
+        let compound = apply_slippage_down(single, 100); // 980_100
+        assert_eq!(single, 990_000);
+        assert_eq!(compound, 980_100);
+        assert!(compound < single);
+    }
+
+    #[macros::test_all]
+    fn apply_slippage_up_one_percent() {
+        assert_eq!(apply_slippage_up(1_000_000, 100), 1_010_000);
+    }
+
+    // ─── Claim floor (promise honoring) ──────────────────────────────
+
+    #[macros::test_all]
+    fn claim_floor_anchors_on_expected_in_normal_mode() {
+        // Even when raw_quote dropped below expected (still passes drift),
+        // the floor must equal `expected × (1 − s)` — never `raw × (1 − s)`,
+        // which would compound and break the user's promise.
+        let expected = 1_000_000_u64;
+        let raw = 992_000_u128; // dropped 0.8% from prepare quote, within 1% drift
+        let floor = compute_claim_floor(raw, expected, 100, false);
+        assert_eq!(floor, 990_000); // expected × 0.99
+        assert_ne!(floor, 982_080); // would be raw × 0.99 (the broken case)
+    }
+
+    #[macros::test_all]
+    fn claim_floor_anchors_on_expected_when_raw_is_higher() {
+        // Favorable movement: raw_quote > expected. Floor stays at the
+        // promise — the user is guaranteed at least the promise; anything
+        // above that is a bonus.
+        let expected = 1_000_000_u64;
+        let raw = 1_010_000_u128;
+        assert_eq!(compute_claim_floor(raw, expected, 100, false), 990_000);
+    }
+
+    #[macros::test_all]
+    fn claim_floor_falls_back_to_raw_in_recovery() {
+        // Recovery has no prepare-time expected amount. Floor uses the
+        // live quote so the claim still has a meaningful min.
+        let raw = 500_000_u128;
+        assert_eq!(compute_claim_floor(raw, 0, 100, true), 495_000);
+    }
+
+    #[macros::test_all]
+    fn claim_floor_zero_expected_in_normal_mode_is_zero() {
+        // Defensive: a normal-mode claim with expected=0 returns floor=0,
+        // and the call site rejects that as "amount too small".
+        assert_eq!(compute_claim_floor(500_000, 0, 100, false), 0);
     }
 
     // ─── OFT approval gate tests ─────────────────────────────────────
