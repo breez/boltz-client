@@ -1917,7 +1917,10 @@ fn compute_claim_floor(
 /// Enforces the same `10..=MAX_SLIPPAGE_BPS` bounds in both cases so a bad
 /// per-swap value can't bypass the validation that previously ran on the
 /// config-level default.
-fn resolve_slippage_bps(override_bps: Option<u32>, config_default: u32) -> Result<u32, BoltzError> {
+pub(crate) fn resolve_slippage_bps(
+    override_bps: Option<u32>,
+    config_default: u32,
+) -> Result<u32, BoltzError> {
     let bps = override_bps.unwrap_or(config_default);
     if !(10..=MAX_SLIPPAGE_BPS).contains(&bps) {
         return Err(BoltzError::Generic(format!(

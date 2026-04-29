@@ -31,7 +31,7 @@ use evm::provider::EvmProvider;
 use evm::signing::EvmSigner;
 use solana::rpc::SolanaRpcClient;
 use swap::manager::SwapManager;
-use swap::reverse::{ReverseSwapExecutor, current_unix_timestamp};
+use swap::reverse::{ReverseSwapExecutor, current_unix_timestamp, resolve_slippage_bps};
 
 /// Top-level Boltz service facade.
 ///
@@ -341,6 +341,46 @@ impl BoltzService {
                 Err(e)
             }
         }
+    }
+
+    /// Update the slippage tolerance for an existing swap.
+    ///
+    /// `slippage_bps` is purely client-side: it gates the claim-time DEX
+    /// quote drift check and the on-chain `minOut` floor. Boltz never sees
+    /// it, so adjusting it does not require any API interaction.
+    ///
+    /// Rejects swaps in terminal states (`Completed`/`Failed`/`Expired`),
+    /// where no future claim attempt will read the value. For a swap in
+    /// `Claiming` with a tx already broadcast, the on-chain `minOut` is
+    /// already signed into that tx — the new value will only take effect
+    /// on the next retry.
+    ///
+    /// `slippage_bps` is validated against the same `10..=MAX_SLIPPAGE_BPS`
+    /// bounds enforced at `prepare` time.
+    pub async fn update_swap_slippage(
+        &self,
+        swap_id: &str,
+        slippage_bps: u32,
+    ) -> Result<BoltzSwap, BoltzError> {
+        let bps = resolve_slippage_bps(Some(slippage_bps), self.executor.config.slippage_bps)?;
+
+        let mut swap = self
+            .store
+            .get_swap(swap_id)
+            .await?
+            .ok_or_else(|| BoltzError::Store(format!("Swap not found: {swap_id}")))?;
+
+        if swap.status.is_terminal() {
+            return Err(BoltzError::Generic(format!(
+                "Cannot update slippage: swap {} is in terminal state {:?}",
+                swap_id, swap.status
+            )));
+        }
+
+        swap.slippage_bps = bps;
+        swap.updated_at = current_unix_timestamp();
+        self.store.update_swap(&swap).await?;
+        Ok(swap)
     }
 
     /// Recover unclaimed swaps by scanning the blockchain.
