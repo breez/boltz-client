@@ -101,7 +101,16 @@ pub const DEFAULT_GAS_SPONSOR_URL: &str = "https://sponsor.ccxp.space/";
 
 /// Router contract address on Arbitrum — not available via the Boltz API.
 /// If upgraded, the old contract address remains valid.
-pub const ARBITRUM_ROUTER_ADDRESS: &str = "0x6EA68e965fcd19b6fbC6553BABbF87a5018F9B28";
+///
+/// boltz-core v5.0.0 deployment. Upgraded from the v4.0.3 deployment
+/// (`0x6EA68e965fcd19b6fbC6553BABbF87a5018F9B28`) to gain `claimERC20ExecuteCctp`
+/// (CCTP support; added in core v4.0.5). The OFT claim path is unaffected: the
+/// `claimERC20ExecuteOft` signature, the `Erc20Claim`/`Call`/`SendData`/
+/// `ClaimSendAuthorization` structs, every OFT EIP-712 typehash, and the
+/// `{name: "Router", version: "2"}` domain are byte-identical between v4.0.3 and
+/// v5.0.0 — only the `verifyingContract` (this address, passed dynamically into
+/// the EIP-712 domain) changes.
+pub const ARBITRUM_ROUTER_ADDRESS: &str = "0x182589d2A10384e12EE8C1Fe350F4dfba36C7b73";
 
 /// tBTC token address on Arbitrum.
 pub const ARBITRUM_TBTC_ADDRESS: &str = "0x6c84a8f1c29108F47a79964b5Fe888D4f4D0dE40";
