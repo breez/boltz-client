@@ -38,6 +38,19 @@ pub fn is_valid_destination_address(transport: NetworkTransport, addr: &str) -> 
     encode_oft_recipient(transport, addr).is_ok()
 }
 
+/// Normalize a token/recipient address for known-token comparison. EVM
+/// addresses are lowercased (they are case-insensitive / EIP-55 checksummed,
+/// so a paste may carry any casing); Solana and Tron addresses are left as-is
+/// because base58 is case-sensitive. Surrounding whitespace is trimmed.
+#[must_use]
+pub fn normalize_token_address(transport: NetworkTransport, addr: &str) -> String {
+    let trimmed = addr.trim();
+    match transport {
+        NetworkTransport::Evm => trimmed.to_lowercase(),
+        NetworkTransport::Solana | NetworkTransport::Tron => trimmed.to_string(),
+    }
+}
+
 fn encode_evm(addr: &str) -> Result<FixedBytes<32>, BoltzError> {
     let parsed = parse_address(addr)?;
     Ok(address_to_bytes32(parsed))
@@ -248,5 +261,27 @@ mod tests {
             NetworkTransport::Tron,
             "TInvalid"
         ));
+    }
+
+    #[macros::test_all]
+    fn normalize_token_address_per_transport() {
+        // EVM: lowercased and trimmed so mixed-case / EIP-55 pastes compare equal.
+        assert_eq!(
+            normalize_token_address(
+                NetworkTransport::Evm,
+                "  0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9 "
+            ),
+            "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9"
+        );
+        // Solana: case preserved (base58 is case-sensitive), only trimmed.
+        assert_eq!(
+            normalize_token_address(NetworkTransport::Solana, " Es9vMFrz "),
+            "Es9vMFrz"
+        );
+        // Tron: case preserved, only trimmed.
+        assert_eq!(
+            normalize_token_address(NetworkTransport::Tron, " TR7NHqje "),
+            "TR7NHqje"
+        );
     }
 }

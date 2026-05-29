@@ -20,7 +20,9 @@ use crate::evm::contracts::{
 use crate::evm::lz_options::build_extra_options;
 use crate::evm::oft::legacy_mesh_source_amount;
 use crate::evm::provider::EvmProvider;
-use crate::evm::recipient::{encode_oft_recipient, is_valid_destination_address};
+use crate::evm::recipient::{
+    encode_oft_recipient, is_valid_destination_address, normalize_token_address,
+};
 use crate::evm::signing::EvmSigner;
 use crate::keys::EvmKeyManager;
 use crate::models::{
@@ -125,7 +127,7 @@ impl ReverseSwapExecutor {
         let slippage_bps = resolve_slippage_bps(max_slippage_bps, self.config.slippage_bps)?;
 
         let spec = self.resolve_destination(&chain)?;
-        validate_destination(spec, destination)?;
+        self.validate_destination(spec, destination)?;
 
         let tbtc_pair = self.fetch_tbtc_pair().await?;
 
@@ -223,7 +225,7 @@ impl ReverseSwapExecutor {
         let slippage_bps = resolve_slippage_bps(max_slippage_bps, self.config.slippage_bps)?;
 
         let spec = self.resolve_destination(&chain)?;
-        validate_destination(spec, destination)?;
+        self.validate_destination(spec, destination)?;
 
         let tbtc_pair = self.fetch_tbtc_pair().await?;
 
@@ -1462,6 +1464,54 @@ impl ReverseSwapExecutor {
     /// exist, future checks for the same recipient in-process skip the RPC.
     /// "Doesn't exist" is not cached — the user may create the ATA between
     /// calls.
+    /// Validate the destination address for the given chain's transport before
+    /// committing to a swap, and reject addresses that are themselves a known
+    /// token *contract* address (sending tokens there would burn them).
+    fn validate_destination(&self, spec: &ChainSpec, destination: &str) -> Result<(), BoltzError> {
+        if !is_valid_destination_address(spec.transport, destination) {
+            return Err(BoltzError::Generic(format!(
+                "Invalid destination address '{destination}' for {}",
+                spec.display_name
+            )));
+        }
+
+        if self.is_known_token_address(spec.transport, destination) {
+            return Err(BoltzError::Generic(format!(
+                "Destination '{destination}' is a known token contract address; \
+                 sending there would burn funds"
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Whether `addr` matches a known token-contract address on the same
+    /// transport. Compares against the source chain's USDT and tBTC (EVM), the
+    /// Solana USDT0 mint, and every destination's published USDT0 token
+    /// address, each normalized per transport. Cross-transport addresses never
+    /// match (their encodings differ), so only same-transport tokens are
+    /// gathered.
+    fn is_known_token_address(&self, transport: NetworkTransport, addr: &str) -> bool {
+        let mut known: Vec<&str> = Vec::new();
+        match transport {
+            NetworkTransport::Evm => {
+                known.push(ARBITRUM_USDT_ADDRESS);
+                known.push(ARBITRUM_TBTC_ADDRESS);
+            }
+            NetworkTransport::Solana => known.push(SOLANA_USDT0_MINT),
+            NetworkTransport::Tron => {}
+        }
+        for spec in self.chain_registry.destinations.values() {
+            if spec.transport == transport
+                && let Some(token) = &spec.token_address
+            {
+                known.push(token.as_str());
+            }
+        }
+
+        matches_any_known_token(transport, addr, &known)
+    }
+
     async fn compute_extra_options(
         &self,
         spec: &ChainSpec,
@@ -1816,18 +1866,17 @@ fn tbtc_wei_to_sats_u64(tbtc_wei: u128) -> Result<u64, BoltzError> {
     u64::try_from(tbtc_sats).map_err(|_| BoltzError::Generic("tBTC sats overflow".into()))
 }
 
-/// Validate the destination address for the given chain's transport before
-/// committing to a swap. Dispatches to the per-transport parser in
-/// `crate::evm::recipient`.
-fn validate_destination(spec: &ChainSpec, destination: &str) -> Result<(), BoltzError> {
-    if is_valid_destination_address(spec.transport, destination) {
-        Ok(())
-    } else {
-        Err(BoltzError::Generic(format!(
-            "Invalid destination address '{destination}' for {}",
-            spec.display_name
-        )))
+/// Whether `addr` matches any address in `known`, normalized for `transport`
+/// (EVM case-insensitive; Solana/Tron exact). An empty/blank `addr` never
+/// matches.
+fn matches_any_known_token(transport: NetworkTransport, addr: &str, known: &[&str]) -> bool {
+    let target = normalize_token_address(transport, addr);
+    if target.is_empty() {
+        return false;
     }
+    known
+        .iter()
+        .any(|k| normalize_token_address(transport, k) == target)
 }
 
 /// Decode a base58 Solana pubkey into its 32-byte form.
@@ -2001,6 +2050,59 @@ mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
     use super::*;
+
+    #[macros::test_all]
+    fn matches_any_known_token_evm_case_insensitive() {
+        let known = [ARBITRUM_USDT_ADDRESS, ARBITRUM_TBTC_ADDRESS];
+        // Exact, lowercased, and uppercased all match (EVM is case-insensitive).
+        assert!(matches_any_known_token(
+            NetworkTransport::Evm,
+            ARBITRUM_USDT_ADDRESS,
+            &known
+        ));
+        assert!(matches_any_known_token(
+            NetworkTransport::Evm,
+            &ARBITRUM_USDT_ADDRESS.to_uppercase(),
+            &known
+        ));
+        // Surrounding whitespace tolerated.
+        assert!(matches_any_known_token(
+            NetworkTransport::Evm,
+            &format!("  {ARBITRUM_TBTC_ADDRESS}  "),
+            &known
+        ));
+        // A normal recipient address is not a known token.
+        assert!(!matches_any_known_token(
+            NetworkTransport::Evm,
+            "0x1234567890AbCdEf1234567890aBcDeF12345678",
+            &known
+        ));
+    }
+
+    #[macros::test_all]
+    fn matches_any_known_token_solana_case_sensitive() {
+        let known = [SOLANA_USDT0_MINT];
+        assert!(matches_any_known_token(
+            NetworkTransport::Solana,
+            SOLANA_USDT0_MINT,
+            &known
+        ));
+        // base58 is case-sensitive: a lowercased mint must NOT match.
+        assert!(!matches_any_known_token(
+            NetworkTransport::Solana,
+            &SOLANA_USDT0_MINT.to_lowercase(),
+            &known
+        ));
+    }
+
+    #[macros::test_all]
+    fn matches_any_known_token_empty_addr() {
+        assert!(!matches_any_known_token(
+            NetworkTransport::Evm,
+            "   ",
+            &[ARBITRUM_USDT_ADDRESS]
+        ));
+    }
 
     #[macros::test_all]
     fn test_current_unix_timestamp() {
