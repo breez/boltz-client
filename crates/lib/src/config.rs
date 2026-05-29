@@ -25,6 +25,11 @@ pub struct BoltzConfig {
     pub slippage_bps: u32,
     /// URL for fetching OFT (USDT0) deployment data.
     pub oft_deployments_url: String,
+    /// Circle CCTP "Iris" API base URL. Used to quote the CCTP burn fee at
+    /// prepare time and to fetch the attestation / forwarding tx hash during
+    /// recovery for USDC (CCTP) destinations. Sandbox:
+    /// `https://iris-api-sandbox.circle.com`.
+    pub cctp_api_url: String,
     /// Solana JSON-RPC endpoint used when the destination chain is Solana.
     /// Queried to check whether the recipient's `Associated Token Account`
     /// already exists so the cross-chain message can pre-fund its creation
@@ -60,6 +65,7 @@ impl BoltzConfig {
             referral_id,
             slippage_bps: DEFAULT_SLIPPAGE_BPS,
             oft_deployments_url: DEFAULT_OFT_DEPLOYMENTS_URL.to_string(),
+            cctp_api_url: DEFAULT_CCTP_API_URL.to_string(),
             solana_rpc_url: DEFAULT_SOLANA_RPC_URL.to_string(),
         }
     }
@@ -118,6 +124,58 @@ pub const ARBITRUM_TBTC_ADDRESS: &str = "0x6c84a8f1c29108F47a79964b5Fe888D4f4D0d
 /// USDT token address on Arbitrum.
 pub const ARBITRUM_USDT_ADDRESS: &str = "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9";
 
+/// USDC token address on Arbitrum (6 decimals). The DEX leg trades tBTC into
+/// this token, which the Router then burns via CCTP for USDC destinations.
+pub const ARBITRUM_USDC_ADDRESS: &str = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831";
+
+/// Circle CCTP v2 `TokenMessenger` — same address on every supported EVM
+/// chain. The Router's `claimERC20ExecuteCctp` calls `depositForBurn` here.
+pub const CCTP_TOKEN_MESSENGER_V2: &str = "0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d";
+
+/// Circle CCTP v2 `MessageTransmitter` — same address on every supported EVM
+/// chain. Emits the `MessageSent` log parsed to read the burned amount, and
+/// (on the destination chain) mints via `receiveMessage`.
+pub const CCTP_MESSAGE_TRANSMITTER_V2: &str = "0x81D40F21F12A8F0E3252Bccb954D722d4c464B64";
+
+/// Circle CCTP domain id for Arbitrum (the burn source). Distinct from the EVM
+/// chain id.
+pub const CCTP_ARBITRUM_DOMAIN: u32 = 3;
+
+/// CCTP v2 `minFinalityThreshold` for Fast transfers (soft finality, lower
+/// latency). The web app defaults to Fast for every CCTP route.
+pub const CCTP_FINALITY_FAST: u32 = 1000;
+
+/// CCTP v2 `minFinalityThreshold` for Standard transfers (hard finality).
+pub const CCTP_FINALITY_STANDARD: u32 = 2000;
+
+/// CCTP v2 "forwarding service" `hookData` for EVM destinations: the ASCII tag
+/// `"cctp-forward"` (12 bytes) right-padded to 32 bytes. Circle's forwarder
+/// recognizes it as version 0 with no extra payload. Hex (no `0x`); see
+/// boltz-web-app `cctp/evm.ts` `cctpForwardHookData`.
+pub const CCTP_FORWARD_HOOK_DATA_HEX: &str =
+    "636374702d666f72776172640000000000000000000000000000000000000000";
+
+/// SPL token mint for USDC on Solana — used to derive the recipient's USDC
+/// Associated Token Account as the CCTP `mintRecipient` for Solana
+/// destinations.
+pub const SOLANA_USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+/// Default Circle CCTP "Iris" API base URL (mainnet). Sandbox is
+/// `https://iris-api-sandbox.circle.com`.
+pub const DEFAULT_CCTP_API_URL: &str = "https://iris-api.circle.com";
+
+/// Extra basis points added on top of Circle's quoted burn fee to absorb
+/// fee movement between prepare and claim (`maxFee` cushion — NOT user
+/// slippage). Matches the web app's `cctpMaxFeeBufferBps`.
+pub const CCTP_MAX_FEE_BUFFER_BPS: u64 = 2;
+
+/// Scale of Circle's `minimumFee` field (basis points scaled by 10^9).
+pub const CCTP_FEE_SCALE: u128 = 1_000_000_000;
+
+/// Denominator for applying `minimumFee`: `10_000 * CCTP_FEE_SCALE`. The
+/// burn fee is `amount * bpsUnits / CCTP_FEE_BPS_DENOMINATOR + forwardFee`.
+pub const CCTP_FEE_BPS_DENOMINATOR: u128 = 10_000 * CCTP_FEE_SCALE;
+
 /// SPL token mint for USDT0 on Solana. Used to derive the recipient's
 /// `Associated Token Account` when building the `LayerZero` OFT send from
 /// Arbitrum. Not exposed by the USDT0 deployments API.
@@ -153,3 +211,26 @@ pub const RECOVERY_MAX_KEY_INDEX: u32 = 100_000;
 /// Matches Boltz's documented minimum from `GET /v2/swap/reverse/expiry` so
 /// the unfunded swap's server-side state self-clears as quickly as possible.
 pub const PROBE_INVOICE_EXPIRY_SECS: u64 = 60;
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "browser-tests")]
+    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    use super::*;
+
+    /// The CCTP forwarding hookData must be exactly the ASCII tag
+    /// `"cctp-forward"` (12 bytes) right-padded with 20 zero bytes to 32 bytes.
+    #[macros::test_all]
+    fn cctp_forward_hook_data_is_cctp_forward_padded() {
+        let bytes = hex::decode(CCTP_FORWARD_HOOK_DATA_HEX).expect("valid hex");
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(&bytes[..12], b"cctp-forward");
+        assert_eq!(&bytes[12..], &[0u8; 20]);
+    }
+
+    #[macros::test_all]
+    fn cctp_fee_denominator_is_scaled_bps() {
+        assert_eq!(CCTP_FEE_BPS_DENOMINATOR, 10_000 * CCTP_FEE_SCALE);
+    }
+}
