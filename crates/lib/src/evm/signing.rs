@@ -55,6 +55,17 @@ pub(crate) mod router_eip712 {
             uint256 lzTokenFee;
             address refundAddress;
         }
+
+        /// Router cross-chain CCTP bridge authorization.
+        /// Domain: `{ name: "Router", version: "2", chainId, verifyingContract }`
+        /// `cctpData` is the `hash_cctp_data` struct hash.
+        struct ClaimCctp {
+            bytes32 preimage;
+            address token;
+            address tokenMessenger;
+            bytes32 cctpData;
+            uint256 minAmount;
+        }
     }
 }
 
@@ -233,6 +244,46 @@ impl EvmSigner {
             .sign_typed_data_sync(&claim_send, &domain)
             .map_err(|e| {
                 BoltzError::Signing(format!("Router ClaimSend EIP-712 signing failed: {e}"))
+            })?;
+        Ok(alloy_sig_to_evm_sig(&sig))
+    }
+
+    // ─── 6. EIP-712: Router ClaimCctp (cross-chain CCTP) ────────────────
+
+    /// Sign the Router `ClaimCctp` EIP-712 typed data (cross-chain CCTP/USDC
+    /// bridging). Same domain as the OFT `ClaimSend` path.
+    // TODO(cctp): remove `allow(dead_code)` once the CCTP claim path wires this in.
+    #[allow(dead_code)]
+    pub fn sign_eip712_router_claim_cctp(
+        &self,
+        router_address: Address,
+        preimage: &[u8; 32],
+        token: Address,
+        token_messenger: Address,
+        cctp_data_hash: [u8; 32],
+        min_amount: U256,
+    ) -> Result<EvmSignature, BoltzError> {
+        let domain = Eip712Domain {
+            name: Some("Router".into()),
+            version: Some("2".into()),
+            chain_id: Some(U256::from(self.chain_id)),
+            verifying_contract: Some(router_address),
+            salt: None,
+        };
+
+        let claim_cctp = router_eip712::ClaimCctp {
+            preimage: (*preimage).into(),
+            token,
+            tokenMessenger: token_messenger,
+            cctpData: cctp_data_hash.into(),
+            minAmount: min_amount,
+        };
+
+        let sig = self
+            .inner
+            .sign_typed_data_sync(&claim_cctp, &domain)
+            .map_err(|e| {
+                BoltzError::Signing(format!("Router ClaimCctp EIP-712 signing failed: {e}"))
             })?;
         Ok(alloy_sig_to_evm_sig(&sig))
     }
@@ -581,6 +632,27 @@ mod tests {
         assert_eq!(
             format!("{}", claim_send.eip712_type_hash()),
             "0xd574e98ae922e812083482a53f290e4a94af4ec6bc2d9490b0386edcf40dfecf"
+        );
+    }
+
+    #[macros::test_all]
+    fn test_router_claim_cctp_type_hash() {
+        use alloy_sol_types::SolStruct;
+
+        let claim_cctp = router_eip712::ClaimCctp {
+            preimage: [0u8; 32].into(),
+            token: Address::ZERO,
+            tokenMessenger: Address::ZERO,
+            cctpData: [0u8; 32].into(),
+            minAmount: U256::ZERO,
+        };
+
+        // keccak256("ClaimCctp(bytes32 preimage,address token,address tokenMessenger,bytes32 cctpData,uint256 minAmount)")
+        // Independently computed with `cast keccak` — must match boltz-core
+        // v5.0.0 Router.TYPEHASH_CLAIM_CCTP.
+        assert_eq!(
+            format!("{}", claim_cctp.eip712_type_hash()),
+            "0xf854d53d13bfc357f12f22b9d29b6f5c46693d79fb5dfd1153ba80151e59528c"
         );
     }
 
