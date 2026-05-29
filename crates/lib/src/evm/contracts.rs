@@ -71,6 +71,36 @@ sol! {
         ClaimSendAuthorization calldata auth
     );
 
+    /// CCTP burn parameters for cross-chain bridging via Circle CCTP v2.
+    struct CctpData {
+        uint32 destinationDomain;
+        bytes32 mintRecipient;
+        bytes32 destinationCaller;
+        uint256 maxFee;
+        uint32 minFinalityThreshold;
+        bytes hookData;
+    }
+
+    /// Authorization for cross-chain Router.claimERC20ExecuteCctp.
+    /// `minAmount` is the USDC floor that must remain for the CCTP burn after
+    /// the DEX `calls` execute (the end-to-end delivered-amount floor).
+    struct ClaimCctpAuthorization {
+        uint256 minAmount;
+        uint8 v;
+        bytes32 r;
+        bytes32 s;
+    }
+
+    /// Cross-chain: claim + DEX swap (tBTC -> USDC) + CCTP burn to another chain.
+    function claimERC20ExecuteCctp(
+        Erc20Claim calldata claim,
+        Call[] calldata calls,
+        address token,
+        address tokenMessenger,
+        CctpData calldata cctpData,
+        ClaimCctpAuthorization calldata auth
+    );
+
     // ─── ERC20Swap contract ──────────────────────────────────────────────
 
     /// Direct claim (non-Router fallback). Anyone can call; tokens go to claimAddress.
@@ -109,6 +139,7 @@ sol! {
     // ─── Router read functions ───────────────────────────────────────────
 
     function TYPEHASH_SEND_DATA() external view returns (bytes32);
+    function TYPEHASH_CCTP_DATA() external view returns (bytes32);
 
     // ─── OFT Contract (LayerZero USDT0) ──────────────────────────────
 
@@ -238,6 +269,52 @@ pub fn encode_claim_erc20_execute_oft(
     call.abi_encode()
 }
 
+/// Encode `claimERC20ExecuteCctp` calldata for cross-chain USDC delivery via
+/// Circle CCTP v2.
+pub fn encode_claim_erc20_execute_cctp(
+    claim: &Erc20Claim,
+    calls: &[Call],
+    token: Address,
+    token_messenger: Address,
+    cctp_data: &CctpData,
+    auth: &ClaimCctpAuthorization,
+) -> Vec<u8> {
+    let call = claimERC20ExecuteCctpCall {
+        claim: claim.clone(),
+        calls: calls.to_vec(),
+        token,
+        tokenMessenger: token_messenger,
+        cctpData: cctp_data.clone(),
+        auth: auth.clone(),
+    };
+    call.abi_encode()
+}
+
+/// Compute the EIP-712 struct hash for `CctpData`.
+///
+/// `hash = keccak256(abi.encode(TYPEHASH, destinationDomain, mintRecipient,
+/// destinationCaller, maxFee, minFinalityThreshold, keccak256(hookData)))`.
+/// `hookData` is hashed (it is `bytes` in the struct but `bytes32` in the
+/// typehash); the `uint32` fields are encoded as full 32-byte words.
+pub fn hash_cctp_data(typehash: [u8; 32], cctp_data: &CctpData) -> [u8; 32] {
+    use alloy_primitives::keccak256;
+
+    let hook_data_hash = keccak256(cctp_data.hookData.as_ref());
+
+    let encoded = (
+        FixedBytes::<32>::from(typehash),
+        U256::from(cctp_data.destinationDomain),
+        cctp_data.mintRecipient,
+        cctp_data.destinationCaller,
+        cctp_data.maxFee,
+        U256::from(cctp_data.minFinalityThreshold),
+        hook_data_hash,
+    )
+        .abi_encode();
+
+    keccak256(&encoded).into()
+}
+
 /// Encode `version()` calldata for reading `ERC20Swap` version.
 pub fn encode_version_call() -> Vec<u8> {
     versionCall {}.abi_encode()
@@ -322,6 +399,20 @@ pub fn encode_direct_claim(
 /// Encode `TYPEHASH_SEND_DATA()` calldata.
 pub fn encode_typehash_send_data_call() -> Vec<u8> {
     TYPEHASH_SEND_DATACall {}.abi_encode()
+}
+
+/// Encode `TYPEHASH_CCTP_DATA()` calldata.
+pub fn encode_typehash_cctp_data_call() -> Vec<u8> {
+    TYPEHASH_CCTP_DATACall {}.abi_encode()
+}
+
+/// Decode `TYPEHASH_CCTP_DATA()` return value.
+pub fn decode_typehash_cctp_data(data: &[u8]) -> Result<[u8; 32], BoltzError> {
+    let decoded = <(FixedBytes<32>,)>::abi_decode(data).map_err(|e| BoltzError::Evm {
+        reason: format!("Failed to decode TYPEHASH_CCTP_DATA return: {e}"),
+        tx_hash: None,
+    })?;
+    Ok(decoded.0.into())
 }
 
 /// Decode `TYPEHASH_SEND_DATA()` return value.
@@ -1097,6 +1188,105 @@ mod tests {
             hash_send_data(typehash, &sd1),
             hash_send_data(typehash, &sd2)
         );
+    }
+
+    fn sample_cctp_data() -> CctpData {
+        CctpData {
+            destinationDomain: 6,
+            mintRecipient: [0xaa; 32].into(),
+            destinationCaller: [0u8; 32].into(),
+            maxFee: U256::from(1_000u64),
+            minFinalityThreshold: 1000,
+            hookData: vec![].into(),
+        }
+    }
+
+    #[macros::test_all]
+    fn test_encode_claim_erc20_execute_cctp_selector() {
+        let claim = Erc20Claim {
+            preimage: [0u8; 32].into(),
+            amount: U256::from(1u64),
+            tokenAddress: Address::ZERO,
+            refundAddress: Address::ZERO,
+            timelock: U256::from(1u64),
+            v: 28,
+            r: [0u8; 32].into(),
+            s: [0u8; 32].into(),
+        };
+        let auth = ClaimCctpAuthorization {
+            minAmount: U256::from(900u64),
+            v: 28,
+            r: [0u8; 32].into(),
+            s: [0u8; 32].into(),
+        };
+
+        let encoded = encode_claim_erc20_execute_cctp(
+            &claim,
+            &[],
+            Address::ZERO,
+            Address::ZERO,
+            &sample_cctp_data(),
+            &auth,
+        );
+
+        assert_eq!(&encoded[..4], &claimERC20ExecuteCctpCall::SELECTOR);
+        // Round-trips back to the same fields.
+        let decoded = claimERC20ExecuteCctpCall::abi_decode(&encoded).unwrap();
+        assert_eq!(decoded.cctpData.destinationDomain, 6);
+        assert_eq!(decoded.cctpData.minFinalityThreshold, 1000);
+        assert_eq!(decoded.auth.minAmount, U256::from(900u64));
+    }
+
+    #[macros::test_all]
+    fn test_typehash_cctp_data_call_selector() {
+        let encoded = encode_typehash_cctp_data_call();
+        assert_eq!(&encoded[..4], &TYPEHASH_CCTP_DATACall::SELECTOR);
+    }
+
+    #[macros::test_all]
+    fn test_hash_cctp_data_deterministic() {
+        let typehash = [1u8; 32];
+        let d = sample_cctp_data();
+        assert_eq!(hash_cctp_data(typehash, &d), hash_cctp_data(typehash, &d));
+        assert_ne!(hash_cctp_data(typehash, &d), [0u8; 32]);
+    }
+
+    #[macros::test_all]
+    fn test_hash_cctp_data_field_sensitivity() {
+        let typehash = [1u8; 32];
+        let base = sample_cctp_data();
+
+        let diff_domain = CctpData {
+            destinationDomain: 7,
+            ..base.clone()
+        };
+        assert_ne!(
+            hash_cctp_data(typehash, &base),
+            hash_cctp_data(typehash, &diff_domain)
+        );
+
+        // hookData is hashed into the struct hash, so it must affect the result.
+        let diff_hook = CctpData {
+            hookData: vec![0xde, 0xad].into(),
+            ..base.clone()
+        };
+        assert_ne!(
+            hash_cctp_data(typehash, &base),
+            hash_cctp_data(typehash, &diff_hook)
+        );
+    }
+
+    #[macros::test_all]
+    fn test_hash_cctp_data_hashes_hookdata() {
+        use alloy_primitives::keccak256;
+        // Empty hookData must be folded in as keccak256("") — the canonical
+        // empty-bytes hash. Guards against accidentally inlining raw hookData.
+        let empty_keccak: [u8; 32] =
+            hex::decode("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        assert_eq!(keccak256(b"").as_slice(), &empty_keccak);
     }
 
     #[macros::test_all]
