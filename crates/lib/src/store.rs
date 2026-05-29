@@ -98,12 +98,13 @@ mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
     use super::*;
-    use crate::models::{BoltzSwapStatus, ChainId};
+    use crate::models::{BoltzSwapStatus, BridgeKind, ChainId};
 
     fn test_swap(id: &str, status: BoltzSwapStatus) -> BoltzSwap {
         BoltzSwap {
             id: id.to_string(),
             status,
+            bridge_kind: BridgeKind::Oft,
             claim_key_index: 0,
             chain_id: 42161,
             claim_address: "0xabc".to_string(),

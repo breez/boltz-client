@@ -11,6 +11,10 @@ pub struct BoltzSwap {
     /// Swap ID — the Boltz backend ID for normal swaps, or a `recovery-*` ID for recovered swaps.
     pub id: String,
     pub status: BoltzSwapStatus,
+    /// Which bridge carries the Arbitrum -> destination leg. Defaults to `Oft`
+    /// for swaps persisted before CCTP support existed.
+    #[serde(default)]
+    pub bridge_kind: BridgeKind,
     /// HD derivation index for the per-swap preimage key.
     pub claim_key_index: u32,
     /// EVM chain ID (42161 for Arbitrum).
@@ -253,11 +257,168 @@ impl ChainRegistry {
     }
 }
 
+/// Which bridge carries a swap's Arbitrum -> destination leg.
+/// `Oft` = `LayerZero` USDT0 (the original USDT path); `Cctp` = Circle CCTP v2
+/// (USDC). Stored on the swap so the claim/recovery paths branch without
+/// re-deriving. Defaults to `Oft` so swaps persisted before CCTP existed
+/// deserialize correctly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum BridgeKind {
+    #[default]
+    Oft,
+    Cctp,
+}
+
+/// A USDC (CCTP) destination chain. Static compile-time table — CCTP routes
+/// are not published by the USDT0 deployments API. `id` is the lowercased
+/// asset name (e.g. `"usdc-base"`), kept distinct from OFT chain ids
+/// (`"polygon pos"`, `"solana"`, ...) so the two destination spaces never
+/// collide for chains that support both bridges.
+#[derive(Clone, Debug)]
+pub struct CctpDestination {
+    /// Lowercased asset name; join key used as a [`ChainId`].
+    pub id: &'static str,
+    /// Asset identifier as published by the web app (e.g. `"USDC-BASE"`).
+    pub asset: &'static str,
+    pub transport: NetworkTransport,
+    /// Circle CCTP domain id of the destination chain.
+    pub domain: u32,
+    /// USDC token contract on the destination chain (EVM `0x…`, Solana base58
+    /// mint). Used to decode the delivered amount during recovery.
+    pub token_address: &'static str,
+}
+
+/// Static registry of USDC (CCTP) destinations, mirroring boltz-web-app
+/// `boltz-swaps` `cctp/variants.ts`. Addresses and Circle domains are verified
+/// against that source.
+pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
+    CctpDestination {
+        id: "usdc-base",
+        asset: "USDC-BASE",
+        transport: NetworkTransport::Evm,
+        domain: 6,
+        token_address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    },
+    CctpDestination {
+        id: "usdc-eth",
+        asset: "USDC-ETH",
+        transport: NetworkTransport::Evm,
+        domain: 0,
+        token_address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+    },
+    CctpDestination {
+        id: "usdc-avax",
+        asset: "USDC-AVAX",
+        transport: NetworkTransport::Evm,
+        domain: 1,
+        token_address: "0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E",
+    },
+    CctpDestination {
+        id: "usdc-op",
+        asset: "USDC-OP",
+        transport: NetworkTransport::Evm,
+        domain: 2,
+        token_address: "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85",
+    },
+    CctpDestination {
+        id: "usdc-pol",
+        asset: "USDC-POL",
+        transport: NetworkTransport::Evm,
+        domain: 7,
+        token_address: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
+    },
+    CctpDestination {
+        id: "usdc-uni",
+        asset: "USDC-UNI",
+        transport: NetworkTransport::Evm,
+        domain: 10,
+        token_address: "0x078D782b760474a361dDA0AF3839290b0EF57AD6",
+    },
+    CctpDestination {
+        id: "usdc-linea",
+        asset: "USDC-LINEA",
+        transport: NetworkTransport::Evm,
+        domain: 11,
+        token_address: "0x176211869cA2b568f2A7D4EE941E073a821EE1ff",
+    },
+    CctpDestination {
+        id: "usdc-codex",
+        asset: "USDC-CODEX",
+        transport: NetworkTransport::Evm,
+        domain: 12,
+        token_address: "0xd996633a415985DBd7D6D12f4A4343E31f5037cf",
+    },
+    CctpDestination {
+        id: "usdc-sonic",
+        asset: "USDC-SONIC",
+        transport: NetworkTransport::Evm,
+        domain: 13,
+        token_address: "0x29219dd400f2Bf60E5a23d13be72b486d4038894",
+    },
+    CctpDestination {
+        id: "usdc-world",
+        asset: "USDC-WORLD",
+        transport: NetworkTransport::Evm,
+        domain: 14,
+        token_address: "0x79A02482A880bCe3F13E09da970dC34dB4cD24D1",
+    },
+    CctpDestination {
+        id: "usdc-mon",
+        asset: "USDC-MON",
+        transport: NetworkTransport::Evm,
+        domain: 15,
+        token_address: "0x754704Bc059F8C67012fEd69BC8A327a5aafb603",
+    },
+    CctpDestination {
+        id: "usdc-sei",
+        asset: "USDC-SEI",
+        transport: NetworkTransport::Evm,
+        domain: 16,
+        token_address: "0xe15fC38F6D8c56aF07bbCBe3BAf5708A2Bf42392",
+    },
+    CctpDestination {
+        id: "usdc-xdc",
+        asset: "USDC-XDC",
+        transport: NetworkTransport::Evm,
+        domain: 18,
+        token_address: "0xfA2958CB79b0491CC627c1557F441eF849Ca8eb1",
+    },
+    CctpDestination {
+        id: "usdc-ink",
+        asset: "USDC-INK",
+        transport: NetworkTransport::Evm,
+        domain: 21,
+        token_address: "0x2D270e6886d130D724215A266106e6832161EAEd",
+    },
+    CctpDestination {
+        id: "usdc-plume",
+        asset: "USDC-PLUME",
+        transport: NetworkTransport::Evm,
+        domain: 22,
+        token_address: "0x222365EF19F7947e5484218551B56bb3965Aa7aF",
+    },
+    CctpDestination {
+        id: "usdc-sol",
+        asset: "USDC-SOL",
+        transport: NetworkTransport::Solana,
+        domain: 5,
+        token_address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    },
+];
+
+/// Resolve a CCTP destination by its [`ChainId`] (the lowercased asset name).
+#[must_use]
+pub fn cctp_destination(id: &ChainId) -> Option<&'static CctpDestination> {
+    CCTP_DESTINATIONS.iter().find(|d| d.id == id.as_str())
+}
+
 /// Quote result returned to caller before committing to a swap.
 #[derive(Clone, Debug, Serialize)]
 pub struct PreparedSwap {
     pub destination_address: String,
     pub destination_chain: ChainId,
+    /// Which bridge will carry the destination leg (OFT for USDT, CCTP for USDC).
+    pub bridge_kind: BridgeKind,
     /// Requested USDT output (6 decimals).
     pub usdt_amount: u64,
     /// Total sats to pay (includes all fees).
@@ -356,6 +517,7 @@ mod tests {
         let swap = BoltzSwap {
             id: "boltz-1".to_string(),
             status: BoltzSwapStatus::Created,
+            bridge_kind: BridgeKind::Oft,
             claim_key_index: 0,
             chain_id: 42161,
             claim_address: "0xabc".to_string(),
@@ -402,5 +564,59 @@ mod tests {
         assert_eq!(json, r#""polygon pos""#);
         let back: ChainId = serde_json::from_str(&json).unwrap();
         assert_eq!(back, id);
+    }
+
+    #[macros::test_all]
+    fn bridge_kind_defaults_to_oft() {
+        assert_eq!(BridgeKind::default(), BridgeKind::Oft);
+    }
+
+    #[macros::test_all]
+    fn cctp_destinations_table_is_well_formed() {
+        use std::collections::HashSet;
+
+        // 15 EVM destinations + Solana.
+        assert_eq!(CCTP_DESTINATIONS.len(), 16);
+
+        let mut ids = HashSet::new();
+        let mut domains = HashSet::new();
+        let mut solana_count = 0;
+        for d in CCTP_DESTINATIONS {
+            // ids are unique and already lowercased (valid ChainId join keys).
+            assert!(ids.insert(d.id), "duplicate id {}", d.id);
+            assert_eq!(d.id, d.id.to_lowercase());
+            // Circle domains are unique per destination.
+            assert!(domains.insert(d.domain), "duplicate domain {}", d.domain);
+            match d.transport {
+                NetworkTransport::Evm => {
+                    assert!(d.token_address.starts_with("0x"));
+                    assert_eq!(d.token_address.len(), 42);
+                }
+                NetworkTransport::Solana => {
+                    solana_count += 1;
+                    assert!(!d.token_address.starts_with("0x"));
+                }
+                NetworkTransport::Tron => panic!("CCTP does not support Tron"),
+            }
+        }
+        // Exactly one Solana destination (USDC-SOL).
+        assert_eq!(solana_count, 1);
+    }
+
+    #[macros::test_all]
+    fn cctp_destination_lookup_by_chain_id() {
+        let base = cctp_destination(&ChainId::new("usdc-base")).unwrap();
+        assert_eq!(base.asset, "USDC-BASE");
+        assert_eq!(base.domain, 6);
+        assert_eq!(base.transport, NetworkTransport::Evm);
+
+        // Lookup is case-insensitive via ChainId normalization.
+        let sol = cctp_destination(&ChainId::new("USDC-SOL")).unwrap();
+        assert_eq!(sol.domain, 5);
+        assert_eq!(sol.transport, NetworkTransport::Solana);
+
+        // OFT chain ids must NOT resolve as CCTP destinations.
+        assert!(cctp_destination(&ChainId::new("polygon pos")).is_none());
+        assert!(cctp_destination(&ChainId::new("solana")).is_none());
     }
 }

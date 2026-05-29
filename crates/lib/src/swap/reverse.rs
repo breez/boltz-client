@@ -26,8 +26,8 @@ use crate::evm::recipient::{
 use crate::evm::signing::EvmSigner;
 use crate::keys::EvmKeyManager;
 use crate::models::{
-    BoltzSwap, BoltzSwapStatus, ChainId, ChainRegistry, ChainSpec, NetworkTransport, PreparedSwap,
-    SwapLimits, Usdt0Kind,
+    BoltzSwap, BoltzSwapStatus, BridgeKind, ChainId, ChainRegistry, ChainSpec, NetworkTransport,
+    PreparedSwap, SwapLimits, Usdt0Kind,
 };
 use crate::recover::{self, RecoverableSwap};
 use crate::solana::ata::derive_ata;
@@ -198,6 +198,7 @@ impl ReverseSwapExecutor {
         Ok(PreparedSwap {
             destination_address: destination.to_string(),
             destination_chain: chain,
+            bridge_kind: BridgeKind::Oft,
             usdt_amount,
             invoice_amount_sats: fee_calc.invoice_sats,
             boltz_fee_sats: fee_calc.boltz_fee_sats,
@@ -310,6 +311,7 @@ impl ReverseSwapExecutor {
         Ok(PreparedSwap {
             destination_address: destination.to_string(),
             destination_chain: chain,
+            bridge_kind: BridgeKind::Oft,
             usdt_amount: usdt_output,
             invoice_amount_sats,
             boltz_fee_sats: fee_calc.boltz_fee_sats,
@@ -406,6 +408,7 @@ impl ReverseSwapExecutor {
         Ok(BoltzSwap {
             id: resp.id,
             status: BoltzSwapStatus::Created,
+            bridge_kind: prepared.bridge_kind,
             claim_key_index: key_index,
             chain_id: self.config.chain_id,
             claim_address: gas_signer.address_hex(),
@@ -558,6 +561,8 @@ impl ReverseSwapExecutor {
         Ok(BoltzSwap {
             id: format!("recovery-{}-{}", recoverable.key_index, now),
             status: BoltzSwapStatus::TbtcLocked,
+            // Recovery currently scans only OFT (USDT) Lockup events.
+            bridge_kind: BridgeKind::Oft,
             claim_key_index: recoverable.key_index,
             chain_id: self.config.chain_id,
             claim_address: format!("0x{}", hex::encode(recoverable.claim_address.as_slice())),
