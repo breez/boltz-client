@@ -1770,6 +1770,25 @@ impl ReverseSwapExecutor {
         Ok(self.alchemy_client.poll_call_status(call_id).await?.tx_hash)
     }
 
+    /// Query Circle Iris for the destination-delivery status of a CCTP swap,
+    /// given its stored guid `"<source_domain>:<source_tx_hash>"`. Lets callers
+    /// confirm the cross-chain mint was forwarded — the client only verifies
+    /// the Arbitrum burn on-chain; CCTP delivery lands asynchronously.
+    pub(crate) async fn cctp_delivery_status(
+        &self,
+        guid: &str,
+    ) -> Result<cctp::CctpMessageStatus, BoltzError> {
+        let (domain_str, tx_hash) = guid
+            .split_once(':')
+            .ok_or_else(|| BoltzError::Generic(format!("Malformed CCTP guid '{guid}'")))?;
+        let source_domain: u32 = domain_str.parse().map_err(|_| {
+            BoltzError::Generic(format!("Invalid CCTP source domain in guid '{guid}'"))
+        })?;
+        self.cctp_fee_client
+            .get_message_status(source_domain, tx_hash)
+            .await
+    }
+
     // ─── OFT fee estimation (for prepare-time quoting) ─────────────────
 
     /// Find the OFT send amount required to deliver `target_amount` on the

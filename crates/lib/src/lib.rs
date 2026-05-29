@@ -18,6 +18,7 @@ use platform_utils::tokio::sync::mpsc;
 pub use config::*;
 pub use error::BoltzError;
 pub use events::{BoltzEventListener, BoltzSwapEvent, EventEmitter};
+pub use evm::cctp::CctpMessageStatus;
 pub use evm::recipient::is_valid_destination_address;
 pub use keys::EvmKeyManager;
 pub use models::*;
@@ -178,6 +179,29 @@ impl BoltzService {
     /// Get a swap by its internal ID.
     pub async fn get_swap(&self, swap_id: &str) -> Result<Option<BoltzSwap>, BoltzError> {
         self.store.get_swap(swap_id).await
+    }
+
+    /// Query the destination-delivery status of a USDC (CCTP) swap via Circle
+    /// Iris. The client verifies the Arbitrum burn on-chain, but the CCTP mint
+    /// on the destination chain lands asynchronously; this reports whether the
+    /// message has been attested and forwarded (minted).
+    ///
+    /// Returns `Ok(None)` for non-CCTP swaps, unknown swaps, or CCTP swaps
+    /// whose burn tx hash hasn't been recorded yet.
+    pub async fn cctp_delivery_status(
+        &self,
+        swap_id: &str,
+    ) -> Result<Option<CctpMessageStatus>, BoltzError> {
+        let Some(swap) = self.store.get_swap(swap_id).await? else {
+            return Ok(None);
+        };
+        if swap.bridge_kind != BridgeKind::Cctp {
+            return Ok(None);
+        }
+        let Some(guid) = swap.lz_guid else {
+            return Ok(None);
+        };
+        Ok(Some(self.executor.cctp_delivery_status(&guid).await?))
     }
 
     /// Shut down the swap manager and close the WebSocket connection.

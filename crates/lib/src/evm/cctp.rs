@@ -236,6 +236,58 @@ impl CctpFeeClient {
         Self::parse_fee_response(&response.body, finality_threshold)
     }
 
+    /// Query the status of a CCTP message by its source-chain burn tx hash.
+    /// `GET /v2/messages/{source_domain}?transactionHash=...`. A 404 means the
+    /// burn hasn't been indexed yet (treated as not-yet-found, still pending).
+    pub async fn get_message_status(
+        &self,
+        source_domain: u32,
+        source_tx_hash: &str,
+    ) -> Result<CctpMessageStatus, BoltzError> {
+        let url = format!(
+            "{}/v2/messages/{source_domain}?transactionHash={source_tx_hash}",
+            self.api_url
+        );
+        let mut headers = HashMap::new();
+        headers.insert("Accept".to_string(), "application/json".to_string());
+
+        let response = self
+            .http
+            .get(url, Some(headers))
+            .await
+            .map_err(|e| BoltzError::Generic(format!("CCTP message request failed: {e}")))?;
+
+        // Not indexed yet — the message is still pending, not an error.
+        if response.status == 404 {
+            return Ok(CctpMessageStatus::default());
+        }
+        if !response.is_success() {
+            return Err(BoltzError::Generic(format!(
+                "CCTP message HTTP error {}: {}",
+                response.status, response.body
+            )));
+        }
+
+        Self::parse_message_status(&response.body)
+    }
+
+    /// Parse the Iris `/v2/messages` response. Split out for testing against
+    /// recorded JSON.
+    fn parse_message_status(body: &str) -> Result<CctpMessageStatus, BoltzError> {
+        let parsed: CctpMessagesResponse = serde_json::from_str(body).map_err(|e| {
+            BoltzError::Generic(format!("failed to parse CCTP messages response: {e}"))
+        })?;
+        let Some(msg) = parsed.messages.into_iter().next() else {
+            return Ok(CctpMessageStatus::default());
+        };
+        Ok(CctpMessageStatus {
+            found: true,
+            status: msg.status,
+            attestation: msg.attestation,
+            forward_tx_hash: msg.forward_tx_hash,
+        })
+    }
+
     /// Parse the Iris fee response body and extract the fee for
     /// `finality_threshold`. Split out for testing against recorded JSON.
     fn parse_fee_response(body: &str, finality_threshold: u32) -> Result<CctpFee, BoltzError> {
@@ -274,6 +326,48 @@ impl CctpFeeClient {
 /// Scale (in decimal digits) Circle applies to `minimumFee`. `CCTP_FEE_SCALE`
 /// is `10^CCTP_FEE_SCALE_DIGITS`.
 const CCTP_FEE_SCALE_DIGITS: u32 = 9;
+
+/// Status of a CCTP message from the Iris `/v2/messages` endpoint, used to
+/// confirm destination-side delivery for a USDC swap.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CctpMessageStatus {
+    /// `false` when Iris hasn't indexed the burn yet (HTTP 404 or empty list);
+    /// the message is still pending.
+    pub found: bool,
+    /// Circle status string, e.g. `"pending_confirmations"` / `"complete"`.
+    pub status: Option<String>,
+    /// Attestation signature, present once the message is attested.
+    pub attestation: Option<String>,
+    /// Forwarding-service tx hash on the destination chain, present once the
+    /// forward (mint) has been submitted. The destination `MintAndWithdraw` in
+    /// this tx carries the authoritative delivered amount.
+    pub forward_tx_hash: Option<String>,
+}
+
+impl CctpMessageStatus {
+    /// Whether the destination mint has been forwarded (delivery on its way /
+    /// done).
+    #[must_use]
+    pub fn is_forwarded(&self) -> bool {
+        self.forward_tx_hash.is_some()
+    }
+}
+
+#[derive(Deserialize)]
+struct CctpMessagesResponse {
+    #[serde(default)]
+    messages: Vec<CctpMessageSnapshot>,
+}
+
+#[derive(Deserialize)]
+struct CctpMessageSnapshot {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    attestation: Option<String>,
+    #[serde(default, rename = "forwardTxHash")]
+    forward_tx_hash: Option<String>,
+}
 
 #[derive(Deserialize)]
 struct CctpFeeEntry {
@@ -449,6 +543,34 @@ mod tests {
     fn parse_fee_response_missing_finality_errors() {
         let body = r#"[{"finalityThreshold":2000,"minimumFee":"0","forwardFee":{"low":"1","med":"2","high":"3"}}]"#;
         assert!(CctpFeeClient::parse_fee_response(body, 1000).is_err());
+    }
+
+    #[macros::test_all]
+    fn parse_message_status_forwarded() {
+        let body = r#"{"messages":[{"status":"complete","attestation":"0xabcd","forwardTxHash":"0xdead"}]}"#;
+        let s = CctpFeeClient::parse_message_status(body).unwrap();
+        assert!(s.found);
+        assert_eq!(s.status.as_deref(), Some("complete"));
+        assert_eq!(s.attestation.as_deref(), Some("0xabcd"));
+        assert_eq!(s.forward_tx_hash.as_deref(), Some("0xdead"));
+        assert!(s.is_forwarded());
+    }
+
+    #[macros::test_all]
+    fn parse_message_status_pending_not_forwarded() {
+        let body = r#"{"messages":[{"status":"pending_confirmations","attestation":"PENDING"}]}"#;
+        let s = CctpFeeClient::parse_message_status(body).unwrap();
+        assert!(s.found);
+        assert_eq!(s.status.as_deref(), Some("pending_confirmations"));
+        assert!(s.forward_tx_hash.is_none());
+        assert!(!s.is_forwarded());
+    }
+
+    #[macros::test_all]
+    fn parse_message_status_empty_is_not_found() {
+        let s = CctpFeeClient::parse_message_status(r#"{"messages":[]}"#).unwrap();
+        assert!(!s.found);
+        assert!(!s.is_forwarded());
     }
 
     #[macros::test_all]
