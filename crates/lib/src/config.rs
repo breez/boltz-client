@@ -78,6 +78,11 @@ impl BoltzConfig {
 // Chain constants for Arbitrum One
 pub const ARBITRUM_CHAIN_ID: u64 = 42161;
 
+/// Polygon `PoS` EVM chain ID. Used only to flag OFT sends to Polygon, which
+/// need a temporary `lzReceive` gas bump (see
+/// [`crate::evm::lz_options::POLYGON_LZ_RECEIVE_GAS_BUMP`]).
+pub const POLYGON_EVM_CHAIN_ID: u64 = 137;
+
 /// Default slippage tolerance: 100 basis points = 1%.
 pub const DEFAULT_SLIPPAGE_BPS: u32 = 100;
 

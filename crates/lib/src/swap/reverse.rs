@@ -8,8 +8,8 @@ use crate::api::BoltzApiClient;
 use crate::api::types::{EncodeRequest, QuoteResponse, ReversePairInfo};
 use crate::config::{
     ARBITRUM_ERC20SWAP_DEPLOY_BLOCK, ARBITRUM_ROUTER_ADDRESS, ARBITRUM_TBTC_ADDRESS,
-    ARBITRUM_USDT_ADDRESS, BoltzConfig, MAX_SLIPPAGE_BPS, PROBE_INVOICE_EXPIRY_SECS,
-    SATS_TO_TBTC_FACTOR, SOLANA_USDT0_MINT, ZERO_ADDRESS,
+    ARBITRUM_USDT_ADDRESS, BoltzConfig, MAX_SLIPPAGE_BPS, POLYGON_EVM_CHAIN_ID,
+    PROBE_INVOICE_EXPIRY_SECS, SATS_TO_TBTC_FACTOR, SOLANA_USDT0_MINT, ZERO_ADDRESS,
 };
 use crate::error::BoltzError;
 use crate::evm::alchemy::{AlchemyGasClient, EvmCall};
@@ -1467,8 +1467,13 @@ impl ReverseSwapExecutor {
         spec: &ChainSpec,
         destination: &str,
     ) -> Result<Bytes, BoltzError> {
+        // Temporary workaround: OFT sends to Polygon need a bumped `lzReceive`
+        // gas limit (boltz-web-app#1500). Polygon is an EVM destination, so it
+        // never overlaps the Solana ATA branch below.
+        let polygon_gas_bump = spec.evm_chain_id == Some(POLYGON_EVM_CHAIN_ID);
+
         if spec.transport != NetworkTransport::Solana {
-            return Ok(Bytes::new());
+            return Ok(Bytes::from(build_extra_options(false, polygon_gas_bump)));
         }
 
         // Fast path: if we've already confirmed the ATA exists for this
@@ -1494,7 +1499,7 @@ impl ReverseSwapExecutor {
             return Ok(Bytes::new());
         }
 
-        Ok(Bytes::from(build_extra_options(true)))
+        Ok(Bytes::from(build_extra_options(true, false)))
     }
 
     // ─── OFT quoting helpers ──────────────────────────────────────────
