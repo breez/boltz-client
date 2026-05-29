@@ -6,7 +6,12 @@
 //! Router's `claimERC20ExecuteCctp`; these helpers build the `CctpData`
 //! field values for it.
 
+use std::collections::HashMap;
+
 use alloy_primitives::FixedBytes;
+use serde::Deserialize;
+
+use platform_utils::http::HttpClient;
 
 use crate::config::{CCTP_FEE_BPS_DENOMINATOR, CCTP_MAX_FEE_BUFFER_BPS, SOLANA_USDC_MINT};
 use crate::error::BoltzError;
@@ -106,13 +111,178 @@ pub fn add_fee_buffer(amount: u128) -> u128 {
         .unwrap_or(0)
 }
 
+/// Circle CCTP burn fee for one route/finality, resolved from the Iris API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CctpFee {
+    /// Protocol fee in basis points, scaled by [`CCTP_FEE_SCALE`].
+    pub bps_units: u128,
+    /// Flat forwarding-service fee, in the burn token's smallest units.
+    pub forward_fee: u128,
+}
+
+/// Parse a decimal value (number or numeric string) into an integer scaled by
+/// `10^scale_digits`, truncating any fraction beyond `scale_digits`. Used for
+/// Circle's `minimumFee` (bps, scaled by 9) and `forwardFee` (scale 0).
+fn parse_scaled(value: &serde_json::Value, scale_digits: u32) -> Result<u128, BoltzError> {
+    let s = match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        other => {
+            return Err(BoltzError::Generic(format!(
+                "invalid CCTP fee value: {other}"
+            )));
+        }
+    };
+
+    let (int_part, frac_part) = match s.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (s.as_str(), ""),
+    };
+
+    let parse_digits = |d: &str| -> Result<u128, BoltzError> {
+        if d.is_empty() {
+            return Ok(0);
+        }
+        d.parse::<u128>()
+            .map_err(|_| BoltzError::Generic(format!("invalid CCTP fee number '{s}'")))
+    };
+
+    let scale = scale_digits as usize;
+    // Truncate or right-pad the fractional part to exactly `scale` digits.
+    let mut frac = String::with_capacity(scale);
+    frac.push_str(frac_part.get(..scale.min(frac_part.len())).unwrap_or(""));
+    while frac.len() < scale {
+        frac.push('0');
+    }
+
+    let int_scaled = parse_digits(int_part)?
+        .checked_mul(10u128.pow(scale_digits))
+        .ok_or_else(|| BoltzError::Generic("CCTP fee overflow".into()))?;
+    let frac_scaled = if frac.is_empty() {
+        0
+    } else {
+        parse_digits(&frac)?
+    };
+
+    int_scaled
+        .checked_add(frac_scaled)
+        .ok_or_else(|| BoltzError::Generic("CCTP fee overflow".into()))
+}
+
+/// Client for Circle's Iris CCTP fee API.
+pub struct CctpFeeClient {
+    http: Box<dyn HttpClient>,
+    api_url: String,
+}
+
+impl CctpFeeClient {
+    pub fn new(http: Box<dyn HttpClient>, api_url: String) -> Self {
+        // Normalize: drop a single trailing slash so path joins are clean.
+        let api_url = match api_url.strip_suffix('/') {
+            Some(trimmed) => trimmed.to_string(),
+            None => api_url,
+        };
+        Self { http, api_url }
+    }
+
+    /// Fetch the burn fee for `source_domain -> dest_domain` at the given
+    /// `finality_threshold` (Fast=1000 / Standard=2000), in Forwarded mode.
+    pub async fn get_fee(
+        &self,
+        source_domain: u32,
+        dest_domain: u32,
+        finality_threshold: u32,
+    ) -> Result<CctpFee, BoltzError> {
+        let url = format!(
+            "{}/v2/burn/USDC/fees/{source_domain}/{dest_domain}?forward=true",
+            self.api_url
+        );
+        let mut headers = HashMap::new();
+        headers.insert("Accept".to_string(), "application/json".to_string());
+
+        let response = self
+            .http
+            .get(url, Some(headers))
+            .await
+            .map_err(|e| BoltzError::Generic(format!("CCTP fee request failed: {e}")))?;
+
+        if !response.is_success() {
+            return Err(BoltzError::Generic(format!(
+                "CCTP fee HTTP error {}: {}",
+                response.status, response.body
+            )));
+        }
+
+        Self::parse_fee_response(&response.body, finality_threshold)
+    }
+
+    /// Parse the Iris fee response body and extract the fee for
+    /// `finality_threshold`. Split out for testing against recorded JSON.
+    fn parse_fee_response(body: &str, finality_threshold: u32) -> Result<CctpFee, BoltzError> {
+        let entries: Vec<CctpFeeEntry> = serde_json::from_str(body).map_err(|e| {
+            BoltzError::Generic(format!(
+                "failed to parse CCTP fee response: {e} (body: {body})"
+            ))
+        })?;
+
+        let entry = entries
+            .into_iter()
+            .find(|e| e.finality_threshold == finality_threshold)
+            .ok_or_else(|| {
+                BoltzError::Generic(format!(
+                    "missing CCTP fee for finality threshold {finality_threshold}"
+                ))
+            })?;
+
+        let bps_units = parse_scaled(&entry.minimum_fee, CCTP_FEE_SCALE_DIGITS)?;
+        let forward_fee = match entry.forward_fee {
+            Some(f) => parse_scaled(&f.med, 0)?,
+            None => {
+                return Err(BoltzError::Generic(format!(
+                    "missing CCTP forward fee for finality threshold {finality_threshold}"
+                )));
+            }
+        };
+
+        Ok(CctpFee {
+            bps_units,
+            forward_fee,
+        })
+    }
+}
+
+/// Scale (in decimal digits) Circle applies to `minimumFee`. `CCTP_FEE_SCALE`
+/// is `10^CCTP_FEE_SCALE_DIGITS`.
+const CCTP_FEE_SCALE_DIGITS: u32 = 9;
+
+#[derive(Deserialize)]
+struct CctpFeeEntry {
+    #[serde(rename = "finalityThreshold")]
+    finality_threshold: u32,
+    #[serde(rename = "minimumFee")]
+    minimum_fee: serde_json::Value,
+    #[serde(rename = "forwardFee")]
+    forward_fee: Option<CctpForwardFee>,
+}
+
+#[derive(Deserialize)]
+struct CctpForwardFee {
+    med: serde_json::Value,
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "browser-tests")]
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
     use super::*;
-    use crate::config::CCTP_FORWARD_HOOK_DATA_HEX;
+    use crate::config::{CCTP_FEE_SCALE, CCTP_FORWARD_HOOK_DATA_HEX};
+
+    // Sanity: the scale constant and digit count agree.
+    #[macros::test_all]
+    fn fee_scale_matches_digits() {
+        assert_eq!(CCTP_FEE_SCALE, 10u128.pow(CCTP_FEE_SCALE_DIGITS));
+    }
 
     #[macros::test_all]
     fn evm_forward_hook_matches_config_hex() {
@@ -193,5 +363,56 @@ mod tests {
         // 1 * (10002) / 10000 = 1.0002 -> ceil -> 2.
         assert_eq!(add_fee_buffer(1), 2);
         assert_eq!(add_fee_buffer(0), 0);
+    }
+
+    #[macros::test_all]
+    fn parse_scaled_handles_integers_and_decimals() {
+        use serde_json::json;
+        // Integer bps "1" scaled by 9.
+        assert_eq!(parse_scaled(&json!("1"), 9).unwrap(), 1_000_000_000);
+        // Numeric (not string) integer.
+        assert_eq!(parse_scaled(&json!(2), 0).unwrap(), 2);
+        // Decimal bps "0.5" scaled by 9.
+        assert_eq!(parse_scaled(&json!("0.5"), 9).unwrap(), 500_000_000);
+        // Fraction longer than the scale is truncated.
+        assert_eq!(
+            parse_scaled(&json!("1.2345678915"), 9).unwrap(),
+            1_234_567_891
+        );
+        // Zero.
+        assert_eq!(parse_scaled(&json!("0"), 9).unwrap(), 0);
+    }
+
+    #[macros::test_all]
+    fn parse_fee_response_picks_finality_and_tier() {
+        // Recorded-shape Iris response: two finality tiers, each with a
+        // minimumFee (bps) and low/med/high forwardFee.
+        let body = r#"[
+            {"finalityThreshold":1000,"minimumFee":"1","forwardFee":{"low":"100","med":"150","high":"200"}},
+            {"finalityThreshold":2000,"minimumFee":"0","forwardFee":{"low":"50","med":"75","high":"100"}}
+        ]"#;
+
+        let fast = CctpFeeClient::parse_fee_response(body, 1000).unwrap();
+        assert_eq!(fast.bps_units, 1_000_000_000); // 1 bps scaled by 10^9
+        assert_eq!(fast.forward_fee, 150); // med tier
+
+        let standard = CctpFeeClient::parse_fee_response(body, 2000).unwrap();
+        assert_eq!(standard.bps_units, 0);
+        assert_eq!(standard.forward_fee, 75);
+    }
+
+    #[macros::test_all]
+    fn parse_fee_response_missing_finality_errors() {
+        let body = r#"[{"finalityThreshold":2000,"minimumFee":"0","forwardFee":{"low":"1","med":"2","high":"3"}}]"#;
+        assert!(CctpFeeClient::parse_fee_response(body, 1000).is_err());
+    }
+
+    #[macros::test_all]
+    fn parse_fee_response_forwarded_fee_with_numeric_values() {
+        // minimumFee / forwardFee can arrive as JSON numbers, not strings.
+        let body = r#"[{"finalityThreshold":1000,"minimumFee":0.5,"forwardFee":{"low":10,"med":20,"high":30}}]"#;
+        let fee = CctpFeeClient::parse_fee_response(body, 1000).unwrap();
+        assert_eq!(fee.bps_units, 500_000_000);
+        assert_eq!(fee.forward_fee, 20);
     }
 }
