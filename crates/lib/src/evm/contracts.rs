@@ -203,6 +203,21 @@ sol! {
         uint256 amountSentLD,
         uint256 amountReceivedLD
     );
+
+    /// Circle CCTP v2 `MessageTransmitter` event. Emitted once per
+    /// `depositForBurn`; `message` is the full CCTP message whose burn body
+    /// carries the burned amount and (on the destination) the executed fee.
+    event MessageSent(bytes message);
+
+    /// Circle CCTP v2 `TokenMinter` event on the destination chain.
+    /// `mintRecipient` and `mintToken` are indexed; `amount` and
+    /// `feeCollected` are in data. The authoritative delivered amount.
+    event MintAndWithdraw(
+        address indexed mintRecipient,
+        uint256 amount,
+        address indexed mintToken,
+        uint256 feeCollected
+    );
 }
 
 /// Convert a Boltz encode API `QuoteCalldata` to a Router `Call`.
@@ -723,6 +738,11 @@ pub enum DeliveredAmountSource {
     /// by the mesh-appropriate source OFT contract and read
     /// `amountReceivedLD`.
     OftSent { oft_contract: Address },
+    /// Bridged delivery via Circle CCTP: find a `MessageSent` log emitted by
+    /// the `MessageTransmitter` and read the burned amount (less the executed
+    /// fee) from the burn-message body. This is a source-side estimate; the
+    /// authoritative amount is the destination `MintAndWithdraw`.
+    Cctp { message_transmitter: Address },
 }
 
 /// Result of decoding the delivered amount from a claim receipt's logs.
@@ -731,8 +751,12 @@ pub struct DeliveredAmount {
     /// Amount delivered on the destination chain (token base units).
     pub amount: u64,
     /// `LayerZero` message GUID as `0x`-prefixed hex, present only for
-    /// bridged swaps (`OFTSent` path).
+    /// bridged OFT swaps (`OFTSent` path).
     pub lz_guid: Option<String>,
+    /// Circle CCTP source domain, present only for CCTP swaps. The caller
+    /// synthesizes the guid `"<domain>:<source_tx_hash>"` (it needs the tx
+    /// hash, which is not available to the log decoder).
+    pub cctp_source_domain: Option<u32>,
 }
 
 /// Decode the delivered amount from a successful claim transaction's logs.
@@ -749,7 +773,69 @@ pub fn decode_delivered_from_logs(
             decode_arbitrum_transfer(logs, *token, *user)
         }
         DeliveredAmountSource::OftSent { oft_contract } => decode_oft_sent(logs, *oft_contract),
+        DeliveredAmountSource::Cctp {
+            message_transmitter,
+        } => decode_cctp_sent(logs, *message_transmitter),
     }
+}
+
+// CCTP v2 message byte offsets (Circle MessageV2.sol + BurnMessageV2.sol).
+// Outer header: sourceDomain (uint32) at byte 4; messageBody starts at 148.
+// Burn body: amount (uint256) at body+68, feeExecuted (uint256) at body+164.
+const CCTP_SOURCE_DOMAIN_OFFSET: usize = 4;
+const CCTP_BODY_OFFSET: usize = 148;
+const CCTP_BURN_AMOUNT_OFFSET: usize = CCTP_BODY_OFFSET + 68; // 216
+const CCTP_BURN_FEE_OFFSET: usize = CCTP_BODY_OFFSET + 164; // 312
+
+fn decode_cctp_sent(
+    logs: &[crate::evm::provider::LogEntry],
+    message_transmitter: Address,
+) -> Option<DeliveredAmount> {
+    let topic0 = format!("0x{}", hex::encode(MessageSent::SIGNATURE_HASH.as_slice()));
+
+    for log in logs {
+        if !addresses_equal(&log.address, &message_transmitter) {
+            continue;
+        }
+        if log.topics.first().is_none_or(|t| !topics_equal(t, &topic0)) {
+            continue;
+        }
+
+        // `MessageSent(bytes)` is non-indexed: data is abi.encode(bytes), i.e.
+        // the raw CCTP message with an offset+length prefix.
+        let data_bytes = parse_hex_bytes(&log.data).ok()?;
+        let message = <alloy_primitives::Bytes>::abi_decode(&data_bytes).ok()?;
+        let msg = message.as_ref();
+
+        let source_domain = read_u32_be(msg, CCTP_SOURCE_DOMAIN_OFFSET)?;
+        let amount = read_u256_be(msg, CCTP_BURN_AMOUNT_OFFSET)?;
+        let fee_executed = read_u256_be(msg, CCTP_BURN_FEE_OFFSET)?;
+        // feeExecuted is 0 at the source (the fee is taken on the destination),
+        // but guard anyway. Delivered estimate = burned amount - executed fee.
+        let delivered = amount.saturating_sub(fee_executed);
+        let amount_u64: u64 = delivered.try_into().ok()?;
+
+        return Some(DeliveredAmount {
+            amount: amount_u64,
+            lz_guid: None,
+            cctp_source_domain: Some(source_domain),
+        });
+    }
+    None
+}
+
+/// Read a big-endian `uint32` at `offset` from a raw byte message.
+fn read_u32_be(msg: &[u8], offset: usize) -> Option<u32> {
+    let end = offset.checked_add(4)?;
+    let slice = msg.get(offset..end)?;
+    Some(u32::from_be_bytes(slice.try_into().ok()?))
+}
+
+/// Read a big-endian `uint256` at `offset` from a raw byte message.
+fn read_u256_be(msg: &[u8], offset: usize) -> Option<U256> {
+    let end = offset.checked_add(32)?;
+    let slice = msg.get(offset..end)?;
+    Some(U256::from_be_slice(slice))
 }
 
 fn decode_arbitrum_transfer(
@@ -779,6 +865,7 @@ fn decode_arbitrum_transfer(
         return Some(DeliveredAmount {
             amount,
             lz_guid: None,
+            cctp_source_domain: None,
         });
     }
     None
@@ -812,6 +899,7 @@ fn decode_oft_sent(
         return Some(DeliveredAmount {
             amount,
             lz_guid: Some(format!("0x{guid_hex}")),
+            cctp_source_domain: None,
         });
     }
     None
@@ -1412,6 +1500,69 @@ mod tests {
 
         assert_eq!(result.amount, 1_000_000);
         assert_eq!(result.lz_guid.as_deref(), Some(guid));
+    }
+
+    fn cctp_message_sent_topic() -> String {
+        format!("0x{}", hex::encode(MessageSent::SIGNATURE_HASH.as_slice()))
+    }
+
+    /// Build a synthetic CCTP message and its `MessageSent` log data:
+    /// `sourceDomain` at byte 4, burn `amount` at byte 216, `feeExecuted` at
+    /// byte 312.
+    fn cctp_message_sent_data(source_domain: u32, amount: u128, fee: u128) -> String {
+        let mut msg = vec![0u8; CCTP_BURN_FEE_OFFSET + 32];
+        msg[CCTP_SOURCE_DOMAIN_OFFSET..CCTP_SOURCE_DOMAIN_OFFSET + 4]
+            .copy_from_slice(&source_domain.to_be_bytes());
+        msg[CCTP_BURN_AMOUNT_OFFSET..CCTP_BURN_AMOUNT_OFFSET + 32]
+            .copy_from_slice(&U256::from(amount).to_be_bytes::<32>());
+        msg[CCTP_BURN_FEE_OFFSET..CCTP_BURN_FEE_OFFSET + 32]
+            .copy_from_slice(&U256::from(fee).to_be_bytes::<32>());
+        let encoded = alloy_primitives::Bytes::from(msg).abi_encode();
+        format!("0x{}", hex::encode(encoded))
+    }
+
+    const CCTP_MT: &str = "0x81D40F21F12A8F0E3252Bccb954D722d4c464B64";
+
+    #[macros::test_all]
+    fn test_decode_cctp_message_sent() {
+        let log = mk_log(
+            CCTP_MT,
+            vec![cctp_message_sent_topic()],
+            &cctp_message_sent_data(3, 1_000_000, 7),
+        );
+        let message_transmitter = parse_address(CCTP_MT).unwrap();
+        let result = decode_delivered_from_logs(
+            &[log],
+            &DeliveredAmountSource::Cctp {
+                message_transmitter,
+            },
+        )
+        .unwrap();
+
+        // Delivered estimate = burn amount - executed fee.
+        assert_eq!(result.amount, 1_000_000 - 7);
+        assert_eq!(result.cctp_source_domain, Some(3));
+        assert_eq!(result.lz_guid, None);
+    }
+
+    #[macros::test_all]
+    fn test_decode_cctp_ignores_wrong_emitter() {
+        let message_transmitter = parse_address(CCTP_MT).unwrap();
+        // Same event, but emitted by a different contract — must not match.
+        let log = mk_log(
+            USDT_TOKEN,
+            vec![cctp_message_sent_topic()],
+            &cctp_message_sent_data(3, 1_000_000, 0),
+        );
+        assert!(
+            decode_delivered_from_logs(
+                &[log],
+                &DeliveredAmountSource::Cctp {
+                    message_transmitter
+                }
+            )
+            .is_none()
+        );
     }
 
     #[macros::test_all]

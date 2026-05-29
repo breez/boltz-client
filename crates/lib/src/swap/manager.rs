@@ -5,14 +5,14 @@ use platform_utils::tokio;
 use tokio::sync::{Mutex, mpsc, watch};
 
 use crate::api::ws::{SwapStatusSubscriber, SwapStatusUpdate};
-use crate::config::ARBITRUM_USDT_ADDRESS;
+use crate::config::{ARBITRUM_USDT_ADDRESS, CCTP_MESSAGE_TRANSMITTER_V2};
 use crate::error::BoltzError;
 use crate::events::{BoltzSwapEvent, EventEmitter};
 use crate::evm::contracts::{
     DeliveredAmount, DeliveredAmountSource, decode_delivered_from_logs, parse_address,
 };
 use crate::evm::provider::TxReceipt;
-use crate::models::{BoltzSwap, BoltzSwapStatus};
+use crate::models::{BoltzSwap, BoltzSwapStatus, BridgeKind};
 use crate::recover;
 use crate::store::BoltzStorage;
 use crate::swap::reverse::{ReverseSwapExecutor, current_unix_timestamp};
@@ -610,9 +610,18 @@ fn apply_delivered_amount(
     };
 
     match decode_delivered_from_logs(&receipt.logs, &source) {
-        Some(DeliveredAmount { amount, lz_guid }) => {
+        Some(DeliveredAmount {
+            amount,
+            lz_guid,
+            cctp_source_domain,
+        }) => {
             swap.delivered_amount = Some(amount);
-            swap.lz_guid = lz_guid;
+            // CCTP guid needs the source tx hash (not available to the log
+            // decoder), so synthesize it here as "<domain>:<tx_hash>".
+            swap.lz_guid = match cctp_source_domain {
+                Some(domain) => Some(format!("{domain}:{tx_hash}")),
+                None => lz_guid,
+            };
         }
         None => {
             tracing::warn!(
@@ -629,6 +638,15 @@ fn delivered_source_for(
     executor: &ReverseSwapExecutor,
     swap: &BoltzSwap,
 ) -> Option<DeliveredAmountSource> {
+    // CCTP swaps emit a MessageSent log from the MessageTransmitter rather than
+    // an OFTSent / Transfer log; they are not in the OFT registry.
+    if swap.bridge_kind == BridgeKind::Cctp {
+        let message_transmitter = parse_address(CCTP_MESSAGE_TRANSMITTER_V2).ok()?;
+        return Some(DeliveredAmountSource::Cctp {
+            message_transmitter,
+        });
+    }
+
     let registry = &executor.chain_registry;
     if registry.is_source(&swap.destination_chain) {
         let token = parse_address(ARBITRUM_USDT_ADDRESS).ok()?;
