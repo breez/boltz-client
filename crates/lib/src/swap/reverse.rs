@@ -32,6 +32,7 @@ use crate::models::{
 use crate::recover::{self, RecoverableSwap};
 use crate::solana::ata::derive_ata;
 use crate::solana::rpc::SolanaRpcClient;
+use crate::store::BoltzStorage;
 
 /// Maximum claim retries (quote may go stale between encode and submit).
 const MAX_CLAIM_RETRIES: u32 = 5;
@@ -48,6 +49,10 @@ pub(crate) struct ReverseSwapExecutor {
     pub(crate) evm_provider: EvmProvider,
     pub(crate) chain_registry: Arc<ChainRegistry>,
     pub(crate) config: BoltzConfig,
+    /// Persistence handle, used to durably record the in-flight gas-sponsor
+    /// `call_id` mid-claim (between submission and confirmation) so a crash in
+    /// that window is recoverable on resume.
+    store: Arc<dyn BoltzStorage>,
     pub(crate) erc20swap_address: String,
     /// Used only when the destination chain is Solana, to query whether the
     /// recipient's Associated Token Account already exists. Always
@@ -69,6 +74,7 @@ impl ReverseSwapExecutor {
         evm_provider: EvmProvider,
         chain_registry: Arc<ChainRegistry>,
         config: BoltzConfig,
+        store: Arc<dyn BoltzStorage>,
         erc20swap_address: String,
         solana_rpc: SolanaRpcClient,
     ) -> Self {
@@ -79,6 +85,7 @@ impl ReverseSwapExecutor {
             evm_provider,
             chain_registry,
             config,
+            store,
             erc20swap_address,
             solana_rpc,
             ata_cache: Mutex::new(HashSet::new()),
@@ -418,6 +425,7 @@ impl ReverseSwapExecutor {
             timeout_block_height: resp.timeout_block_height,
             lockup_tx_id: None,
             claim_tx_hash: None,
+            pending_call_id: None,
             delivered_amount: None,
             lz_guid: None,
             created_at: now,
@@ -566,6 +574,7 @@ impl ReverseSwapExecutor {
             timeout_block_height: timelock,
             lockup_tx_id: Some(recoverable.lockup_tx_hash.clone()),
             claim_tx_hash: None,
+            pending_call_id: None,
             delivered_amount: None,
             lz_guid: None,
             created_at: now,
@@ -1284,6 +1293,12 @@ impl ReverseSwapExecutor {
     }
 
     /// Submit encoded calldata via Alchemy gas abstraction.
+    ///
+    /// Submission and confirmation are split so the gas-sponsor `call_id` can
+    /// be durably persisted in the window between them: if the process dies
+    /// after `wallet_sendPreparedCalls` but before the confirming poll, the
+    /// claim still mines, and on resume the manager re-polls the persisted
+    /// `call_id` to recover the tx hash instead of trusting the WS event.
     async fn submit_claim(
         &self,
         swap: &BoltzSwap,
@@ -1296,10 +1311,18 @@ impl ReverseSwapExecutor {
             data: Some(format!("0x{}", hex::encode(calldata))),
         };
 
-        let result = self
+        let call_id = self
             .alchemy_client
-            .send_sponsored_calls(vec![evm_call], swap.chain_id)
+            .submit_calls(vec![evm_call], swap.chain_id)
             .await?;
+
+        // Durably record the in-flight call_id before polling. Best-effort:
+        // a persistence failure only forfeits the resume optimization (the
+        // on-chain rescan fallback still applies), so it must not abort the
+        // claim.
+        self.persist_pending_call_id(&swap.id, &call_id).await;
+
+        let result = self.alchemy_client.poll_call_status(&call_id).await?;
 
         tracing::info!(
             tx_hash = result.tx_hash,
@@ -1307,6 +1330,33 @@ impl ReverseSwapExecutor {
             "Claim submitted"
         );
         Ok(result.tx_hash)
+    }
+
+    /// Persist the in-flight gas-sponsor `call_id` onto the stored swap.
+    /// Best-effort — logs and swallows errors.
+    async fn persist_pending_call_id(&self, swap_id: &str, call_id: &str) {
+        match self.store.get_swap(swap_id).await {
+            Ok(Some(mut s)) => {
+                s.pending_call_id = Some(call_id.to_string());
+                s.updated_at = current_unix_timestamp();
+                if let Err(e) = self.store.update_swap(&s).await {
+                    tracing::warn!(swap_id, error = %e, "Failed to persist pending call_id");
+                }
+            }
+            Ok(None) => {
+                tracing::warn!(swap_id, "Swap missing while persisting pending call_id");
+            }
+            Err(e) => {
+                tracing::warn!(swap_id, error = %e, "Failed to load swap for pending call_id");
+            }
+        }
+    }
+
+    /// Recover the claim tx hash for a previously persisted gas-sponsor
+    /// `call_id` by re-polling `wallet_getCallsStatus`. Used on resume when a
+    /// swap is mid-claim with no tx hash yet recorded.
+    pub(crate) async fn poll_pending_call(&self, call_id: &str) -> Result<String, BoltzError> {
+        Ok(self.alchemy_client.poll_call_status(call_id).await?.tx_hash)
     }
 
     // ─── OFT fee estimation (for prepare-time quoting) ─────────────────

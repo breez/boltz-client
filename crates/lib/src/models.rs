@@ -50,6 +50,13 @@ pub struct BoltzSwap {
     // Results
     pub lockup_tx_id: Option<String>,
     pub claim_tx_hash: Option<String>,
+    /// Gas-sponsor `call_id` for an in-flight claim, persisted right after
+    /// `wallet_sendPreparedCalls` and before the confirming poll. If the
+    /// process dies in that window the claim still mines, but the tx hash is
+    /// not yet known locally; on resume the manager re-polls this `call_id` to
+    /// recover the tx hash (and verify on-chain) instead of trusting the WS
+    /// `invoice.settled` event. Cleared once `claim_tx_hash` is persisted.
+    pub pending_call_id: Option<String>,
     /// Actual USDT amount delivered on the destination chain (6 decimals).
     /// `None` until the claim receipt is processed. For bridged destinations
     /// this is the OFT `amountReceivedLD`; for Arbitrum delivery it's the
@@ -365,6 +372,7 @@ mod tests {
             timeout_block_height: 123_456,
             lockup_tx_id: None,
             claim_tx_hash: None,
+            pending_call_id: None,
             delivered_amount: None,
             lz_guid: None,
             created_at: 1_700_000_000,

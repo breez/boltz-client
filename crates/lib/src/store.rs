@@ -120,6 +120,7 @@ mod tests {
             timeout_block_height: 123_456,
             lockup_tx_id: None,
             claim_tx_hash: None,
+            pending_call_id: None,
             delivered_amount: None,
             lz_guid: None,
             created_at: 1_700_000_000,
@@ -192,5 +193,29 @@ mod tests {
     async fn test_get_nonexistent_returns_none() {
         let store = MemoryBoltzStorage::new();
         assert!(store.get_swap("nonexistent").await.unwrap().is_none());
+    }
+
+    #[macros::async_test_all]
+    async fn test_pending_call_id_round_trips() {
+        let store = MemoryBoltzStorage::new();
+        let mut swap = test_swap("1", BoltzSwapStatus::Claiming);
+        assert!(swap.pending_call_id.is_none());
+        store.insert_swap(&swap).await.unwrap();
+
+        // Mid-claim: record the in-flight call_id.
+        swap.pending_call_id = Some("call_abc".to_string());
+        store.update_swap(&swap).await.unwrap();
+        assert_eq!(
+            store.get_swap("1").await.unwrap().unwrap().pending_call_id,
+            Some("call_abc".to_string())
+        );
+
+        // Confirmed: tx hash recorded, pending marker cleared.
+        swap.claim_tx_hash = Some("0xdeadbeef".to_string());
+        swap.pending_call_id = None;
+        store.update_swap(&swap).await.unwrap();
+        let final_swap = store.get_swap("1").await.unwrap().unwrap();
+        assert_eq!(final_swap.claim_tx_hash, Some("0xdeadbeef".to_string()));
+        assert!(final_swap.pending_call_id.is_none());
     }
 }

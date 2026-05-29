@@ -284,10 +284,20 @@ impl SwapManager {
                     if reached_terminal {
                         Self::cleanup_terminal(ws_subscriber, tracked_ids, swap_id).await;
                     }
+                } else if let Some(call_id) = swap.pending_call_id.clone() {
+                    // No tx hash recorded, but we have the gas-sponsor call_id:
+                    // recover the tx hash and verify the receipt on-chain
+                    // rather than trusting the WS event blindly.
+                    let reached_terminal =
+                        Self::resume_pending_call(executor, store, event_emitter, &swap, &call_id)
+                            .await;
+                    if reached_terminal {
+                        Self::cleanup_terminal(ws_subscriber, tracked_ids, swap_id).await;
+                    }
                 } else {
                     tracing::warn!(
                         swap_id,
-                        "No claim tx hash — cannot verify on-chain, trusting WS event"
+                        "No claim tx hash or pending call_id — cannot verify on-chain, trusting WS event"
                     );
                     update_swap_status(
                         &**store,
@@ -386,10 +396,57 @@ impl SwapManager {
     ) {
         if let Some(ref tx_hash) = swap.claim_tx_hash {
             let _ = Self::poll_receipt(executor, store, event_emitter, &swap.id, tx_hash).await;
+        } else if let Some(ref call_id) = swap.pending_call_id {
+            // Crash between gas-sponsor submission and confirmation: the claim
+            // was handed to the sponsor (and likely mined) but we never
+            // recorded a tx hash. Recover it directly from the call_id.
+            Self::resume_pending_call(executor, store, event_emitter, swap, call_id).await;
         } else {
             // Crash during Alchemy call: we set Claiming but never got a tx
             // hash back. Check on-chain if the claim went through anyway.
             Self::check_on_chain_and_retry(executor, store, event_emitter, swap).await;
+        }
+    }
+
+    /// Recover a mid-claim swap from its persisted gas-sponsor `call_id`:
+    /// re-poll for the tx hash, persist it (clearing `pending_call_id`), then
+    /// poll the receipt to reach a terminal state. Falls back to the on-chain
+    /// rescan if the `call_id` can't be resolved (e.g. the sponsor no longer
+    /// knows it). Returns `true` if a terminal state was reached.
+    async fn resume_pending_call(
+        executor: &ReverseSwapExecutor,
+        store: &Arc<dyn BoltzStorage>,
+        event_emitter: &EventEmitter,
+        swap: &BoltzSwap,
+        call_id: &str,
+    ) -> bool {
+        let swap_id = &swap.id;
+        match executor.poll_pending_call(call_id).await {
+            Ok(tx_hash) => {
+                tracing::info!(
+                    swap_id,
+                    tx_hash,
+                    "Recovered claim tx hash from pending call_id"
+                );
+                if let Ok(Some(mut s)) = store.get_swap(swap_id).await {
+                    s.claim_tx_hash = Some(tx_hash.clone());
+                    s.pending_call_id = None;
+                    s.updated_at = current_unix_timestamp();
+                    if let Err(e) = store.update_swap(&s).await {
+                        tracing::error!(swap_id, error = %e, "Failed to persist recovered tx hash");
+                    }
+                }
+                Self::poll_receipt(executor, store, event_emitter, swap_id, &tx_hash).await
+            }
+            Err(e) => {
+                tracing::warn!(
+                    swap_id,
+                    error = %e,
+                    "Could not recover tx hash from pending call_id, falling back to on-chain check"
+                );
+                Self::check_on_chain_and_retry(executor, store, event_emitter, swap).await;
+                false
+            }
         }
     }
 

@@ -128,6 +128,7 @@ impl BoltzService {
             evm_provider,
             chain_registry.clone(),
             config,
+            store.clone(),
             erc20swap_address,
             solana_rpc,
         ));

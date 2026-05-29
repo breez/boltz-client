@@ -59,22 +59,36 @@ impl AlchemyGasClient {
         }
     }
 
-    /// Submit a bundle of calls via Alchemy gas abstraction.
-    /// Handles first-time EIP-7702 delegation + `UserOp` signing.
-    /// Polls until confirmed or timeout. Returns tx hash.
+    /// Submit a bundle of calls via Alchemy gas abstraction in one shot
+    /// (submit + poll). Test-only convenience: the claim path drives
+    /// [`Self::submit_calls`] and [`Self::poll_call_status`] separately so it
+    /// can persist the `call_id` between the two.
+    #[cfg(test)]
     pub async fn send_sponsored_calls(
         &self,
         calls: Vec<EvmCall>,
         chain_id: u64,
     ) -> Result<AlchemyResult, BoltzError> {
+        let call_id = self.submit_calls(calls, chain_id).await?;
+        self.poll_call_status(&call_id).await
+    }
+
+    /// Prepare, sign, and send a bundle of calls, returning the gas-sponsor
+    /// `call_id` WITHOUT waiting for confirmation. Splitting submission from
+    /// polling lets the caller durably persist the `call_id` before the
+    /// confirming poll, so a crash in that window can resume by re-polling
+    /// instead of losing the claim tx reference. Pair with
+    /// [`Self::poll_call_status`].
+    pub(crate) async fn submit_calls(
+        &self,
+        calls: Vec<EvmCall>,
+        chain_id: u64,
+    ) -> Result<String, BoltzError> {
         // Step 1: wallet_prepareCalls
         let prepared = self.prepare_calls(&calls, chain_id).await?;
 
         // Step 2: Sign and send via wallet_sendPreparedCalls
-        let call_id = self.sign_and_send(prepared).await?;
-
-        // Step 3: Poll wallet_getCallsStatus until confirmed
-        self.poll_status(&call_id).await
+        self.sign_and_send(prepared).await
     }
 
     /// Step 1: `wallet_prepareCalls` — prepare calls for gas abstraction.
@@ -221,13 +235,17 @@ impl AlchemyGasClient {
         Ok(attach_signature(prepared, &sig))
     }
 
-    /// Step 3: Poll `wallet_getCallsStatus` until confirmed or timeout.
+    /// Poll `wallet_getCallsStatus` until confirmed or timeout. Also used on
+    /// resume to recover the tx hash for a previously persisted `call_id`.
     ///
     /// A transient RPC error on a single iteration does not abort the poll
     /// — it is stashed as `last_err` and only returned if every subsequent
     /// attempt also fails. A receipt with status `0x0` is a terminal revert
     /// and returns immediately.
-    async fn poll_status(&self, call_id: &str) -> Result<AlchemyResult, BoltzError> {
+    pub(crate) async fn poll_call_status(
+        &self,
+        call_id: &str,
+    ) -> Result<AlchemyResult, BoltzError> {
         let mut last_err: Option<BoltzError> = None;
 
         for attempt in 0..MAX_POLL_ATTEMPTS {
