@@ -824,6 +824,25 @@ fn decode_cctp_sent(
     None
 }
 
+/// Parse the **authoritative** delivered amount from an attested CCTP message
+/// (the `message` hex returned by Circle's Iris `/v2/messages`, NOT a log).
+///
+/// Unlike the source-chain `MessageSent` log — where `feeExecuted` is 0 — the
+/// attested message has the finalized `feeExecuted` filled in by Circle, so
+/// `delivered = burnAmount - feeExecuted` is exactly what gets minted on the
+/// destination. This is what lets the client report the real delivered amount
+/// without a destination-chain RPC. Returns `None` on a malformed/short
+/// message or if the fee exceeds the amount.
+pub fn decode_cctp_delivered_from_message(message_hex: &str) -> Option<u64> {
+    let msg = parse_hex_bytes(message_hex).ok()?;
+    let amount = read_u256_be(&msg, CCTP_BURN_AMOUNT_OFFSET)?;
+    let fee = read_u256_be(&msg, CCTP_BURN_FEE_OFFSET)?;
+    if fee > amount {
+        return None;
+    }
+    amount.saturating_sub(fee).try_into().ok()
+}
+
 /// Read a big-endian `uint32` at `offset` from a raw byte message.
 fn read_u32_be(msg: &[u8], offset: usize) -> Option<u32> {
     let end = offset.checked_add(4)?;
@@ -1543,6 +1562,26 @@ mod tests {
         assert_eq!(result.amount, 1_000_000 - 7);
         assert_eq!(result.cctp_source_domain, Some(3));
         assert_eq!(result.lz_guid, None);
+    }
+
+    #[macros::test_all]
+    fn test_decode_cctp_delivered_from_attested_message() {
+        // Build a raw attested message: amount 1_000_000 at byte 216, the
+        // finalized feeExecuted 250 at byte 312. Unlike the source log, the
+        // attested message carries the real fee, so delivered = 999_750.
+        let mut msg = vec![0u8; CCTP_BURN_FEE_OFFSET + 32];
+        msg[CCTP_BURN_AMOUNT_OFFSET..CCTP_BURN_AMOUNT_OFFSET + 32]
+            .copy_from_slice(&U256::from(1_000_000u64).to_be_bytes::<32>());
+        msg[CCTP_BURN_FEE_OFFSET..CCTP_BURN_FEE_OFFSET + 32]
+            .copy_from_slice(&U256::from(250u64).to_be_bytes::<32>());
+        let message_hex = format!("0x{}", hex::encode(&msg));
+
+        assert_eq!(
+            decode_cctp_delivered_from_message(&message_hex),
+            Some(1_000_000 - 250)
+        );
+        // Malformed/short message yields None.
+        assert_eq!(decode_cctp_delivered_from_message("0x1234"), None);
     }
 
     #[macros::test_all]

@@ -280,11 +280,21 @@ impl CctpFeeClient {
         let Some(msg) = parsed.messages.into_iter().next() else {
             return Ok(CctpMessageStatus::default());
         };
+        // The authoritative delivered amount comes from the attested message's
+        // finalized feeExecuted; filled in by the caller (which owns the
+        // message decoder) when `message` is present.
+        let delivered_amount = msg
+            .message
+            .as_deref()
+            .and_then(crate::evm::contracts::decode_cctp_delivered_from_message);
+
         Ok(CctpMessageStatus {
             found: true,
             status: msg.status,
             attestation: msg.attestation,
             forward_tx_hash: msg.forward_tx_hash,
+            message: msg.message,
+            delivered_amount,
         })
     }
 
@@ -339,9 +349,15 @@ pub struct CctpMessageStatus {
     /// Attestation signature, present once the message is attested.
     pub attestation: Option<String>,
     /// Forwarding-service tx hash on the destination chain, present once the
-    /// forward (mint) has been submitted. The destination `MintAndWithdraw` in
-    /// this tx carries the authoritative delivered amount.
+    /// forward (mint) has been submitted.
     pub forward_tx_hash: Option<String>,
+    /// The attested CCTP message hex, present once attested. Its burn body
+    /// carries the finalized `feeExecuted`, from which the authoritative
+    /// delivered amount is derived.
+    pub message: Option<String>,
+    /// Authoritative delivered amount (burn amount minus the finalized CCTP
+    /// fee), parsed from `message`. Present only once attested.
+    pub delivered_amount: Option<u64>,
 }
 
 impl CctpMessageStatus {
@@ -367,6 +383,8 @@ struct CctpMessageSnapshot {
     attestation: Option<String>,
     #[serde(default, rename = "forwardTxHash")]
     forward_tx_hash: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -571,6 +589,24 @@ mod tests {
         let s = CctpFeeClient::parse_message_status(r#"{"messages":[]}"#).unwrap();
         assert!(!s.found);
         assert!(!s.is_forwarded());
+    }
+
+    #[macros::test_all]
+    fn parse_message_status_derives_delivered_from_attested_message() {
+        // Attested message: burn amount at byte 216, finalized feeExecuted at
+        // byte 312. delivered = amount - fee.
+        let mut msg = vec![0u8; 344];
+        msg[216..248].copy_from_slice(&[0u8; 32]);
+        msg[244..248].copy_from_slice(&1_000_000u32.to_be_bytes()); // amount = 1_000_000
+        msg[340..344].copy_from_slice(&250u32.to_be_bytes()); // feeExecuted = 250
+        let message_hex = format!("0x{}", hex::encode(&msg));
+        let body = format!(
+            r#"{{"messages":[{{"status":"complete","attestation":"0xabcd","forwardTxHash":"0xdead","message":"{message_hex}"}}]}}"#
+        );
+
+        let s = CctpFeeClient::parse_message_status(&body).unwrap();
+        assert_eq!(s.message.as_deref(), Some(message_hex.as_str()));
+        assert_eq!(s.delivered_amount, Some(1_000_000 - 250));
     }
 
     #[macros::test_all]

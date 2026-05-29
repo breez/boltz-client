@@ -198,10 +198,24 @@ impl BoltzService {
         if swap.bridge_kind != BridgeKind::Cctp {
             return Ok(None);
         }
-        let Some(guid) = swap.lz_guid else {
+        let Some(ref guid) = swap.lz_guid else {
             return Ok(None);
         };
-        Ok(Some(self.executor.cctp_delivery_status(&guid).await?))
+        let status = self.executor.cctp_delivery_status(guid).await?;
+
+        // Once Circle has attested the message, its finalized feeExecuted gives
+        // the authoritative delivered amount (no destination RPC needed).
+        // Persist it over the source-side burn estimate set at completion.
+        if let Some(delivered) = status.delivered_amount
+            && swap.delivered_amount != Some(delivered)
+        {
+            let mut updated = swap;
+            updated.delivered_amount = Some(delivered);
+            updated.updated_at = swap::reverse::current_unix_timestamp();
+            self.store.update_swap(&updated).await?;
+        }
+
+        Ok(Some(status))
     }
 
     /// Shut down the swap manager and close the WebSocket connection.
