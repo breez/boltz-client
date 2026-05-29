@@ -121,6 +121,11 @@ impl BoltzService {
             config.solana_rpc_url.clone(),
         );
 
+        let cctp_fee_client = crate::evm::cctp::CctpFeeClient::new(
+            Box::new(DefaultHttpClient::new(None)),
+            config.cctp_api_url.clone(),
+        );
+
         let executor = Arc::new(ReverseSwapExecutor::new(
             api_client,
             key_manager,
@@ -129,6 +134,7 @@ impl BoltzService {
             chain_registry.clone(),
             config,
             store.clone(),
+            cctp_fee_client,
             erc20swap_address,
             solana_rpc,
         ));

@@ -97,6 +97,26 @@ pub fn compute_total_fee(amount: u128, bps_units: u128, forward_fee: u128) -> u1
         .saturating_add(forward_fee)
 }
 
+/// Invert the burn fee: the USDC amount the DEX must produce so that, after
+/// the CCTP fee is deducted from the burn, at least `target` arrives on the
+/// destination. Solves `burn * (denom - bps_units) / denom - forward_fee >=
+/// target` for `burn`, rounding up. Used at prepare time to size the swap.
+#[must_use]
+pub fn cctp_required_burn(target: u128, fee: &CctpFee) -> u128 {
+    let net = CCTP_FEE_BPS_DENOMINATOR.saturating_sub(fee.bps_units);
+    if net == 0 {
+        return u128::MAX;
+    }
+    let numerator = target
+        .saturating_add(fee.forward_fee)
+        .saturating_mul(CCTP_FEE_BPS_DENOMINATOR);
+    // Ceiling division so we never under-size the burn.
+    numerator
+        .saturating_add(net.saturating_sub(1))
+        .checked_div(net)
+        .unwrap_or(u128::MAX)
+}
+
 /// Add the `maxFee` cushion (`CCTP_MAX_FEE_BUFFER_BPS`) on top of the quoted
 /// fee, rounding up, so fee movement between prepare and claim doesn't make the
 /// burn revert. This is a fee cap, NOT user slippage.
@@ -363,6 +383,30 @@ mod tests {
         // 1 * (10002) / 10000 = 1.0002 -> ceil -> 2.
         assert_eq!(add_fee_buffer(1), 2);
         assert_eq!(add_fee_buffer(0), 0);
+    }
+
+    #[macros::test_all]
+    fn cctp_required_burn_covers_target_plus_fee() {
+        // 1 bps protocol + flat forward fee of 50, target 1_000_000.
+        let fee = CctpFee {
+            bps_units: 1_000_000_000, // 1 bps scaled
+            forward_fee: 50,
+        };
+        let burn = cctp_required_burn(1_000_000, &fee);
+        // Burning `burn` and deducting the fee must leave >= target.
+        let actual_fee = compute_total_fee(burn, fee.bps_units, fee.forward_fee);
+        assert!(burn.saturating_sub(actual_fee) >= 1_000_000);
+        // ...and not be wildly over-sized (within fee + 1 of target).
+        assert!(burn <= 1_000_000 + actual_fee + 1);
+    }
+
+    #[macros::test_all]
+    fn cctp_required_burn_zero_fee_is_target() {
+        let fee = CctpFee {
+            bps_units: 0,
+            forward_fee: 0,
+        };
+        assert_eq!(cctp_required_burn(1_000_000, &fee), 1_000_000);
     }
 
     #[macros::test_all]

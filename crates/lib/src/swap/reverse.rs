@@ -8,14 +8,17 @@ use crate::api::BoltzApiClient;
 use crate::api::types::{EncodeRequest, QuoteResponse, ReversePairInfo};
 use crate::config::{
     ARBITRUM_ERC20SWAP_DEPLOY_BLOCK, ARBITRUM_ROUTER_ADDRESS, ARBITRUM_TBTC_ADDRESS,
-    ARBITRUM_USDT_ADDRESS, BoltzConfig, MAX_SLIPPAGE_BPS, POLYGON_EVM_CHAIN_ID,
+    ARBITRUM_USDC_ADDRESS, ARBITRUM_USDT_ADDRESS, BoltzConfig, CCTP_ARBITRUM_DOMAIN,
+    CCTP_FINALITY_FAST, CCTP_TOKEN_MESSENGER_V2, MAX_SLIPPAGE_BPS, POLYGON_EVM_CHAIN_ID,
     PROBE_INVOICE_EXPIRY_SECS, SATS_TO_TBTC_FACTOR, SOLANA_USDT0_MINT, ZERO_ADDRESS,
 };
 use crate::error::BoltzError;
 use crate::evm::alchemy::{AlchemyGasClient, EvmCall};
+use crate::evm::cctp::{self, CctpFeeClient};
 use crate::evm::contracts::{
-    self, ClaimSendAuthorization, Erc20Claim, SendData, encode_claim_erc20_execute,
-    encode_claim_erc20_execute_oft, parse_address, quote_calldata_to_call,
+    self, CctpData, ClaimCctpAuthorization, ClaimSendAuthorization, Erc20Claim, SendData,
+    encode_claim_erc20_execute, encode_claim_erc20_execute_cctp, encode_claim_erc20_execute_oft,
+    hash_cctp_data, parse_address, quote_calldata_to_call,
 };
 use crate::evm::lz_options::build_extra_options;
 use crate::evm::oft::legacy_mesh_source_amount;
@@ -26,8 +29,8 @@ use crate::evm::recipient::{
 use crate::evm::signing::EvmSigner;
 use crate::keys::EvmKeyManager;
 use crate::models::{
-    BoltzSwap, BoltzSwapStatus, BridgeKind, ChainId, ChainRegistry, ChainSpec, NetworkTransport,
-    PreparedSwap, SwapLimits, Usdt0Kind,
+    BoltzSwap, BoltzSwapStatus, BridgeKind, CctpDestination, ChainId, ChainRegistry, ChainSpec,
+    NetworkTransport, PreparedSwap, SwapLimits, Usdt0Kind, cctp_destination,
 };
 use crate::recover::{self, RecoverableSwap};
 use crate::solana::ata::derive_ata;
@@ -53,6 +56,9 @@ pub(crate) struct ReverseSwapExecutor {
     /// `call_id` mid-claim (between submission and confirmation) so a crash in
     /// that window is recoverable on resume.
     store: Arc<dyn BoltzStorage>,
+    /// Circle Iris fee client, used to quote the CCTP burn fee for USDC
+    /// destinations at prepare and claim time.
+    cctp_fee_client: CctpFeeClient,
     pub(crate) erc20swap_address: String,
     /// Used only when the destination chain is Solana, to query whether the
     /// recipient's Associated Token Account already exists. Always
@@ -75,6 +81,7 @@ impl ReverseSwapExecutor {
         chain_registry: Arc<ChainRegistry>,
         config: BoltzConfig,
         store: Arc<dyn BoltzStorage>,
+        cctp_fee_client: CctpFeeClient,
         erc20swap_address: String,
         solana_rpc: SolanaRpcClient,
     ) -> Self {
@@ -86,6 +93,7 @@ impl ReverseSwapExecutor {
             chain_registry,
             config,
             store,
+            cctp_fee_client,
             erc20swap_address,
             solana_rpc,
             ata_cache: Mutex::new(HashSet::new()),
@@ -132,6 +140,13 @@ impl ReverseSwapExecutor {
         max_slippage_bps: Option<u32>,
     ) -> Result<PreparedSwap, BoltzError> {
         let slippage_bps = resolve_slippage_bps(max_slippage_bps, self.config.slippage_bps)?;
+
+        // USDC destinations bridge via CCTP rather than the USDT0 OFT mesh.
+        if let Some(dest) = cctp_destination(&chain) {
+            return self
+                .prepare_cctp(destination, chain, dest, usdt_amount, slippage_bps)
+                .await;
+        }
 
         let spec = self.resolve_destination(&chain)?;
         self.validate_destination(spec, destination)?;
@@ -209,6 +224,176 @@ impl ReverseSwapExecutor {
         })
     }
 
+    /// Prepare a USDC (CCTP) reverse swap quote for `target_usdc` delivered on
+    /// the destination chain. The Arbitrum leg is a single DEX trade tBTC ->
+    /// USDC; the Router then burns that USDC via CCTP. The burn fee is deducted
+    /// from the burned amount, so the DEX must produce `target + fee` USDC.
+    async fn prepare_cctp(
+        &self,
+        destination: &str,
+        chain: ChainId,
+        dest: &CctpDestination,
+        target_usdc: u64,
+        slippage_bps: u32,
+    ) -> Result<PreparedSwap, BoltzError> {
+        if !is_valid_destination_address(dest.transport, destination) {
+            return Err(BoltzError::Generic(format!(
+                "Invalid destination address '{destination}' for {}",
+                dest.asset
+            )));
+        }
+
+        let tbtc_pair = self.fetch_tbtc_pair().await?;
+
+        // Quote the CCTP burn fee and invert it to the USDC the DEX must
+        // produce so `target_usdc` survives the burn.
+        let fee = self
+            .cctp_fee_client
+            .get_fee(CCTP_ARBITRUM_DOMAIN, dest.domain, CCTP_FINALITY_FAST)
+            .await?;
+        let required_burn = cctp::cctp_required_burn(u128::from(target_usdc), &fee);
+        let required_burn_u64 = u64::try_from(required_burn)
+            .map_err(|_| BoltzError::Generic("USDC burn amount overflow".into()))?;
+
+        let tbtc_wei = self
+            .fetch_quote_out_tbtc_for_token(required_burn_u64, ARBITRUM_USDC_ADDRESS)
+            .await?;
+        let total_tbtc_sats = tbtc_wei_to_sats_u64(tbtc_wei)?;
+
+        let fee_calc = compute_invoice_amount(&tbtc_pair, total_tbtc_sats)?;
+        if fee_calc.invoice_sats < tbtc_pair.limits.minimal
+            || fee_calc.invoice_sats > tbtc_pair.limits.maximal
+        {
+            return Err(BoltzError::AmountOutOfRange {
+                amount: fee_calc.invoice_sats,
+                min: tbtc_pair.limits.minimal,
+                max: tbtc_pair.limits.maximal,
+            });
+        }
+
+        let now = current_unix_timestamp();
+        Ok(PreparedSwap {
+            destination_address: destination.to_string(),
+            destination_chain: chain,
+            bridge_kind: BridgeKind::Cctp,
+            usdt_amount: target_usdc,
+            invoice_amount_sats: fee_calc.invoice_sats,
+            boltz_fee_sats: fee_calc.boltz_fee_sats,
+            estimated_onchain_amount: fee_calc.onchain_sats,
+            slippage_bps,
+            pair_hash: tbtc_pair.hash.clone(),
+            expires_at: now.saturating_add(60),
+        })
+    }
+
+    /// DEX quote: tBTC (EVM units) needed to buy `amount` of `token_in`
+    /// (Arbitrum USDT or USDC), "out" direction (least tBTC for the output).
+    async fn fetch_quote_out_tbtc_for_token(
+        &self,
+        amount: u64,
+        token_in: &str,
+    ) -> Result<u128, BoltzError> {
+        let quotes = self
+            .api_client
+            .get_quote_out("ARB", ARBITRUM_TBTC_ADDRESS, token_in, u128::from(amount))
+            .await?;
+        let quote = pick_best_quote(&quotes, QuoteDirection::Out)?;
+        if quote == 0 {
+            return Err(BoltzError::InvalidQuote(
+                "DEX quote returned zero tBTC".to_string(),
+            ));
+        }
+        Ok(quote)
+    }
+
+    /// DEX quote: amount of `token_out` (Arbitrum USDT or USDC) that
+    /// `tbtc_evm_units` of tBTC buys, "in" direction.
+    async fn fetch_quote_in_for_token(
+        &self,
+        tbtc_evm_units: u128,
+        token_out: &str,
+    ) -> Result<u128, BoltzError> {
+        let quotes = self
+            .api_client
+            .get_quote_in("ARB", ARBITRUM_TBTC_ADDRESS, token_out, tbtc_evm_units)
+            .await?;
+        let amount = pick_best_quote(&quotes, QuoteDirection::In)?;
+        if amount == 0 {
+            return Err(BoltzError::InvalidQuote(
+                "DEX quote returned zero output".to_string(),
+            ));
+        }
+        Ok(amount)
+    }
+
+    /// CCTP variant of [`Self::prepare_from_sats`]: forward-quote tBTC -> USDC,
+    /// then subtract the CCTP burn fee to get the delivered amount.
+    async fn prepare_cctp_from_sats(
+        &self,
+        destination: &str,
+        chain: ChainId,
+        dest: &CctpDestination,
+        invoice_amount_sats: u64,
+        slippage_bps: u32,
+    ) -> Result<PreparedSwap, BoltzError> {
+        if !is_valid_destination_address(dest.transport, destination) {
+            return Err(BoltzError::Generic(format!(
+                "Invalid destination address '{destination}' for {}",
+                dest.asset
+            )));
+        }
+
+        let tbtc_pair = self.fetch_tbtc_pair().await?;
+        if invoice_amount_sats < tbtc_pair.limits.minimal
+            || invoice_amount_sats > tbtc_pair.limits.maximal
+        {
+            return Err(BoltzError::AmountOutOfRange {
+                amount: invoice_amount_sats,
+                min: tbtc_pair.limits.minimal,
+                max: tbtc_pair.limits.maximal,
+            });
+        }
+
+        let fee_calc = compute_onchain_amount(&tbtc_pair, invoice_amount_sats)?;
+        let tbtc_evm_units = u128::from(fee_calc.onchain_sats)
+            .checked_mul(u128::from(SATS_TO_TBTC_FACTOR))
+            .ok_or_else(|| BoltzError::Generic("tBTC amount overflow".into()))?;
+
+        // USDC the DEX produces on Arbitrum (the amount that gets burned).
+        let burn_usdc = self
+            .fetch_quote_in_for_token(tbtc_evm_units, ARBITRUM_USDC_ADDRESS)
+            .await?;
+
+        // Delivered on the destination = burn - CCTP fee.
+        let fee = self
+            .cctp_fee_client
+            .get_fee(CCTP_ARBITRUM_DOMAIN, dest.domain, CCTP_FINALITY_FAST)
+            .await?;
+        let total_fee = cctp::compute_total_fee(burn_usdc, fee.bps_units, fee.forward_fee);
+        let delivered = burn_usdc.saturating_sub(total_fee);
+        if delivered == 0 {
+            return Err(BoltzError::Generic(
+                "Amount too small to cover the CCTP burn fee".into(),
+            ));
+        }
+        let usdt_output = u64::try_from(delivered)
+            .map_err(|_| BoltzError::Generic("USDC amount overflow".into()))?;
+
+        let now = current_unix_timestamp();
+        Ok(PreparedSwap {
+            destination_address: destination.to_string(),
+            destination_chain: chain,
+            bridge_kind: BridgeKind::Cctp,
+            usdt_amount: usdt_output,
+            invoice_amount_sats,
+            boltz_fee_sats: fee_calc.boltz_fee_sats,
+            estimated_onchain_amount: fee_calc.onchain_sats,
+            slippage_bps,
+            pair_hash: tbtc_pair.hash.clone(),
+            expires_at: now.saturating_add(60),
+        })
+    }
+
     /// Prepare a reverse swap quote starting from input sats.
     ///
     /// Walks the route forward:
@@ -231,6 +416,12 @@ impl ReverseSwapExecutor {
         max_slippage_bps: Option<u32>,
     ) -> Result<PreparedSwap, BoltzError> {
         let slippage_bps = resolve_slippage_bps(max_slippage_bps, self.config.slippage_bps)?;
+
+        if let Some(dest) = cctp_destination(&chain) {
+            return self
+                .prepare_cctp_from_sats(destination, chain, dest, invoice_amount_sats, slippage_bps)
+                .await;
+        }
 
         let spec = self.resolve_destination(&chain)?;
         self.validate_destination(spec, destination)?;
@@ -715,7 +906,12 @@ impl ReverseSwapExecutor {
             .fetch_erc20swap_version(&swap.erc20swap_address)
             .await?;
 
-        let addrs = ClaimAddresses::parse(swap, &self.chain_registry)?;
+        // CCTP swaps deliver USDC and aren't in the USDT0 OFT registry, so
+        // resolve their addresses without it.
+        let addrs = match swap.bridge_kind {
+            BridgeKind::Cctp => ClaimAddresses::parse_cctp(swap)?,
+            BridgeKind::Oft => ClaimAddresses::parse(swap, &self.chain_registry)?,
+        };
         let tbtc_evm_amount = U256::from(swap.onchain_amount)
             .checked_mul(U256::from(SATS_TO_TBTC_FACTOR))
             .ok_or_else(|| BoltzError::Generic("tBTC EVM amount overflow".into()))?;
@@ -809,7 +1005,19 @@ impl ReverseSwapExecutor {
         timelock: U256,
         skip_drift_check: bool,
     ) -> Result<String, BoltzError> {
-        if self.chain_registry.is_source(&swap.destination_chain) {
+        if swap.bridge_kind == BridgeKind::Cctp {
+            self.try_claim_cctp(
+                swap,
+                gas_signer,
+                erc20swap_version,
+                preimage,
+                addrs,
+                tbtc_evm_amount,
+                timelock,
+                skip_drift_check,
+            )
+            .await
+        } else if self.chain_registry.is_source(&swap.destination_chain) {
             self.try_claim_same_chain(
                 swap,
                 gas_signer,
@@ -955,6 +1163,204 @@ impl ReverseSwapExecutor {
 
         self.submit_claim(swap, &swap.router_address.clone(), &calldata)
             .await
+    }
+
+    /// Cross-chain CCTP claim: claim tBTC + DEX swap to USDC + CCTP burn to the
+    /// destination chain, all in one atomic Router call.
+    ///
+    /// End-to-end slippage: `delivered = burn - cctpFee`. The Router enforces a
+    /// floor (`minAmount`) on the USDC available to burn after the DEX calls;
+    /// we set `minAmount = delivered_floor + maxFee` so that, since the burn
+    /// deducts at most `maxFee`, the delivered amount stays at or above the
+    /// single end-to-end floor anchored on the prepare-time expected amount.
+    #[expect(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn try_claim_cctp(
+        &self,
+        swap: &BoltzSwap,
+        gas_signer: &EvmSigner,
+        erc20swap_version: &str,
+        preimage: &[u8; 32],
+        addrs: &ClaimAddresses,
+        tbtc_evm_amount: U256,
+        timelock: U256,
+        skip_drift_check: bool,
+    ) -> Result<String, BoltzError> {
+        let dest = cctp_destination(&swap.destination_chain).ok_or_else(|| {
+            BoltzError::Generic(format!(
+                "Unknown CCTP destination '{}' for swap {}",
+                swap.destination_chain, swap.id
+            ))
+        })?;
+
+        let amount_in: u128 = tbtc_evm_amount
+            .try_into()
+            .map_err(|_| BoltzError::Generic("tBTC amount too large".into()))?;
+
+        // DEX quote: tBTC -> Arbitrum USDC.
+        let quotes = self
+            .api_client
+            .get_quote_in(
+                "ARB",
+                ARBITRUM_TBTC_ADDRESS,
+                ARBITRUM_USDC_ADDRESS,
+                amount_in,
+            )
+            .await?;
+        let best = pick_best_quote_with_data(&quotes, QuoteDirection::In)?;
+        if best.amount == 0 {
+            return Err(BoltzError::InvalidQuote(
+                "DEX quote returned zero USDC".into(),
+            ));
+        }
+        let raw_quote_usdc = best.amount;
+
+        // Re-quote the CCTP burn fee at claim time and cap it with a buffer.
+        let fee = self
+            .cctp_fee_client
+            .get_fee(CCTP_ARBITRUM_DOMAIN, dest.domain, CCTP_FINALITY_FAST)
+            .await?;
+        let max_fee = cctp::add_fee_buffer(cctp::compute_total_fee(
+            raw_quote_usdc,
+            fee.bps_units,
+            fee.forward_fee,
+        ));
+
+        // The amount that would actually land on the destination = burn - fee.
+        let net_quote = raw_quote_usdc.saturating_sub(max_fee);
+        if !skip_drift_check {
+            check_quote_drift(swap.expected_usdt_amount, net_quote, swap.slippage_bps)?;
+        }
+        let delivered_floor = compute_claim_floor(
+            net_quote,
+            swap.expected_usdt_amount,
+            swap.slippage_bps,
+            skip_drift_check,
+        );
+        if delivered_floor == 0 {
+            return Err(BoltzError::Generic(
+                "Amount too small: slippage-adjusted minimum is zero".into(),
+            ));
+        }
+        // Floor the burn so that delivered (= burn - maxFee) >= delivered_floor.
+        let min_amount = delivered_floor
+            .checked_add(max_fee)
+            .ok_or_else(|| BoltzError::Generic("CCTP min amount overflow".into()))?;
+
+        // Encode the DEX trade routing the USDC output to the Router.
+        let encode_resp = self
+            .api_client
+            .encode_quote(
+                "ARB",
+                &EncodeRequest {
+                    recipient: addrs.router.to_string(),
+                    amount_in,
+                    amount_out_min: min_amount,
+                    data: best.data.clone(),
+                },
+            )
+            .await?;
+        let dex_calls: Vec<contracts::Call> = encode_resp
+            .calls
+            .iter()
+            .map(quote_calldata_to_call)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Build CctpData.
+        let token_messenger = parse_address(CCTP_TOKEN_MESSENGER_V2)?;
+        let mint_recipient = match dest.transport {
+            NetworkTransport::Evm => cctp::evm_mint_recipient(&swap.destination_address)?,
+            NetworkTransport::Solana => cctp::solana_mint_recipient(&swap.destination_address)?,
+            NetworkTransport::Tron => {
+                return Err(BoltzError::Generic(
+                    "CCTP does not support Tron destinations".into(),
+                ));
+            }
+        };
+        let hook_data = self.cctp_hook_data(dest, &swap.destination_address).await?;
+
+        let cctp_data = CctpData {
+            destinationDomain: dest.domain,
+            mintRecipient: mint_recipient,
+            destinationCaller: FixedBytes::<32>::ZERO,
+            maxFee: U256::from(max_fee),
+            minFinalityThreshold: CCTP_FINALITY_FAST,
+            hookData: hook_data.into(),
+        };
+
+        let typehash = self.fetch_typehash_cctp_data(&swap.router_address).await?;
+        let cctp_data_hash = hash_cctp_data(typehash, &cctp_data);
+
+        // Sign: the ERC20Swap cooperative claim (identical to OFT) + the Router
+        // ClaimCctp authorization.
+        let erc20swap_sig = gas_signer.sign_eip712_erc20swap_claim(
+            addrs.erc20swap,
+            erc20swap_version,
+            preimage,
+            tbtc_evm_amount,
+            addrs.tbtc,
+            addrs.refund,
+            timelock,
+            addrs.router,
+        )?;
+        let router_sig = gas_signer.sign_eip712_router_claim_cctp(
+            addrs.router,
+            preimage,
+            addrs.usdt, // = Arbitrum USDC for CCTP swaps
+            token_messenger,
+            cctp_data_hash,
+            U256::from(min_amount),
+        )?;
+
+        let erc20_claim = Erc20Claim {
+            preimage: (*preimage).into(),
+            amount: tbtc_evm_amount,
+            tokenAddress: addrs.tbtc,
+            refundAddress: addrs.refund,
+            timelock,
+            v: erc20swap_sig.v,
+            r: erc20swap_sig.r.into(),
+            s: erc20swap_sig.s.into(),
+        };
+        let auth = ClaimCctpAuthorization {
+            minAmount: U256::from(min_amount),
+            v: router_sig.v,
+            r: router_sig.r.into(),
+            s: router_sig.s.into(),
+        };
+
+        let calldata = encode_claim_erc20_execute_cctp(
+            &erc20_claim,
+            &dex_calls,
+            addrs.usdt,
+            token_messenger,
+            &cctp_data,
+            &auth,
+        );
+
+        self.submit_claim(swap, &swap.router_address.clone(), &calldata)
+            .await
+    }
+
+    /// Choose the CCTP forwarding `hookData` for a destination. EVM uses the
+    /// static forward tag. Solana uses the static tag when the recipient's USDC
+    /// ATA already exists, or the ATA-creating variant (carrying the wallet)
+    /// when it does not.
+    async fn cctp_hook_data(
+        &self,
+        dest: &CctpDestination,
+        destination: &str,
+    ) -> Result<Vec<u8>, BoltzError> {
+        if dest.transport != NetworkTransport::Solana {
+            return Ok(cctp::evm_forward_hook_data().to_vec());
+        }
+
+        let ata = cctp::solana_mint_recipient(destination)?;
+        let ata_base58 = bs58::encode(ata.as_slice()).into_string();
+        if self.solana_rpc.account_exists(&ata_base58).await? {
+            Ok(cctp::evm_forward_hook_data().to_vec())
+        } else {
+            cctp::solana_forward_hook_data(destination)
+        }
     }
 
     /// Cross-chain claim: claim tBTC + DEX swap to USDT + OFT bridge to destination chain.
@@ -1693,6 +2099,16 @@ impl ReverseSwapExecutor {
         contracts::decode_typehash_send_data(&result)
     }
 
+    /// Fetch `TYPEHASH_CCTP_DATA` from the Router contract.
+    async fn fetch_typehash_cctp_data(&self, router_address: &str) -> Result<[u8; 32], BoltzError> {
+        let calldata = contracts::encode_typehash_cctp_data_call();
+        let result = self
+            .evm_provider
+            .eth_call(router_address, &calldata)
+            .await?;
+        contracts::decode_typehash_cctp_data(&result)
+    }
+
     async fn fetch_erc20swap_version(&self, erc20swap_address: &str) -> Result<String, BoltzError> {
         let calldata = contracts::encode_version_call();
         let result = self
@@ -1773,6 +2189,22 @@ impl ClaimAddresses {
             refund: parse_address(&swap.refund_address)?,
             destination_evm,
             destination_bytes32,
+        })
+    }
+
+    /// Addresses for a CCTP (USDC) claim. CCTP destinations are not in the
+    /// USDT0 OFT registry, so this resolves them without it. `usdt` carries the
+    /// DEX output token, which for CCTP is Arbitrum USDC; the destination
+    /// fields are unused (the CCTP path derives its own `mintRecipient`).
+    fn parse_cctp(swap: &BoltzSwap) -> Result<Self, BoltzError> {
+        Ok(Self {
+            erc20swap: parse_address(&swap.erc20swap_address)?,
+            router: parse_address(&swap.router_address)?,
+            tbtc: parse_address(ARBITRUM_TBTC_ADDRESS)?,
+            usdt: parse_address(ARBITRUM_USDC_ADDRESS)?,
+            refund: parse_address(&swap.refund_address)?,
+            destination_evm: None,
+            destination_bytes32: FixedBytes::<32>::ZERO,
         })
     }
 }
