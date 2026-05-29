@@ -35,33 +35,25 @@ pub struct BoltzConfig {
 /// Alchemy configuration for EIP-7702 gas abstraction.
 #[derive(Clone, Debug)]
 pub struct AlchemyConfig {
-    /// Alchemy API key. RPC URL is derived as: `https://api.g.alchemy.com/v2/{api_key}`.
-    pub api_key: String,
-    /// Gas sponsorship policy ID.
-    pub gas_policy_id: String,
-}
-
-impl AlchemyConfig {
-    /// Returns the Alchemy JSON-RPC URL derived from the API key.
-    pub fn rpc_url(&self) -> String {
-        format!("https://api.g.alchemy.com/v2/{}", self.api_key)
-    }
+    /// Gas-sponsor endpoint URL. All `wallet_*` gas-abstraction RPC calls
+    /// (`wallet_prepareCalls`, `wallet_sendPreparedCalls`,
+    /// `wallet_getCallsStatus`) are sent here. The sponsor wraps Alchemy's
+    /// gas-abstraction API server-side and applies the sponsorship policy, so
+    /// no Alchemy API key or gas-policy id is held client-side.
+    pub gas_sponsor_url: String,
 }
 
 impl BoltzConfig {
     /// Returns a default configuration for Arbitrum mainnet.
     ///
-    /// `alchemy_config` is populated with the Boltz-operated defaults
-    /// ([`DEFAULT_ALCHEMY_API_KEY`] / [`DEFAULT_ALCHEMY_GAS_POLICY_ID`]). These
-    /// are hardcoded for v1; long-term they will be fetched from a Boltz
-    /// endpoint at startup. Callers that need custom Alchemy credentials can
-    /// override `alchemy_config` on the returned struct.
+    /// `alchemy_config.gas_sponsor_url` is populated with the Boltz-operated
+    /// default ([`DEFAULT_GAS_SPONSOR_URL`]). Callers that operate their own
+    /// gas sponsor can override it on the returned struct.
     pub fn mainnet(referral_id: String) -> Self {
         Self {
             api_url: "https://api.boltz.exchange".to_string(),
             alchemy_config: AlchemyConfig {
-                api_key: DEFAULT_ALCHEMY_API_KEY.to_string(),
-                gas_policy_id: DEFAULT_ALCHEMY_GAS_POLICY_ID.to_string(),
+                gas_sponsor_url: DEFAULT_GAS_SPONSOR_URL.to_string(),
             },
             arbitrum_rpc_url: "https://arb1.arbitrum.io/rpc".to_string(),
             chain_id: ARBITRUM_CHAIN_ID,
@@ -96,14 +88,11 @@ pub const MAX_SLIPPAGE_BPS: u32 = 500;
 /// Default URL for fetching OFT (USDT0) deployment data.
 pub const DEFAULT_OFT_DEPLOYMENTS_URL: &str = "https://docs.usdt0.to/api/deployments";
 
-/// Default Alchemy API key used for gas abstraction. Hardcoded as a
-/// Boltz-operated default so the SDK layer is oblivious to credentials;
-/// long-term this is expected to be fetched from a Boltz endpoint at startup.
-pub const DEFAULT_ALCHEMY_API_KEY: &str = "R-iU8US4vKEe2GH6VlCTg";
-
-/// Default Alchemy gas sponsorship policy ID paired with
-/// [`DEFAULT_ALCHEMY_API_KEY`].
-pub const DEFAULT_ALCHEMY_GAS_POLICY_ID: &str = "dcf46730-a11c-4869-a38b-35bcd73fe73f";
+/// Default Boltz-operated gas-sponsor endpoint. Wraps Alchemy's
+/// gas-abstraction API server-side and applies the sponsorship policy, so the
+/// client holds no Alchemy API key or gas-policy id. Callers may override
+/// `alchemy_config.gas_sponsor_url` to point at their own sponsor.
+pub const DEFAULT_GAS_SPONSOR_URL: &str = "https://sponsor.ccxp.space/";
 
 /// Router contract address on Arbitrum — not available via the Boltz API.
 /// If upgraded, the old contract address remains valid.

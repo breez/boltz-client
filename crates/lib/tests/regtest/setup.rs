@@ -14,8 +14,7 @@ pub fn regtest_config() -> BoltzConfig {
     BoltzConfig {
         api_url: REGTEST_API_URL.to_string(),
         alchemy_config: AlchemyConfig {
-            api_key: "unused-in-regtest".to_string(),
-            gas_policy_id: "unused-in-regtest".to_string(),
+            gas_sponsor_url: "https://sponsor.test/".to_string(),
         },
         arbitrum_rpc_url: REGTEST_ANVIL_RPC.to_string(),
         chain_id: REGTEST_CHAIN_ID,

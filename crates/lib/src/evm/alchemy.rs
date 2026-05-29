@@ -42,7 +42,6 @@ pub(crate) struct AlchemyResult {
 /// the rest as-is — all easier with `Value` than with a full typed schema.
 pub(crate) struct AlchemyGasClient {
     rpc_url: String,
-    gas_policy_id: String,
     http_client: Box<dyn HttpClient>,
     gas_signer: EvmSigner,
 }
@@ -54,8 +53,7 @@ impl AlchemyGasClient {
         gas_signer: EvmSigner,
     ) -> Self {
         Self {
-            rpc_url: config.rpc_url(),
-            gas_policy_id: config.gas_policy_id.clone(),
+            rpc_url: config.gas_sponsor_url.clone(),
             http_client,
             gas_signer,
         }
@@ -100,10 +98,9 @@ impl AlchemyGasClient {
             })
             .collect();
 
+        // No `paymasterService` capability is sent: the gas sponsor applies
+        // the sponsorship policy server-side, so the client holds no policy id.
         let params = serde_json::json!([{
-            "capabilities": {
-                "paymasterService": { "policyId": self.gas_policy_id }
-            },
             "calls": json_calls,
             "from": self.gas_signer.address_hex(),
             "chainId": format!("0x{:x}", chain_id)
@@ -613,8 +610,7 @@ mod tests {
     #[allow(clippy::similar_names)]
     fn test_sign_subsequent_response() {
         let config = AlchemyConfig {
-            api_key: "test".to_string(),
-            gas_policy_id: "policy123".to_string(),
+            gas_sponsor_url: "https://sponsor.test/".to_string(),
         };
         let signer = test_signer();
         let client = AlchemyGasClient::new(
@@ -647,8 +643,7 @@ mod tests {
     #[allow(clippy::similar_names)]
     fn test_sign_first_time_response() {
         let config = AlchemyConfig {
-            api_key: "test".to_string(),
-            gas_policy_id: "policy123".to_string(),
+            gas_sponsor_url: "https://sponsor.test/".to_string(),
         };
         let signer = test_signer();
         let client = AlchemyGasClient::new(
@@ -696,8 +691,7 @@ mod tests {
     #[macros::async_test_all]
     async fn test_full_sponsored_call_flow() {
         let config = AlchemyConfig {
-            api_key: "test_key".to_string(),
-            gas_policy_id: "policy_id".to_string(),
+            gas_sponsor_url: "https://sponsor.test/".to_string(),
         };
         let signer = test_signer();
 
@@ -753,8 +747,7 @@ mod tests {
     #[macros::async_test_all]
     async fn test_sponsored_call_reverted() {
         let config = AlchemyConfig {
-            api_key: "test_key".to_string(),
-            gas_policy_id: "policy_id".to_string(),
+            gas_sponsor_url: "https://sponsor.test/".to_string(),
         };
         let signer = test_signer();
 
@@ -807,8 +800,7 @@ mod tests {
     #[macros::async_test_all]
     async fn test_poll_status_tolerates_transient_error() {
         let config = AlchemyConfig {
-            api_key: "test_key".to_string(),
-            gas_policy_id: "policy_id".to_string(),
+            gas_sponsor_url: "https://sponsor.test/".to_string(),
         };
         let signer = test_signer();
 
@@ -927,8 +919,7 @@ mod tests {
     fn test_first_time_flow_matches_ethers() {
         // Vector 3: full signPreparedCalls first-time flow
         let config = AlchemyConfig {
-            api_key: "test".to_string(),
-            gas_policy_id: "policy".to_string(),
+            gas_sponsor_url: "https://sponsor.test/".to_string(),
         };
         let signer = test_signer();
         let client = AlchemyGasClient::new(
@@ -996,8 +987,7 @@ mod tests {
     fn test_subsequent_flow_matches_ethers() {
         // Vector 4: full signPreparedCalls subsequent flow
         let config = AlchemyConfig {
-            api_key: "test".to_string(),
-            gas_policy_id: "policy".to_string(),
+            gas_sponsor_url: "https://sponsor.test/".to_string(),
         };
         let signer = test_signer();
         let client = AlchemyGasClient::new(
