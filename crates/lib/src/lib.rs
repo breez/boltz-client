@@ -5,7 +5,6 @@ pub mod events;
 pub mod evm;
 pub mod keys;
 pub mod models;
-pub mod recover;
 pub mod solana;
 pub mod store;
 pub mod swap;
@@ -465,66 +464,5 @@ impl BoltzService {
         swap.updated_at = current_unix_timestamp();
         self.store.update_swap(&swap).await?;
         Ok(swap)
-    }
-
-    /// Recover unclaimed swaps by scanning the blockchain.
-    pub async fn recover(&self, destination_address: &str) -> Result<RecoveryResult, BoltzError> {
-        let (recoverable, stats) = self.executor.scan_recoverable().await?;
-
-        if let Some(highest) = stats.highest_key_index {
-            self.store
-                .set_key_index_if_higher(highest.saturating_add(1))
-                .await?;
-        }
-
-        let mut claimed = Vec::new();
-        for r in &recoverable {
-            let swap = self.executor.build_recovery_swap(r, destination_address)?;
-            if let Err(e) = self.store.insert_swap(&swap).await {
-                tracing::error!(
-                    key_index = r.key_index,
-                    error = %e,
-                    "Failed to persist recovery swap"
-                );
-                continue;
-            }
-            let mut swap = swap;
-            swap::manager::update_swap_status(
-                &*self.store,
-                &self.event_emitter,
-                &mut swap,
-                BoltzSwapStatus::Claiming,
-            )
-            .await;
-            match self.executor.claim_and_swap(&swap, true).await {
-                Ok(tx_hash) => {
-                    swap.claim_tx_hash = Some(tx_hash.clone());
-                    swap.updated_at = current_unix_timestamp();
-                    if let Err(e) = self.store.update_swap(&swap).await {
-                        tracing::error!(key_index = r.key_index, error = %e, "Failed to persist claim tx hash");
-                    }
-                    claimed.push(ClaimedRecovery {
-                        key_index: r.key_index,
-                        preimage_hash: r.preimage_hash,
-                        claim_tx_hash: tx_hash,
-                    });
-                }
-                Err(e) => {
-                    tracing::error!(
-                        key_index = r.key_index,
-                        tx = r.lockup_tx_hash,
-                        error = %e,
-                        "Failed to claim recovered swap"
-                    );
-                }
-            }
-        }
-
-        Ok(RecoveryResult {
-            claimed,
-            already_settled: stats.already_settled,
-            total_events_scanned: stats.total_events,
-            highest_key_index: stats.highest_key_index,
-        })
     }
 }

@@ -21,9 +21,6 @@ pub trait BoltzStorage: Send + Sync {
     async fn list_active_swaps(&self) -> Result<Vec<BoltzSwap>, BoltzError>;
     /// Atomically reserve the next key index and return it.
     async fn increment_key_index(&self) -> Result<u32, BoltzError>;
-    /// Set the key index to `value` if it is greater than the current index.
-    /// Used by recovery to fast-forward past already-used indices.
-    async fn set_key_index_if_higher(&self, value: u32) -> Result<(), BoltzError>;
 }
 
 /// In-memory store for testing.
@@ -81,14 +78,6 @@ impl BoltzStorage for MemoryBoltzStorage {
             .checked_add(1)
             .ok_or_else(|| BoltzError::Store("Key index overflow".to_string()))?;
         Ok(current)
-    }
-
-    async fn set_key_index_if_higher(&self, value: u32) -> Result<(), BoltzError> {
-        let mut idx = self.key_index.lock().await;
-        if value > *idx {
-            *idx = value;
-        }
-        Ok(())
     }
 }
 

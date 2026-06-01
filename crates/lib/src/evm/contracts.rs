@@ -544,15 +544,10 @@ pub fn hash_send_data(typehash: [u8; 32], send_data: &SendData) -> [u8; 32] {
     keccak256(&encoded).into()
 }
 
-// ─── Lockup event decoding (for recovery) ───────────────────────────────
+// ─── ERC20Swap lockup state ──────────────────────────────────────────────
 
-/// Lockup event topic0: `keccak256("Lockup(bytes32,uint256,address,address,address,uint256)")`.
-pub fn lockup_event_topic() -> [u8; 32] {
-    use alloy_primitives::keccak256;
-    keccak256(b"Lockup(bytes32,uint256,address,address,address,uint256)").into()
-}
-
-/// Decoded fields from an `ERC20Swap` `Lockup` event log.
+/// The fields that identify an `ERC20Swap` lockup, used to recompute its
+/// on-chain hash and check whether it is still locked.
 #[derive(Debug, Clone)]
 pub struct DecodedLockupEvent {
     pub preimage_hash: [u8; 32],
@@ -561,47 +556,6 @@ pub struct DecodedLockupEvent {
     pub claim_address: Address,
     pub refund_address: Address,
     pub timelock: U256,
-    pub block_number: u64,
-    pub transaction_hash: String,
-}
-
-/// Decode a `Lockup` event from a raw log entry.
-///
-/// Topics layout: `[event_sig, preimageHash, claimAddress, refundAddress]`
-/// Data layout: `abi.encode(uint256 amount, address tokenAddress, uint256 timelock)`
-pub fn decode_lockup_event(
-    log: &crate::evm::provider::LogEntry,
-) -> Result<DecodedLockupEvent, BoltzError> {
-    if log.topics.len() < 4 {
-        return Err(BoltzError::Evm {
-            reason: format!("Lockup log has {} topics, expected 4", log.topics.len()),
-            tx_hash: None,
-        });
-    }
-
-    let preimage_hash: [u8; 32] = parse_hex_bytes32(&log.topics[1])?;
-    let claim_address = address_from_topic(&log.topics[2])?;
-    let refund_address = address_from_topic(&log.topics[3])?;
-
-    let data_bytes = parse_hex_bytes(log.data.strip_prefix("0x").unwrap_or(&log.data))?;
-    let (amount, token_address, timelock) = <(U256, Address, U256)>::abi_decode(&data_bytes)
-        .map_err(|e| BoltzError::Evm {
-            reason: format!("Failed to decode Lockup event data: {e}"),
-            tx_hash: None,
-        })?;
-
-    let block_number = parse_block_number(&log.block_number)?;
-
-    Ok(DecodedLockupEvent {
-        preimage_hash,
-        amount,
-        token_address,
-        claim_address,
-        refund_address,
-        timelock,
-        block_number,
-        transaction_hash: log.transaction_hash.clone(),
-    })
 }
 
 /// Encode `hashValues(...)` calldata.
@@ -652,37 +606,6 @@ pub fn address_to_topic(address: &[u8; 20]) -> String {
     let mut padded = [0u8; 32];
     padded[12..].copy_from_slice(address);
     format!("0x{}", hex::encode(padded))
-}
-
-fn parse_hex_bytes32(hex_str: &str) -> Result<[u8; 32], BoltzError> {
-    let clean = hex_str.strip_prefix("0x").unwrap_or(hex_str);
-    let bytes = hex::decode(clean).map_err(|e| BoltzError::Evm {
-        reason: format!("Invalid hex bytes32 '{hex_str}': {e}"),
-        tx_hash: None,
-    })?;
-    if bytes.len() != 32 {
-        return Err(BoltzError::Evm {
-            reason: format!("Expected 32 bytes, got {}", bytes.len()),
-            tx_hash: None,
-        });
-    }
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&bytes);
-    Ok(arr)
-}
-
-fn address_from_topic(topic: &str) -> Result<Address, BoltzError> {
-    let bytes32 = parse_hex_bytes32(topic)?;
-    // Indexed address is left-padded to 32 bytes; take last 20 bytes
-    Ok(Address::from_slice(&bytes32[12..]))
-}
-
-fn parse_block_number(hex_str: &str) -> Result<u64, BoltzError> {
-    let clean = hex_str.strip_prefix("0x").unwrap_or(hex_str);
-    u64::from_str_radix(clean, 16).map_err(|e| BoltzError::Evm {
-        reason: format!("Failed to parse block number '{hex_str}': {e}"),
-        tx_hash: None,
-    })
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────

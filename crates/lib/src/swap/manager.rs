@@ -11,9 +11,9 @@ use crate::events::{BoltzSwapEvent, EventEmitter};
 use crate::evm::contracts::{
     DeliveredAmount, DeliveredAmountSource, decode_delivered_from_logs, parse_address,
 };
+use crate::evm::lockup::is_swap_still_locked_by_swap;
 use crate::evm::provider::TxReceipt;
 use crate::models::{BoltzSwap, BoltzSwapStatus, BridgeKind};
-use crate::recover;
 use crate::store::BoltzStorage;
 use crate::swap::reverse::{ReverseSwapExecutor, current_unix_timestamp};
 
@@ -531,12 +531,8 @@ impl SwapManager {
     ) {
         let swap_id = &swap.id;
 
-        match recover::is_swap_still_locked_by_swap(
-            &executor.evm_provider,
-            swap,
-            &executor.key_manager,
-        )
-        .await
+        match is_swap_still_locked_by_swap(&executor.evm_provider, swap, &executor.key_manager)
+            .await
         {
             Ok(true) => {
                 // Still locked — safe to retry claim.

@@ -7,10 +7,10 @@ use lightning_invoice::Bolt11Invoice;
 use crate::api::BoltzApiClient;
 use crate::api::types::{EncodeRequest, QuoteResponse, ReversePairInfo};
 use crate::config::{
-    ARBITRUM_ERC20SWAP_DEPLOY_BLOCK, ARBITRUM_ROUTER_ADDRESS, ARBITRUM_TBTC_ADDRESS,
-    ARBITRUM_USDC_ADDRESS, ARBITRUM_USDT_ADDRESS, BoltzConfig, CCTP_ARBITRUM_DOMAIN,
-    CCTP_FINALITY_FAST, CCTP_TOKEN_MESSENGER_V2, MAX_SLIPPAGE_BPS, POLYGON_EVM_CHAIN_ID,
-    PROBE_INVOICE_EXPIRY_SECS, SATS_TO_TBTC_FACTOR, SOLANA_USDT0_MINT, ZERO_ADDRESS,
+    ARBITRUM_ROUTER_ADDRESS, ARBITRUM_TBTC_ADDRESS, ARBITRUM_USDC_ADDRESS, ARBITRUM_USDT_ADDRESS,
+    BoltzConfig, CCTP_ARBITRUM_DOMAIN, CCTP_FINALITY_FAST, CCTP_TOKEN_MESSENGER_V2,
+    MAX_SLIPPAGE_BPS, POLYGON_EVM_CHAIN_ID, PROBE_INVOICE_EXPIRY_SECS, SATS_TO_TBTC_FACTOR,
+    SOLANA_USDT0_MINT, ZERO_ADDRESS,
 };
 use crate::error::BoltzError;
 use crate::evm::alchemy::{AlchemyGasClient, EvmCall};
@@ -20,6 +20,7 @@ use crate::evm::contracts::{
     encode_claim_erc20_execute, encode_claim_erc20_execute_cctp, encode_claim_erc20_execute_oft,
     hash_cctp_data, parse_address, quote_calldata_to_call,
 };
+use crate::evm::lockup::is_swap_still_locked_by_swap;
 use crate::evm::lz_options::build_extra_options;
 use crate::evm::oft::legacy_mesh_source_amount;
 use crate::evm::provider::EvmProvider;
@@ -32,7 +33,6 @@ use crate::models::{
     BoltzSwap, BoltzSwapStatus, BridgeKind, CctpDestination, ChainId, ChainRegistry, ChainSpec,
     NetworkTransport, PreparedSwap, SwapLimits, Usdt0Kind, cctp_destination,
 };
-use crate::recover::{self, RecoverableSwap};
 use crate::solana::ata::derive_ata;
 use crate::solana::rpc::SolanaRpcClient;
 use crate::store::BoltzStorage;
@@ -712,72 +712,6 @@ impl ReverseSwapExecutor {
         Ok(resp.invoice)
     }
 
-    /// Scan the blockchain for unclaimed swaps.
-    /// Returns recoverable swaps and scan statistics. The caller handles
-    /// persistence, key index sync, and claiming.
-    pub async fn scan_recoverable(
-        &self,
-    ) -> Result<(Vec<RecoverableSwap>, recover::ScanStats), BoltzError> {
-        let chain_id_u32 = to_chain_id_u32(self.config.chain_id)?;
-        recover::scan_for_recoverable_swaps(
-            &self.evm_provider,
-            &self.key_manager,
-            chain_id_u32,
-            &self.erc20swap_address,
-            ARBITRUM_ERC20SWAP_DEPLOY_BLOCK,
-        )
-        .await
-    }
-
-    /// Build a synthetic `BoltzSwap` from a recoverable on-chain swap.
-    pub fn build_recovery_swap(
-        &self,
-        recoverable: &RecoverableSwap,
-        destination_address: &str,
-    ) -> Result<BoltzSwap, BoltzError> {
-        let onchain_sats: u64 = recoverable
-            .amount
-            .checked_div(U256::from(SATS_TO_TBTC_FACTOR))
-            .unwrap_or(U256::ZERO)
-            .try_into()
-            .map_err(|_| BoltzError::Generic("tBTC amount too large for u64".into()))?;
-
-        let timelock: u64 = recoverable
-            .timelock
-            .try_into()
-            .map_err(|_| BoltzError::Generic("Timelock too large for u64".into()))?;
-
-        let now = current_unix_timestamp();
-
-        Ok(BoltzSwap {
-            id: format!("recovery-{}-{}", recoverable.key_index, now),
-            status: BoltzSwapStatus::TbtcLocked,
-            // Recovery currently scans only OFT (USDT) Lockup events.
-            bridge_kind: BridgeKind::Oft,
-            claim_key_index: recoverable.key_index,
-            chain_id: self.config.chain_id,
-            claim_address: format!("0x{}", hex::encode(recoverable.claim_address.as_slice())),
-            destination_address: destination_address.to_string(),
-            destination_chain: self.chain_registry.source.id.clone(),
-            refund_address: format!("0x{}", hex::encode(recoverable.refund_address.as_slice())),
-            erc20swap_address: self.erc20swap_address.clone(),
-            router_address: ARBITRUM_ROUTER_ADDRESS.to_string(),
-            invoice: String::new(),
-            invoice_amount_sats: 0,
-            onchain_amount: onchain_sats,
-            expected_usdt_amount: 0,
-            slippage_bps: self.config.slippage_bps,
-            timeout_block_height: timelock,
-            lockup_tx_id: Some(recoverable.lockup_tx_hash.clone()),
-            claim_tx_hash: None,
-            pending_call_id: None,
-            delivered_amount: None,
-            lz_guid: None,
-            created_at: now,
-            updated_at: now,
-        })
-    }
-
     // ─── Internal ────────────────────────────────────────────────────────
 
     async fn fetch_tbtc_pair(&self) -> Result<ReversePairInfo, BoltzError> {
@@ -862,9 +796,7 @@ impl ReverseSwapExecutor {
         // that triggered the `transaction.confirmed` WS event.
         let mut lockup_verified = false;
         for attempt in 0..LOCKUP_CHECK_MAX_ATTEMPTS {
-            match recover::is_swap_still_locked_by_swap(&self.evm_provider, swap, &self.key_manager)
-                .await
-            {
+            match is_swap_still_locked_by_swap(&self.evm_provider, swap, &self.key_manager).await {
                 Ok(true) => {
                     lockup_verified = true;
                     break;
@@ -954,12 +886,8 @@ impl ReverseSwapExecutor {
                     // retrying — the swap was either claimed by another instance
                     // or refunded by Boltz. Don't mark success or failure here;
                     // the WS update will determine the final state.
-                    match recover::is_swap_still_locked_by_swap(
-                        &self.evm_provider,
-                        swap,
-                        &self.key_manager,
-                    )
-                    .await
+                    match is_swap_still_locked_by_swap(&self.evm_provider, swap, &self.key_manager)
+                        .await
                     {
                         Ok(false) => {
                             tracing::info!(
@@ -2456,9 +2384,9 @@ fn apply_slippage_down(amount: u128, slippage_bps: u32) -> u128 {
 /// user is guaranteed to receive at least `expected × (1 − slippage)`
 /// end-to-end — drift between prepare and claim, and any internal buffers
 /// that shrink the live quote, are caught by the drift check rather than
-/// quietly delivering less than the user agreed to. Recovery mode has
-/// no prepare-time expected amount, so the floor falls back to the live
-/// quote.
+/// quietly delivering less than the user agreed to. When the drift check is
+/// skipped (the user explicitly accepted the degraded live quote via
+/// `accept_degraded_quote`), the floor falls back to the live quote.
 fn compute_claim_floor(
     raw_quote: u128,
     expected_amount: u64,
@@ -2802,8 +2730,8 @@ mod tests {
 
     #[macros::test_all]
     fn test_check_quote_drift_zero_expected() {
-        // Recovery swaps have expected=0, should always pass
-        // (but in practice skip_drift_check=true is used for recovery)
+        // A swap with no prepare-time expected amount (expected=0) should
+        // always pass the drift check.
         assert!(check_quote_drift(0, 500_000, 100).is_ok());
     }
 
@@ -2919,9 +2847,9 @@ mod tests {
     }
 
     #[macros::test_all]
-    fn claim_floor_falls_back_to_raw_in_recovery() {
-        // Recovery has no prepare-time expected amount. Floor uses the
-        // live quote so the claim still has a meaningful min.
+    fn claim_floor_falls_back_to_raw_when_drift_check_skipped() {
+        // When the drift check is skipped (accept_degraded_quote), the floor
+        // is anchored on the live quote so the claim still has a meaningful min.
         let raw = 500_000_u128;
         assert_eq!(compute_claim_floor(raw, 0, 100, true), 495_000);
     }

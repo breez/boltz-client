@@ -94,12 +94,6 @@ enum Command {
         swap_id: String,
     },
 
-    /// Recover unclaimed swaps by scanning the blockchain (from mnemonic alone).
-    Recover {
-        /// Destination EVM address for recovered USDT.
-        destination: String,
-    },
-
     /// Exit the interactive shell.
     #[command(hide = true)]
     Exit,
@@ -264,10 +258,6 @@ async fn execute_command(command: Command, svc: &BoltzService, seed: &[u8]) -> R
                 })),
                 None => println!("Not a CCTP swap, unknown swap, or no burn tx recorded yet."),
             }
-            Ok(true)
-        }
-        Command::Recover { destination } => {
-            cmd_recover(svc, &destination).await?;
             Ok(true)
         }
     }
@@ -476,16 +466,6 @@ impl BoltzEventListener for PrintingEventListener {
     }
 }
 
-async fn cmd_recover(svc: &BoltzService, destination: &str) -> Result<()> {
-    println!("Scanning blockchain for recoverable swaps...");
-    println!("This may take a few minutes.\n");
-
-    let result = svc.recover(destination).await?;
-    print_json(&result);
-
-    Ok(())
-}
-
 // ─── Formatting ────────────────────────────────────────────────────────
 
 const USDT_FIELDS: &[&str] = &["usdt_amount", "usdt_delivered"];
@@ -667,14 +647,6 @@ impl BoltzStorage for FileBoltzStorage {
             .ok_or_else(|| BoltzError::Store("Key index overflow".to_string()))?;
         self.write_index(next)?;
         Ok(current)
-    }
-
-    async fn set_key_index_if_higher(&self, value: u32) -> Result<(), BoltzError> {
-        let current = self.read_index()?;
-        if value > current {
-            self.write_index(value)?;
-        }
-        Ok(())
     }
 }
 

@@ -26,8 +26,8 @@ pub struct BoltzConfig {
     /// URL for fetching OFT (USDT0) deployment data.
     pub oft_deployments_url: String,
     /// Circle CCTP "Iris" API base URL. Used to quote the CCTP burn fee at
-    /// prepare time and to fetch the attestation / forwarding tx hash during
-    /// recovery for USDC (CCTP) destinations. Sandbox:
+    /// prepare time and to fetch the attestation / forwarding tx hash when
+    /// checking delivery status for USDC (CCTP) destinations. Sandbox:
     /// `https://iris-api-sandbox.circle.com`.
     pub cctp_api_url: String,
     /// Solana JSON-RPC endpoint used when the destination chain is Solana.
@@ -192,20 +192,6 @@ pub const SATS_TO_TBTC_FACTOR: u64 = 10_000_000_000;
 
 /// Zero address — used as `tokenOut` in Boltz DEX quote API to represent native ETH.
 pub const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
-
-/// Block height at which the `ERC20Swap` contract was deployed on Arbitrum.
-/// Used as the lower bound when scanning for Lockup events during recovery.
-/// Matches the web app's `config.assets.TBTC.contracts.deployHeight` for mainnet.
-pub const ARBITRUM_ERC20SWAP_DEPLOY_BLOCK: u64 = 435_848_678;
-
-/// Number of blocks per scanning batch for log recovery on Arbitrum.
-/// Arbitrum uses large intervals due to fast block times (~0.25s).
-/// Matches the web app's `scanInterval` for Arbitrum.
-pub const RECOVERY_SCAN_BATCH_SIZE: u64 = 100_000;
-
-/// Maximum number of preimage key indices to derive during recovery.
-/// Matches the web app's `maxIterations` constant.
-pub const RECOVERY_MAX_KEY_INDEX: u32 = 100_000;
 
 /// Invoice expiry (seconds) used for probe-only reverse swap invoices.
 /// Matches Boltz's documented minimum from `GET /v2/swap/reverse/expiry` so
