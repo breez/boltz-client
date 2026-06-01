@@ -42,6 +42,7 @@ pub struct BoltzSwap {
     /// tBTC amount locked on-chain (sats, from swap response `onchainAmount`).
     pub onchain_amount: u64,
     /// Expected stablecoin output (6 decimals).
+    #[serde(alias = "expected_usdt_amount")]
     pub expected_output_amount: u64,
     /// DEX slippage tolerance (basis points) snapshot at `prepare` time.
     /// Used for the claim-time quote drift check and on-chain `minOut`
