@@ -24,7 +24,7 @@ const HISTORY_FILE_NAME: &str = "history.txt";
 #[derive(Parser)]
 #[command(
     name = "boltz-cli",
-    about = "Interactive CLI for the Boltz LN -> USDT reverse swap flow"
+    about = "Interactive CLI for the Boltz LN -> stablecoin (USDT/USDC) reverse swap flow"
 )]
 struct Cli {
     /// BIP-39 mnemonic (12 or 24 words). If not provided, reads from data-dir or generates new.
@@ -53,12 +53,12 @@ enum Command {
     /// Get current swap limits (min/max sats).
     Limits,
 
-    /// Get a quote for a LN -> USDT swap (no commitment).
+    /// Get a quote for a LN -> stablecoin swap (USDT or USDC; no commitment).
     ///
     /// The destination chain is picked interactively from the set of chains
     /// whose transport accepts the given address.
     Prepare {
-        /// USDT amount (e.g. 1.5 for 1.50 USDT). Mutually exclusive with --sats.
+        /// Stablecoin amount, 6 decimals (e.g. 1.5 for 1.50 USDT/USDC). Mutually exclusive with --sats.
         #[arg(long, value_parser = parse_usdt_amount, conflicts_with = "sats")]
         usdt: Option<u64>,
         /// Input amount in sats. Mutually exclusive with --usdt.
@@ -71,7 +71,7 @@ enum Command {
 
     /// Full swap flow: prepare -> create -> wait for payment -> complete.
     Swap {
-        /// USDT amount (e.g. 1.5 for 1.50 USDT). Mutually exclusive with --sats.
+        /// Stablecoin amount, 6 decimals (e.g. 1.5 for 1.50 USDT/USDC). Mutually exclusive with --sats.
         #[arg(long, value_parser = parse_usdt_amount, conflicts_with = "sats")]
         usdt: Option<u64>,
         /// Input amount in sats. Mutually exclusive with --usdt.
@@ -84,6 +84,12 @@ enum Command {
 
     /// Accept a degraded quote for a swap stuck waiting for approval.
     Accept {
+        /// Swap ID.
+        swap_id: String,
+    },
+
+    /// Check destination-delivery status of a USDC (CCTP) swap via Circle Iris.
+    CctpStatus {
         /// Swap ID.
         swap_id: String,
     },
@@ -247,6 +253,19 @@ async fn execute_command(command: Command, svc: &BoltzService, seed: &[u8]) -> R
             println!("Accepted degraded quote for {swap_id}");
             Ok(true)
         }
+        Command::CctpStatus { swap_id } => {
+            match svc.cctp_delivery_status(&swap_id).await? {
+                Some(status) => print_json(&serde_json::json!({
+                    "found": status.found,
+                    "status": status.status,
+                    "forwarded": status.is_forwarded(),
+                    "forwardTxHash": status.forward_tx_hash,
+                    "deliveredAmount": status.delivered_amount,
+                })),
+                None => println!("Not a CCTP swap, unknown swap, or no burn tx recorded yet."),
+            }
+            Ok(true)
+        }
         Command::Recover { destination } => {
             cmd_recover(svc, &destination).await?;
             Ok(true)
@@ -315,16 +334,13 @@ fn cmd_info(svc: &BoltzService, seed: &[u8]) -> Result<()> {
     );
     println!("  Preimage key[0] addr:   {}", preimage_key.address_hex());
 
-    let mut chains: Vec<String> = svc
-        .supported_chains()
+    let mut dests: Vec<String> = svc
+        .supported_destinations()
         .into_iter()
-        .map(|id| {
-            svc.chain_spec(&id)
-                .map_or_else(|| id.to_string(), |s| s.display_name.clone())
-        })
+        .map(|d| format!("{} ({})", d.label, d.asset))
         .collect();
-    chains.sort();
-    println!("\nSupported destination chains:\n  {}", chains.join(", "));
+    dests.sort();
+    println!("\nSupported destinations:\n  {}", dests.join(", "));
 
     Ok(())
 }
@@ -353,31 +369,31 @@ async fn prepare(
     }
 }
 
-/// Pick a destination chain by asking which supported chains can accept the
-/// given address, then prompting the user to choose by number.
+/// Pick a destination (chain + asset) by asking which supported destinations
+/// can accept the given address, then prompting the user to choose by number.
 ///
-/// Filters via [`BoltzService::chains_accepting`] so the list contains only
-/// transports compatible with the address format. Auto-selects if exactly
-/// one chain matches; errors if none do.
+/// Filters via [`BoltzService::destinations_accepting`] so the list contains
+/// only transports compatible with the address format, spanning both USDT0
+/// (OFT) and USDC (CCTP). Auto-selects if exactly one matches; errors if none.
 fn pick_chain_for_address(svc: &BoltzService, destination: &str) -> Result<ChainId> {
     let mut candidates: Vec<(String, ChainId)> = svc
-        .chains_accepting(destination)
+        .destinations_accepting(destination)
         .into_iter()
-        .map(|spec| (spec.display_name.clone(), spec.id.clone()))
+        .map(|d| (format!("{} ({})", d.label, d.asset), d.id))
         .collect();
     candidates.sort_by(|a, b| a.0.cmp(&b.0));
 
     match candidates.len() {
         0 => bail!(
-            "No supported chain accepts the address '{destination}'. Run `info` for the list."
+            "No supported destination accepts the address '{destination}'. Run `info` for the list."
         ),
         1 => {
             let (name, id) = candidates.into_iter().next().unwrap();
-            println!("Only one chain supports this address: {name} — proceeding.");
+            println!("Only one destination supports this address: {name} — proceeding.");
             Ok(id)
         }
         _ => {
-            println!("\nWhich chain?");
+            println!("\nWhich destination?");
             for (i, (name, _)) in candidates.iter().enumerate() {
                 println!("  {:>2}. {}", i.saturating_add(1), name);
             }
