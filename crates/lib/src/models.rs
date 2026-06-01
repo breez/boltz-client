@@ -23,10 +23,10 @@ pub struct BoltzSwap {
     // Addresses
     /// Gas signer address (used as claimAddress with Boltz).
     pub claim_address: String,
-    /// User's final USDT destination.
+    /// User's final destination address for the delivered stablecoin.
     pub destination_address: String,
-    /// Target chain for delivery.
-    pub destination_chain: ChainId,
+    /// Target destination (asset-on-chain) for delivery.
+    pub destination_chain: DestinationId,
     /// Boltz's refund address (from swap response).
     pub refund_address: String,
 
@@ -41,8 +41,8 @@ pub struct BoltzSwap {
     // Amounts
     /// tBTC amount locked on-chain (sats, from swap response `onchainAmount`).
     pub onchain_amount: u64,
-    /// Expected USDT output (6 decimals).
-    pub expected_usdt_amount: u64,
+    /// Expected stablecoin output (6 decimals).
+    pub expected_output_amount: u64,
     /// DEX slippage tolerance (basis points) snapshot at `prepare` time.
     /// Used for the claim-time quote drift check and on-chain `minOut`
     /// values so per-swap overrides survive across service restarts.
@@ -61,10 +61,11 @@ pub struct BoltzSwap {
     /// recover the tx hash (and verify on-chain) instead of trusting the WS
     /// `invoice.settled` event. Cleared once `claim_tx_hash` is persisted.
     pub pending_call_id: Option<String>,
-    /// Actual USDT amount delivered on the destination chain (6 decimals).
-    /// `None` until the claim receipt is processed. For bridged destinations
-    /// this is the OFT `amountReceivedLD`; for Arbitrum delivery it's the
-    /// final ERC20 `Transfer` value to the user.
+    /// Actual stablecoin amount delivered on the destination chain (6
+    /// decimals). `None` until the claim receipt is processed. For OFT
+    /// destinations this is `amountReceivedLD`; for CCTP it's the attested
+    /// delivered amount; for `Direct` delivery it's the final ERC20 `Transfer`
+    /// value to the user.
     pub delivered_amount: Option<u64>,
     /// `LayerZero` message GUID (`0x`-prefixed hex) for bridged swaps.
     /// `None` for Arbitrum-destination swaps (no bridge).
@@ -119,15 +120,18 @@ pub enum Usdt0Kind {
     Legacy,
 }
 
-/// Stable identifier for a destination chain. Holds the USDT0 chain name
-/// lowercased (e.g. `"arbitrum one"`, `"solana"`, `"tempo"`). Construct via
-/// [`ChainId::new`] to guarantee the canonical lowercased form.
+/// Opaque, stable identifier for a selectable swap destination — an
+/// *asset-on-chain*, not a bare chain (e.g. `"arbitrum one"` = USDT on
+/// Arbitrum, `"usdc-base"` = USDC on Base, `"usdc-arb"` = USDC on Arbitrum).
+/// Callers round-trip the `id` from [`DestinationOption`] back into the
+/// prepare API and never construct it by hand. Held lowercased; build via
+/// [`DestinationId::new`] for the canonical form.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct ChainId(String);
+pub struct DestinationId(String);
 
-impl ChainId {
-    /// Build a `ChainId` from any string, lowercasing to the canonical form.
+impl DestinationId {
+    /// Build a `DestinationId` from any string, lowercasing to canonical form.
     pub fn new(name: impl AsRef<str>) -> Self {
         Self(name.as_ref().to_lowercase())
     }
@@ -137,133 +141,165 @@ impl ChainId {
     }
 }
 
-impl std::fmt::Display for ChainId {
+impl std::fmt::Display for DestinationId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
 }
 
-impl AsRef<str> for ChainId {
+impl AsRef<str> for DestinationId {
     fn as_ref(&self) -> &str {
         &self.0
     }
 }
 
-/// Runtime metadata for a single destination chain. Built from the USDT0
-/// deployments API at service init and joined with the `NetworkTransport`
-/// inferred from the USDT0 entry.
+/// Stablecoin the user receives on the destination. First-class dimension:
+/// the same physical chain can offer more than one (USDT0 via OFT *and* USDC
+/// via CCTP), so asset is tracked independently of the chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Asset {
+    /// Canonical Tether.
+    Usdt,
+    /// `LayerZero` USDT0 (distinct ERC20/SPL from canonical Tether).
+    Usdt0,
+    /// Circle USD Coin.
+    Usdc,
+}
+
+impl Asset {
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Asset::Usdt => "USDT",
+            Asset::Usdt0 => "USDT0",
+            Asset::Usdc => "USDC",
+        }
+    }
+}
+
+impl std::fmt::Display for Asset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// How a destination's Arbitrum DEX output reaches the user. Carries the
+/// per-bridge routing data the claim path needs. Internal to the registry and
+/// claim paths; the public API surfaces only the coarse [`BridgeKind`].
 #[derive(Clone, Debug)]
-pub struct ChainSpec {
-    /// Canonical ID (lowercased USDT0 name). Stable join key.
-    pub id: ChainId,
-    /// `true` when this spec represents the USDT0 mesh's source chain
-    /// (same-chain delivery: no OFT bridging, no `LayerZero` message).
-    /// Set by the registry builder at init time.
-    pub is_source: bool,
-    /// Raw USDT0 name (`"Arbitrum One"`, `"Solana"`) — display-only.
-    pub display_name: String,
+pub enum Bridge {
+    /// Delivered on Arbitrum itself — no cross-chain hop. The DEX output is
+    /// swept straight to the user (both same-chain USDT and USDC-on-Arbitrum).
+    Direct,
+    /// `LayerZero` USDT0 OFT cross-chain bridge.
+    Oft {
+        /// Which USDT0 mesh this destination belongs to (selects the
+        /// source-side OFT contract via [`DestinationRegistry::oft_for`]).
+        mesh: Usdt0Kind,
+        /// `LayerZero` endpoint ID for the destination.
+        lz_eid: u32,
+    },
+    /// Circle CCTP v2 burn + mint.
+    Cctp {
+        /// Circle CCTP domain id of the destination chain.
+        domain: u32,
+    },
+}
+
+impl Bridge {
+    /// Coarse public category for this bridge.
+    #[must_use]
+    pub fn kind(&self) -> BridgeKind {
+        match self {
+            Bridge::Direct => BridgeKind::Direct,
+            Bridge::Oft { .. } => BridgeKind::Oft,
+            Bridge::Cctp { .. } => BridgeKind::Cctp,
+        }
+    }
+}
+
+/// A single selectable destination: an asset delivered on a chain via a
+/// specific bridge. Unifies what used to be two parallel registries (OFT
+/// `ChainSpec` and static `CctpDestination`). Built once at service init.
+#[derive(Clone, Debug)]
+pub struct Destination {
+    /// Opaque join key / caller-facing handle.
+    pub id: DestinationId,
+    /// Human chain label for display (`"Arbitrum"`, `"Base"`, `"Solana"`).
+    pub chain_label: String,
+    /// Asset the user receives.
+    pub asset: Asset,
     pub transport: NetworkTransport,
-    /// EVM chain ID. `None` for non-EVM transports (Solana, Tron), which
-    /// USDT0 returns with `chainId: null`.
+    /// EVM chain ID. `None` for non-EVM transports (Solana, Tron).
     pub evm_chain_id: Option<u64>,
-    /// `LayerZero` endpoint ID for this destination.
-    pub lz_eid: u32,
-    /// Destination-side OFT contract address (`0x…` for EVM, base58 for
-    /// Solana/Tron). Informational only — the claim path uses the
-    /// source-side OFT picked from [`SourceSpec::oft_for`].
-    pub oft_address: String,
-    /// USDT0 token contract address when the deployments registry publishes
-    /// one. `None` for adapter-only deployments (Ethereum mainnet, where the
-    /// adapter wraps the canonical USDT).
-    pub token_address: Option<String>,
-    /// Which mesh this entry came from.
-    pub mesh: Usdt0Kind,
+    /// Arbitrum token the DEX leg must produce before the bridge/delivery
+    /// (`ARBITRUM_USDT_ADDRESS` for USDT/USDT0 routes, `ARBITRUM_USDC_ADDRESS`
+    /// for USDC routes).
+    pub dex_output_token: &'static str,
+    /// Token contract on the *destination* chain (`0x…` EVM, base58 Solana),
+    /// when known. Used for the "don't send to a token contract" guard.
+    pub dest_token_address: Option<String>,
+    pub bridge: Bridge,
 }
 
-impl ChainSpec {
-    /// Ticker of the asset the user receives on this destination chain.
-    ///
-    /// Returns `"USDT"` when the delivered token is canonical Tether:
-    ///   - Source chain (same-chain delivery; no OFT bridging).
-    ///   - Adapter-only deployments (`token_address.is_none()`) where the
-    ///     OFT adapter unwraps the canonical underlying USDT (e.g.
-    ///     Ethereum mainnet, and legacy-mesh chains like Tron/Solana/Celo
-    ///     that bridge into the pre-existing canonical USDT on that chain).
-    ///
-    /// Returns `"USDT0"` everywhere else — any native-mesh destination
-    /// that publishes its own `Token` entry receives the distinct USDT0
-    /// ERC20/SPL, not canonical Tether, even when other clients label it
-    /// plain "USDT" (they do so because USDT0 is the only USDT-branded
-    /// token they surface on that chain). Labeling it accurately here
-    /// prevents users from conflating a USDT0 balance with any canonical
-    /// Tether deployment they may also hold.
-    pub fn asset_symbol(&self) -> &'static str {
-        if self.is_source || self.token_address.is_none() {
-            return "USDT";
-        }
-        "USDT0"
-    }
-}
-
-/// Runtime metadata for the source chain (Arbitrum). Aggregates the native-
-/// and legacy-mesh OFT contracts on the same chain so the claim path can
-/// pick the one matching the destination's mesh.
-#[derive(Clone, Debug)]
-pub struct SourceSpec {
-    pub id: ChainId,
-    pub evm_chain_id: u64,
-    /// Source OFT contract on the native mesh. `None` if the source chain
-    /// doesn't participate in the native mesh.
-    pub native_oft_address: Option<String>,
-    /// Source OFT contract on the legacy mesh. `None` if the source chain
-    /// doesn't participate in the legacy mesh.
-    pub legacy_oft_address: Option<String>,
-}
-
-impl SourceSpec {
-    /// Pick the source OFT contract address for a destination on the given
-    /// mesh. Returns `None` if the source doesn't participate in that mesh.
-    pub fn oft_for(&self, mesh: Usdt0Kind) -> Option<&str> {
-        match mesh {
-            Usdt0Kind::Native => self.native_oft_address.as_deref(),
-            Usdt0Kind::Legacy => self.legacy_oft_address.as_deref(),
+impl Destination {
+    /// OFT routing data `(mesh, lz_eid)`, present only for `Bridge::Oft`.
+    #[must_use]
+    pub fn oft(&self) -> Option<(Usdt0Kind, u32)> {
+        match &self.bridge {
+            Bridge::Oft { mesh, lz_eid } => Some((*mesh, *lz_eid)),
+            _ => None,
         }
     }
 }
 
-/// Runtime registry of the source chain and all supported destinations.
-/// Built once at service init from the USDT0 deployments API; stable for
-/// the process lifetime.
+/// Runtime registry of every supported destination across all bridges, plus
+/// the source-chain OFT contracts. Built once at service init by merging the
+/// USDT0 deployments API, the static [`CCTP_DESTINATIONS`] table, and the
+/// Arbitrum-direct entries; stable for the process lifetime.
 #[derive(Clone, Debug)]
-pub struct ChainRegistry {
-    pub source: SourceSpec,
-    pub destinations: HashMap<ChainId, ChainSpec>,
+pub struct DestinationRegistry {
+    /// Source-chain destination id (Arbitrum USDT direct).
+    pub source_id: DestinationId,
+    pub source_evm_chain_id: u64,
+    /// Source-side native-mesh OFT contract (`None` if not on the native mesh).
+    pub source_native_oft: Option<String>,
+    /// Source-side legacy-mesh OFT contract (`None` if not on the legacy mesh).
+    pub source_legacy_oft: Option<String>,
+    pub destinations: HashMap<DestinationId, Destination>,
 }
 
-impl ChainRegistry {
-    pub fn get(&self, id: &ChainId) -> Option<&ChainSpec> {
+impl DestinationRegistry {
+    #[must_use]
+    pub fn get(&self, id: &DestinationId) -> Option<&Destination> {
         self.destinations.get(id)
     }
 
-    /// Whether `id` refers to the source chain (i.e. same-chain delivery,
-    /// no OFT bridging needed).
-    pub fn is_source(&self, id: &ChainId) -> bool {
-        *id == self.source.id
-    }
-
-    /// All destination IDs, in arbitrary order.
-    pub fn supported_chains(&self) -> Vec<ChainId> {
-        self.destinations.keys().cloned().collect()
+    /// Source OFT contract for the given mesh, or `None` if the source chain
+    /// doesn't participate in that mesh.
+    #[must_use]
+    pub fn oft_for(&self, mesh: Usdt0Kind) -> Option<&str> {
+        match mesh {
+            Usdt0Kind::Native => self.source_native_oft.as_deref(),
+            Usdt0Kind::Legacy => self.source_legacy_oft.as_deref(),
+        }
     }
 }
 
-/// Which bridge carries a swap's Arbitrum -> destination leg.
-/// `Oft` = `LayerZero` USDT0 (the original USDT path); `Cctp` = Circle CCTP v2
-/// (USDC). Stored on the swap so the claim/recovery paths branch without
-/// re-deriving. Defaults to `Oft` so swaps persisted before CCTP existed
-/// deserialize correctly.
+/// Coarse public category of a swap's Arbitrum -> destination leg, for
+/// display and delivery-status UX (`Cctp` → Circle Iris, `Oft` → `LayerZero`
+/// GUID, `Direct` → none). The data-carrying detail lives in [`Bridge`];
+/// claim dispatch resolves that from the destination, not this field.
+///
+/// - `Direct` — delivered on Arbitrum, no cross-chain hop (USDT or USDC).
+/// - `Oft`    — `LayerZero` USDT0 bridge.
+/// - `Cctp`   — Circle CCTP v2 (USDC).
+///
+/// Defaults to `Oft` so swaps persisted before CCTP/Direct existed deserialize
+/// correctly (a missing field means a pre-CCTP OFT swap).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum BridgeKind {
+    Direct,
     #[default]
     Oft,
     Cctp,
@@ -276,7 +312,7 @@ pub enum BridgeKind {
 /// collide for chains that support both bridges.
 #[derive(Clone, Debug)]
 pub struct CctpDestination {
-    /// Lowercased asset name; join key used as a [`ChainId`].
+    /// Lowercased asset name; join key used as a [`DestinationId`].
     pub id: &'static str,
     /// Asset identifier as published by the web app (e.g. `"USDC-BASE"`).
     pub asset: &'static str,
@@ -415,23 +451,25 @@ impl CctpDestination {
     }
 }
 
-/// Resolve a CCTP destination by its [`ChainId`] (the lowercased asset name).
+/// Resolve a CCTP destination by its [`DestinationId`] (the lowercased asset
+/// name, e.g. `"usdc-base"`).
 #[must_use]
-pub fn cctp_destination(id: &ChainId) -> Option<&'static CctpDestination> {
+pub fn cctp_destination(id: &DestinationId) -> Option<&'static CctpDestination> {
     CCTP_DESTINATIONS.iter().find(|d| d.id == id.as_str())
 }
 
-/// A selectable swap destination, spanning both bridges. Returned by the
-/// discovery API so callers can present USDT0 (OFT) and USDC (CCTP) options
-/// uniformly; the `id` is what you pass to `prepare_reverse_swap`.
+/// A selectable swap destination. Returned by the discovery API so callers can
+/// present every asset/chain/bridge combination uniformly; round-trip the `id`
+/// back into `prepare_reverse_swap` (never construct it by hand).
 #[derive(Clone, Debug)]
 pub struct DestinationOption {
-    pub id: ChainId,
-    /// Display label for the destination chain.
-    pub label: String,
-    /// Asset delivered there (`"USDT"`, `"USDT0"`, or `"USDC"`).
-    pub asset: String,
+    pub id: DestinationId,
+    /// Human chain label for display (`"Arbitrum"`, `"Base"`, `"Solana"`).
+    pub chain_label: String,
+    /// Asset delivered there.
+    pub asset: Asset,
     pub transport: NetworkTransport,
+    /// Coarse bridge category (for delivery-status UX).
     pub bridge_kind: BridgeKind,
 }
 
@@ -439,11 +477,11 @@ pub struct DestinationOption {
 #[derive(Clone, Debug, Serialize)]
 pub struct PreparedSwap {
     pub destination_address: String,
-    pub destination_chain: ChainId,
-    /// Which bridge will carry the destination leg (OFT for USDT, CCTP for USDC).
+    pub destination_chain: DestinationId,
+    /// Coarse bridge category for the destination leg.
     pub bridge_kind: BridgeKind,
-    /// Requested USDT output (6 decimals).
-    pub usdt_amount: u64,
+    /// Requested stablecoin output (6 decimals).
+    pub output_amount: u64,
     /// Total sats to pay (includes all fees).
     pub invoice_amount_sats: u64,
     /// Boltz service fee in sats.
@@ -473,10 +511,10 @@ pub struct CreatedSwap {
 pub struct CompletedSwap {
     pub swap_id: String,
     pub claim_tx_hash: String,
-    /// Actual USDT amount delivered (6 decimals).
-    pub usdt_delivered: u64,
+    /// Actual stablecoin amount delivered (6 decimals).
+    pub output_delivered: u64,
     pub destination_address: String,
-    pub destination_chain: ChainId,
+    pub destination_chain: DestinationId,
 }
 
 /// Min/max swap limits from the Boltz pairs endpoint.
@@ -519,14 +557,14 @@ mod tests {
             chain_id: 42161,
             claim_address: "0xabc".to_string(),
             destination_address: "0xdef".to_string(),
-            destination_chain: ChainId::new("arbitrum one"),
+            destination_chain: DestinationId::new("arbitrum one"),
             refund_address: "0x123".to_string(),
             erc20swap_address: "0xswap".to_string(),
             router_address: "0xrouter".to_string(),
             invoice: "lnbc1000n1...".to_string(),
             invoice_amount_sats: 100_000,
             onchain_amount: 99_500,
-            expected_usdt_amount: 71_000_000,
+            expected_output_amount: 71_000_000,
             slippage_bps: 100,
             timeout_block_height: 123_456,
             lockup_tx_id: None,
@@ -547,25 +585,53 @@ mod tests {
     }
 
     #[macros::test_all]
-    fn chain_id_lowercases_on_construction() {
-        assert_eq!(ChainId::new("Arbitrum One").as_str(), "arbitrum one");
-        assert_eq!(ChainId::new("SOLANA").as_str(), "solana");
-        assert_eq!(ChainId::new("tempo").as_str(), "tempo");
+    fn destination_id_lowercases_on_construction() {
+        assert_eq!(DestinationId::new("Arbitrum One").as_str(), "arbitrum one");
+        assert_eq!(DestinationId::new("SOLANA").as_str(), "solana");
+        assert_eq!(DestinationId::new("USDC-ARB").as_str(), "usdc-arb");
     }
 
     #[macros::test_all]
-    fn chain_id_round_trips_via_serde() {
-        let id = ChainId::new("Polygon PoS");
+    fn destination_id_round_trips_via_serde() {
+        let id = DestinationId::new("Polygon PoS");
         let json = serde_json::to_string(&id).unwrap();
         // `#[serde(transparent)]` serialises as a bare string.
         assert_eq!(json, r#""polygon pos""#);
-        let back: ChainId = serde_json::from_str(&json).unwrap();
+        let back: DestinationId = serde_json::from_str(&json).unwrap();
         assert_eq!(back, id);
     }
 
     #[macros::test_all]
     fn bridge_kind_defaults_to_oft() {
+        // Pre-CCTP swaps have no `bridge_kind` field; it must default to Oft.
         assert_eq!(BridgeKind::default(), BridgeKind::Oft);
+    }
+
+    #[macros::test_all]
+    fn bridge_kind_back_compat_deserializes() {
+        // Old persisted values must still deserialize after adding `Direct`.
+        assert_eq!(
+            serde_json::from_str::<BridgeKind>(r#""Oft""#).unwrap(),
+            BridgeKind::Oft
+        );
+        assert_eq!(
+            serde_json::from_str::<BridgeKind>(r#""Cctp""#).unwrap(),
+            BridgeKind::Cctp
+        );
+    }
+
+    #[macros::test_all]
+    fn bridge_kind_from_bridge() {
+        assert_eq!(Bridge::Direct.kind(), BridgeKind::Direct);
+        assert_eq!(
+            Bridge::Oft {
+                mesh: Usdt0Kind::Native,
+                lz_eid: 30110
+            }
+            .kind(),
+            BridgeKind::Oft
+        );
+        assert_eq!(Bridge::Cctp { domain: 6 }.kind(), BridgeKind::Cctp);
     }
 
     #[macros::test_all]
@@ -579,7 +645,7 @@ mod tests {
         let mut domains = HashSet::new();
         let mut solana_count = 0;
         for d in CCTP_DESTINATIONS {
-            // ids are unique and already lowercased (valid ChainId join keys).
+            // ids are unique and already lowercased (valid DestinationId keys).
             assert!(ids.insert(d.id), "duplicate id {}", d.id);
             assert_eq!(d.id, d.id.to_lowercase());
             // Circle domains are unique per destination.
@@ -601,19 +667,19 @@ mod tests {
     }
 
     #[macros::test_all]
-    fn cctp_destination_lookup_by_chain_id() {
-        let base = cctp_destination(&ChainId::new("usdc-base")).unwrap();
+    fn cctp_destination_lookup_by_destination_id() {
+        let base = cctp_destination(&DestinationId::new("usdc-base")).unwrap();
         assert_eq!(base.asset, "USDC-BASE");
         assert_eq!(base.domain, 6);
         assert_eq!(base.transport, NetworkTransport::Evm);
 
-        // Lookup is case-insensitive via ChainId normalization.
-        let sol = cctp_destination(&ChainId::new("USDC-SOL")).unwrap();
+        // Lookup is case-insensitive via DestinationId normalization.
+        let sol = cctp_destination(&DestinationId::new("USDC-SOL")).unwrap();
         assert_eq!(sol.domain, 5);
         assert_eq!(sol.transport, NetworkTransport::Solana);
 
-        // OFT chain ids must NOT resolve as CCTP destinations.
-        assert!(cctp_destination(&ChainId::new("polygon pos")).is_none());
-        assert!(cctp_destination(&ChainId::new("solana")).is_none());
+        // OFT destination ids must NOT resolve as CCTP destinations.
+        assert!(cctp_destination(&DestinationId::new("polygon pos")).is_none());
+        assert!(cctp_destination(&DestinationId::new("solana")).is_none());
     }
 }

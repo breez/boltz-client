@@ -14,7 +14,7 @@ use rustyline::{Completer, Helper, Hinter, Validator, highlight::Highlighter};
 
 use boltz_client::{
     BoltzConfig, BoltzError, BoltzEventListener, BoltzService, BoltzStorage, BoltzSwapEvent,
-    ChainId,
+    DestinationId,
 };
 
 const PHRASE_FILE_NAME: &str = "phrase";
@@ -327,7 +327,7 @@ fn cmd_info(svc: &BoltzService, seed: &[u8]) -> Result<()> {
     let mut dests: Vec<String> = svc
         .supported_destinations()
         .into_iter()
-        .map(|d| format!("{} ({})", d.label, d.asset))
+        .map(|d| format!("{} ({})", d.chain_label, d.asset))
         .collect();
     dests.sort();
     println!("\nSupported destinations:\n  {}", dests.join(", "));
@@ -344,7 +344,7 @@ async fn cmd_limits(svc: &BoltzService) -> Result<()> {
 async fn prepare(
     svc: &BoltzService,
     destination: &str,
-    chain: ChainId,
+    chain: DestinationId,
     usdt: Option<u64>,
     sats: Option<u64>,
 ) -> Result<boltz_client::PreparedSwap> {
@@ -365,11 +365,11 @@ async fn prepare(
 /// Filters via [`BoltzService::destinations_accepting`] so the list contains
 /// only transports compatible with the address format, spanning both USDT0
 /// (OFT) and USDC (CCTP). Auto-selects if exactly one matches; errors if none.
-fn pick_chain_for_address(svc: &BoltzService, destination: &str) -> Result<ChainId> {
-    let mut candidates: Vec<(String, ChainId)> = svc
+fn pick_chain_for_address(svc: &BoltzService, destination: &str) -> Result<DestinationId> {
+    let mut candidates: Vec<(String, DestinationId)> = svc
         .destinations_accepting(destination)
         .into_iter()
-        .map(|d| (format!("{} ({})", d.label, d.asset), d.id))
+        .map(|d| (format!("{} ({})", d.chain_label, d.asset), d.id))
         .collect();
     candidates.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -412,7 +412,7 @@ fn pick_chain_for_address(svc: &BoltzService, destination: &str) -> Result<Chain
 async fn cmd_swap(
     svc: &BoltzService,
     destination: &str,
-    chain: ChainId,
+    chain: DestinationId,
     usdt: Option<u64>,
     sats: Option<u64>,
 ) -> Result<()> {
@@ -468,18 +468,22 @@ impl BoltzEventListener for PrintingEventListener {
 
 // ─── Formatting ────────────────────────────────────────────────────────
 
-const USDT_FIELDS: &[&str] = &["usdt_amount", "usdt_delivered"];
+const OUTPUT_FIELDS: &[&str] = &[
+    "output_amount",
+    "output_delivered",
+    "expected_output_amount",
+];
 
 fn print_json(value: &impl serde::Serialize) {
     let mut json = serde_json::to_value(value).unwrap();
-    format_usdt_fields(&mut json);
+    format_output_fields(&mut json);
     println!("{}", serde_json::to_string_pretty(&json).unwrap());
 }
 
-fn format_usdt_fields(value: &mut serde_json::Value) {
+fn format_output_fields(value: &mut serde_json::Value) {
     if let Some(obj) = value.as_object_mut() {
         for (key, val) in obj.iter_mut() {
-            if USDT_FIELDS.contains(&key.as_str())
+            if OUTPUT_FIELDS.contains(&key.as_str())
                 && let Some(raw) = val.as_u64()
             {
                 *val = serde_json::Value::String(format!(

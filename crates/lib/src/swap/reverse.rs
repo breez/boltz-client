@@ -30,8 +30,8 @@ use crate::evm::recipient::{
 use crate::evm::signing::EvmSigner;
 use crate::keys::EvmKeyManager;
 use crate::models::{
-    BoltzSwap, BoltzSwapStatus, BridgeKind, CctpDestination, ChainId, ChainRegistry, ChainSpec,
-    NetworkTransport, PreparedSwap, SwapLimits, Usdt0Kind, cctp_destination,
+    BoltzSwap, BoltzSwapStatus, Bridge, Destination, DestinationId, DestinationRegistry,
+    NetworkTransport, PreparedSwap, SwapLimits, Usdt0Kind,
 };
 use crate::solana::ata::derive_ata;
 use crate::solana::rpc::SolanaRpcClient;
@@ -50,7 +50,7 @@ pub(crate) struct ReverseSwapExecutor {
     pub(crate) key_manager: EvmKeyManager,
     alchemy_client: AlchemyGasClient,
     pub(crate) evm_provider: EvmProvider,
-    pub(crate) chain_registry: Arc<ChainRegistry>,
+    pub(crate) chain_registry: Arc<DestinationRegistry>,
     pub(crate) config: BoltzConfig,
     /// Persistence handle, used to durably record the in-flight gas-sponsor
     /// `call_id` mid-claim (between submission and confirmation) so a crash in
@@ -78,7 +78,7 @@ impl ReverseSwapExecutor {
         key_manager: EvmKeyManager,
         alchemy_client: AlchemyGasClient,
         evm_provider: EvmProvider,
-        chain_registry: Arc<ChainRegistry>,
+        chain_registry: Arc<DestinationRegistry>,
         config: BoltzConfig,
         store: Arc<dyn BoltzStorage>,
         cctp_fee_client: CctpFeeClient,
@@ -109,12 +109,12 @@ impl ReverseSwapExecutor {
         })
     }
 
-    /// Look up a destination `ChainSpec`, raising a hard error if the ID is
-    /// unknown. Used by every path that needs per-chain metadata.
-    fn resolve_destination(&self, id: &ChainId) -> Result<&ChainSpec, BoltzError> {
+    /// Look up a [`Destination`], raising a hard error if the ID is unknown.
+    /// Used by every path that needs per-destination metadata.
+    fn resolve_destination(&self, id: &DestinationId) -> Result<&Destination, BoltzError> {
         self.chain_registry
             .get(id)
-            .ok_or_else(|| BoltzError::Generic(format!("Unsupported destination chain '{id}'")))
+            .ok_or_else(|| BoltzError::Generic(format!("Unsupported destination '{id}'")))
     }
 
     /// Prepare a reverse swap quote. No side effects.
@@ -135,65 +135,84 @@ impl ReverseSwapExecutor {
     pub async fn prepare(
         &self,
         destination: &str,
-        chain: ChainId,
-        usdt_amount: u64,
+        chain: DestinationId,
+        output_amount: u64,
         max_slippage_bps: Option<u32>,
     ) -> Result<PreparedSwap, BoltzError> {
         let slippage_bps = resolve_slippage_bps(max_slippage_bps, self.config.slippage_bps)?;
 
-        // USDC destinations bridge via CCTP rather than the USDT0 OFT mesh.
-        if let Some(dest) = cctp_destination(&chain) {
-            return self
-                .prepare_cctp(destination, chain, dest, usdt_amount, slippage_bps)
-                .await;
-        }
+        let dest = self.resolve_destination(&chain)?;
+        self.validate_destination(dest, destination)?;
 
-        let spec = self.resolve_destination(&chain)?;
-        self.validate_destination(spec, destination)?;
-
-        let tbtc_pair = self.fetch_tbtc_pair().await?;
-
-        // Compute the LayerZero executor options for this (chain, destination)
-        // pair. Solana destinations may need an ATA-creation hint, which
-        // affects the messaging fee and must feed every quote and the final
-        // `SendData` so the router signature matches on-chain execution.
-        let extra_options = self.compute_extra_options(spec, destination).await?;
-
-        // Compute the total tBTC claim amount (in sats) needed to fund
-        // the destination-side delivery.
-        let total_tbtc_sats = if self.chain_registry.is_source(&chain) {
-            // Same-chain: single DEX quote for how much tBTC to buy
-            // `usdt_amount` USDT, then floor to sats.
-            let tbtc_wei = self.fetch_quote_out_tbtc(usdt_amount).await?;
-            tbtc_wei_to_sats_u64(tbtc_wei)?
-        } else {
-            // Cross-chain: find how much USDT on Arbitrum is needed to
-            // deliver `usdt_amount` on the destination after OFT fees, then
-            // convert the USDT leg and the LZ messaging-fee leg to tBTC
-            // sats independently.
-            let required_usdt = self
-                .estimate_oft_required_send_amount(spec, u128::from(usdt_amount), &extra_options)
-                .await?;
-            let (msg_fee_native, _) = self
-                .quote_oft_messaging_fee(spec, required_usdt, &extra_options)
-                .await?;
-
-            let required_usdt_u64 = u64::try_from(required_usdt)
-                .map_err(|_| BoltzError::Generic("USDT amount overflow".into()))?;
-            let usdt_leg_tbtc_wei = self.fetch_quote_out_tbtc(required_usdt_u64).await?;
-            let usdt_leg_tbtc_sats = tbtc_wei_to_sats_u64(usdt_leg_tbtc_wei)?;
-
-            let msg_fee_tbtc_sats = if msg_fee_native == 0 {
-                0u64
-            } else {
-                let tbtc_wei = self.fetch_quote_out_tbtc_for_eth(msg_fee_native).await?;
+        // Compute the total tBTC claim amount (in sats) needed to fund the
+        // destination-side delivery. CCTP inverts a burn fee in its own flow
+        // and returns directly; Direct and Oft yield the tBTC sats and fall
+        // through to the shared fee/limit/construction tail below.
+        let total_tbtc_sats = match &dest.bridge {
+            // USDC (CCTP): the Router burns Arbitrum USDC and the burn fee is
+            // deducted from the burned amount, so invert the fee — the DEX must
+            // produce `target + fee` USDC — then quote that in tBTC.
+            Bridge::Cctp { domain } => {
+                let fee = self
+                    .cctp_fee_client
+                    .get_fee(CCTP_ARBITRUM_DOMAIN, *domain, CCTP_FINALITY_FAST)
+                    .await?;
+                let required_burn = cctp::cctp_required_burn(u128::from(output_amount), &fee);
+                let required_burn_u64 = u64::try_from(required_burn)
+                    .map_err(|_| BoltzError::Generic("USDC burn amount overflow".into()))?;
+                let tbtc_wei = self
+                    .fetch_quote_out_tbtc_for_token(required_burn_u64, dest.dex_output_token)
+                    .await?;
                 tbtc_wei_to_sats_u64(tbtc_wei)?
-            };
+            }
+            // Direct: deliver the DEX output (USDT or USDC) on Arbitrum. One
+            // DEX quote for how much tBTC buys `output_amount`, floored to sats.
+            Bridge::Direct => {
+                let tbtc_wei = self
+                    .fetch_quote_out_tbtc_for_token(output_amount, dest.dex_output_token)
+                    .await?;
+                tbtc_wei_to_sats_u64(tbtc_wei)?
+            }
+            // Cross-chain OFT: find how much USDT on Arbitrum is needed to
+            // deliver `output_amount` on the destination after OFT fees, then
+            // convert the USDT leg and the LZ messaging-fee leg to tBTC sats
+            // independently.
+            Bridge::Oft { .. } => {
+                // LayerZero executor options for this (chain, destination)
+                // pair. Solana destinations may need an ATA-creation hint,
+                // which affects the messaging fee and must feed every quote.
+                let extra_options = self.compute_extra_options(dest, destination).await?;
+                let required_usdt = self
+                    .estimate_oft_required_send_amount(
+                        dest,
+                        u128::from(output_amount),
+                        &extra_options,
+                    )
+                    .await?;
+                let (msg_fee_native, _) = self
+                    .quote_oft_messaging_fee(dest, required_usdt, &extra_options)
+                    .await?;
 
-            usdt_leg_tbtc_sats
-                .checked_add(msg_fee_tbtc_sats)
-                .ok_or_else(|| BoltzError::Generic("tBTC sats overflow".into()))?
+                let required_usdt_u64 = u64::try_from(required_usdt)
+                    .map_err(|_| BoltzError::Generic("USDT amount overflow".into()))?;
+                let usdt_leg_tbtc_wei = self.fetch_quote_out_tbtc(required_usdt_u64).await?;
+                let usdt_leg_tbtc_sats = tbtc_wei_to_sats_u64(usdt_leg_tbtc_wei)?;
+
+                let msg_fee_tbtc_sats = if msg_fee_native == 0 {
+                    0u64
+                } else {
+                    let tbtc_wei = self.fetch_quote_out_tbtc_for_eth(msg_fee_native).await?;
+                    tbtc_wei_to_sats_u64(tbtc_wei)?
+                };
+
+                usdt_leg_tbtc_sats
+                    .checked_add(msg_fee_tbtc_sats)
+                    .ok_or_else(|| BoltzError::Generic("tBTC sats overflow".into()))?
+            }
         };
+
+        let bridge_kind = dest.bridge.kind();
+        let tbtc_pair = self.fetch_tbtc_pair().await?;
 
         // Apply Boltz fee
         let fee_calc = compute_invoice_amount(&tbtc_pair, total_tbtc_sats)?;
@@ -213,70 +232,8 @@ impl ReverseSwapExecutor {
         Ok(PreparedSwap {
             destination_address: destination.to_string(),
             destination_chain: chain,
-            bridge_kind: BridgeKind::Oft,
-            usdt_amount,
-            invoice_amount_sats: fee_calc.invoice_sats,
-            boltz_fee_sats: fee_calc.boltz_fee_sats,
-            estimated_onchain_amount: fee_calc.onchain_sats,
-            slippage_bps,
-            pair_hash: tbtc_pair.hash.clone(),
-            expires_at: now.saturating_add(60),
-        })
-    }
-
-    /// Prepare a USDC (CCTP) reverse swap quote for `target_usdc` delivered on
-    /// the destination chain. The Arbitrum leg is a single DEX trade tBTC ->
-    /// USDC; the Router then burns that USDC via CCTP. The burn fee is deducted
-    /// from the burned amount, so the DEX must produce `target + fee` USDC.
-    async fn prepare_cctp(
-        &self,
-        destination: &str,
-        chain: ChainId,
-        dest: &CctpDestination,
-        target_usdc: u64,
-        slippage_bps: u32,
-    ) -> Result<PreparedSwap, BoltzError> {
-        if !is_valid_destination_address(dest.transport, destination) {
-            return Err(BoltzError::Generic(format!(
-                "Invalid destination address '{destination}' for {}",
-                dest.asset
-            )));
-        }
-
-        let tbtc_pair = self.fetch_tbtc_pair().await?;
-
-        // Quote the CCTP burn fee and invert it to the USDC the DEX must
-        // produce so `target_usdc` survives the burn.
-        let fee = self
-            .cctp_fee_client
-            .get_fee(CCTP_ARBITRUM_DOMAIN, dest.domain, CCTP_FINALITY_FAST)
-            .await?;
-        let required_burn = cctp::cctp_required_burn(u128::from(target_usdc), &fee);
-        let required_burn_u64 = u64::try_from(required_burn)
-            .map_err(|_| BoltzError::Generic("USDC burn amount overflow".into()))?;
-
-        let tbtc_wei = self
-            .fetch_quote_out_tbtc_for_token(required_burn_u64, ARBITRUM_USDC_ADDRESS)
-            .await?;
-        let total_tbtc_sats = tbtc_wei_to_sats_u64(tbtc_wei)?;
-
-        let fee_calc = compute_invoice_amount(&tbtc_pair, total_tbtc_sats)?;
-        if fee_calc.invoice_sats < tbtc_pair.limits.minimal
-            || fee_calc.invoice_sats > tbtc_pair.limits.maximal
-        {
-            return Err(BoltzError::AmountOutOfRange {
-                amount: fee_calc.invoice_sats,
-                min: tbtc_pair.limits.minimal,
-                max: tbtc_pair.limits.maximal,
-            });
-        }
-
-        let now = current_unix_timestamp();
-        Ok(PreparedSwap {
-            destination_address: destination.to_string(),
-            destination_chain: chain,
-            bridge_kind: BridgeKind::Cctp,
-            usdt_amount: target_usdc,
+            bridge_kind,
+            output_amount,
             invoice_amount_sats: fee_calc.invoice_sats,
             boltz_fee_sats: fee_calc.boltz_fee_sats,
             estimated_onchain_amount: fee_calc.onchain_sats,
@@ -326,74 +283,6 @@ impl ReverseSwapExecutor {
         Ok(amount)
     }
 
-    /// CCTP variant of [`Self::prepare_from_sats`]: forward-quote tBTC -> USDC,
-    /// then subtract the CCTP burn fee to get the delivered amount.
-    async fn prepare_cctp_from_sats(
-        &self,
-        destination: &str,
-        chain: ChainId,
-        dest: &CctpDestination,
-        invoice_amount_sats: u64,
-        slippage_bps: u32,
-    ) -> Result<PreparedSwap, BoltzError> {
-        if !is_valid_destination_address(dest.transport, destination) {
-            return Err(BoltzError::Generic(format!(
-                "Invalid destination address '{destination}' for {}",
-                dest.asset
-            )));
-        }
-
-        let tbtc_pair = self.fetch_tbtc_pair().await?;
-        if invoice_amount_sats < tbtc_pair.limits.minimal
-            || invoice_amount_sats > tbtc_pair.limits.maximal
-        {
-            return Err(BoltzError::AmountOutOfRange {
-                amount: invoice_amount_sats,
-                min: tbtc_pair.limits.minimal,
-                max: tbtc_pair.limits.maximal,
-            });
-        }
-
-        let fee_calc = compute_onchain_amount(&tbtc_pair, invoice_amount_sats)?;
-        let tbtc_evm_units = u128::from(fee_calc.onchain_sats)
-            .checked_mul(u128::from(SATS_TO_TBTC_FACTOR))
-            .ok_or_else(|| BoltzError::Generic("tBTC amount overflow".into()))?;
-
-        // USDC the DEX produces on Arbitrum (the amount that gets burned).
-        let burn_usdc = self
-            .fetch_quote_in_for_token(tbtc_evm_units, ARBITRUM_USDC_ADDRESS)
-            .await?;
-
-        // Delivered on the destination = burn - CCTP fee.
-        let fee = self
-            .cctp_fee_client
-            .get_fee(CCTP_ARBITRUM_DOMAIN, dest.domain, CCTP_FINALITY_FAST)
-            .await?;
-        let total_fee = cctp::compute_total_fee(burn_usdc, fee.bps_units, fee.forward_fee);
-        let delivered = burn_usdc.saturating_sub(total_fee);
-        if delivered == 0 {
-            return Err(BoltzError::Generic(
-                "Amount too small to cover the CCTP burn fee".into(),
-            ));
-        }
-        let usdt_output = u64::try_from(delivered)
-            .map_err(|_| BoltzError::Generic("USDC amount overflow".into()))?;
-
-        let now = current_unix_timestamp();
-        Ok(PreparedSwap {
-            destination_address: destination.to_string(),
-            destination_chain: chain,
-            bridge_kind: BridgeKind::Cctp,
-            usdt_amount: usdt_output,
-            invoice_amount_sats,
-            boltz_fee_sats: fee_calc.boltz_fee_sats,
-            estimated_onchain_amount: fee_calc.onchain_sats,
-            slippage_bps,
-            pair_hash: tbtc_pair.hash.clone(),
-            expires_at: now.saturating_add(60),
-        })
-    }
-
     /// Prepare a reverse swap quote starting from input sats.
     ///
     /// Walks the route forward:
@@ -411,21 +300,16 @@ impl ReverseSwapExecutor {
     pub async fn prepare_from_sats(
         &self,
         destination: &str,
-        chain: ChainId,
+        chain: DestinationId,
         invoice_amount_sats: u64,
         max_slippage_bps: Option<u32>,
     ) -> Result<PreparedSwap, BoltzError> {
         let slippage_bps = resolve_slippage_bps(max_slippage_bps, self.config.slippage_bps)?;
 
-        if let Some(dest) = cctp_destination(&chain) {
-            return self
-                .prepare_cctp_from_sats(destination, chain, dest, invoice_amount_sats, slippage_bps)
-                .await;
-        }
+        let dest = self.resolve_destination(&chain)?;
+        self.validate_destination(dest, destination)?;
 
-        let spec = self.resolve_destination(&chain)?;
-        self.validate_destination(spec, destination)?;
-
+        let bridge_kind = dest.bridge.kind();
         let tbtc_pair = self.fetch_tbtc_pair().await?;
 
         // Validate against Boltz swap limits
@@ -446,64 +330,90 @@ impl ReverseSwapExecutor {
             .checked_mul(u128::from(SATS_TO_TBTC_FACTOR))
             .ok_or_else(|| BoltzError::Generic("tBTC amount overflow".into()))?;
 
-        // Compute LayerZero executor options for this destination — same
-        // reasoning as `prepare`: any ATA-creation hint must feed every quote
-        // call for the returned fee to match on-chain execution.
-        let extra_options = self.compute_extra_options(spec, destination).await?;
-
-        let usdt_output = if self.chain_registry.is_source(&chain) {
-            // Same-chain: single forward DEX quote tBTC → USDT.
-            self.fetch_quote_in_usdt(tbtc_evm_units).await?
-        } else {
-            // Cross-chain: forward DEX quote tBTC → USDT, quote OFT for the
-            // messaging fee, then convert that fee to tBTC sats directly
-            // via a second DEX quote and subtract in tBTC-sat domain.
-            let initial_usdt = self.fetch_quote_in_usdt(tbtc_evm_units).await?;
-            let (msg_fee_native, _) = self
-                .quote_oft_messaging_fee(spec, u128::from(initial_usdt), &extra_options)
-                .await?;
-
-            let msg_fee_tbtc_sats = if msg_fee_native == 0 {
-                0u64
-            } else {
-                let tbtc_wei = self.fetch_quote_out_tbtc_for_eth(msg_fee_native).await?;
-                tbtc_wei_to_sats_u64(tbtc_wei)?
-            };
-
-            let adjusted_tbtc_sats = fee_calc
-                .onchain_sats
-                .checked_sub(msg_fee_tbtc_sats)
-                .ok_or_else(|| {
-                    BoltzError::Generic(
-                        "Amount too small to cover OFT cross-chain messaging fee".into(),
-                    )
-                })?;
-            if adjusted_tbtc_sats == 0 {
-                return Err(BoltzError::Generic(
-                    "Amount too small to cover OFT cross-chain messaging fee".into(),
-                ));
+        let output = match &dest.bridge {
+            // USDC (CCTP): the DEX produces Arbitrum USDC (the burned amount);
+            // what lands on the destination is that minus the CCTP burn fee.
+            Bridge::Cctp { domain } => {
+                let burn_usdc = self
+                    .fetch_quote_in_for_token(tbtc_evm_units, dest.dex_output_token)
+                    .await?;
+                let fee = self
+                    .cctp_fee_client
+                    .get_fee(CCTP_ARBITRUM_DOMAIN, *domain, CCTP_FINALITY_FAST)
+                    .await?;
+                let total_fee = cctp::compute_total_fee(burn_usdc, fee.bps_units, fee.forward_fee);
+                let delivered = burn_usdc.saturating_sub(total_fee);
+                if delivered == 0 {
+                    return Err(BoltzError::Generic(
+                        "Amount too small to cover the CCTP burn fee".into(),
+                    ));
+                }
+                u64::try_from(delivered)
+                    .map_err(|_| BoltzError::Generic("USDC amount overflow".into()))?
             }
+            // Cross-chain OFT: forward DEX quote tBTC → USDT, quote OFT for the
+            // messaging fee, then convert that fee to tBTC sats directly via a
+            // second DEX quote and subtract in tBTC-sat domain.
+            Bridge::Oft { .. } => {
+                // LayerZero executor options — same reasoning as `prepare`: any
+                // ATA-creation hint must feed every quote call.
+                let extra_options = self.compute_extra_options(dest, destination).await?;
+                let initial_usdt = self.fetch_quote_in_usdt(tbtc_evm_units).await?;
+                let (msg_fee_native, _) = self
+                    .quote_oft_messaging_fee(dest, u128::from(initial_usdt), &extra_options)
+                    .await?;
 
-            // Re-quote the DEX with the adjusted tBTC claim amount to get
-            // the USDT that actually arrives on Arbitrum, then re-quote the
-            // OFT to translate that to the destination chain's USDT.
-            let adjusted_tbtc_evm_units = u128::from(adjusted_tbtc_sats)
-                .checked_mul(u128::from(SATS_TO_TBTC_FACTOR))
-                .ok_or_else(|| BoltzError::Generic("tBTC amount overflow".into()))?;
-            let adjusted_usdt = self.fetch_quote_in_usdt(adjusted_tbtc_evm_units).await?;
-            let (_, oft_received) = self
-                .quote_oft_messaging_fee(spec, u128::from(adjusted_usdt), &extra_options)
-                .await?;
-            u64::try_from(oft_received)
-                .map_err(|_| BoltzError::Generic("USDT amount overflow".into()))?
+                let msg_fee_tbtc_sats = if msg_fee_native == 0 {
+                    0u64
+                } else {
+                    let tbtc_wei = self.fetch_quote_out_tbtc_for_eth(msg_fee_native).await?;
+                    tbtc_wei_to_sats_u64(tbtc_wei)?
+                };
+
+                let adjusted_tbtc_sats = fee_calc
+                    .onchain_sats
+                    .checked_sub(msg_fee_tbtc_sats)
+                    .ok_or_else(|| {
+                        BoltzError::Generic(
+                            "Amount too small to cover OFT cross-chain messaging fee".into(),
+                        )
+                    })?;
+                if adjusted_tbtc_sats == 0 {
+                    return Err(BoltzError::Generic(
+                        "Amount too small to cover OFT cross-chain messaging fee".into(),
+                    ));
+                }
+
+                // Re-quote the DEX with the adjusted tBTC claim amount to get
+                // the USDT that actually arrives on Arbitrum, then re-quote the
+                // OFT to translate that to the destination chain's USDT.
+                let adjusted_tbtc_evm_units = u128::from(adjusted_tbtc_sats)
+                    .checked_mul(u128::from(SATS_TO_TBTC_FACTOR))
+                    .ok_or_else(|| BoltzError::Generic("tBTC amount overflow".into()))?;
+                let adjusted_usdt = self.fetch_quote_in_usdt(adjusted_tbtc_evm_units).await?;
+                let (_, oft_received) = self
+                    .quote_oft_messaging_fee(dest, u128::from(adjusted_usdt), &extra_options)
+                    .await?;
+                u64::try_from(oft_received)
+                    .map_err(|_| BoltzError::Generic("USDT amount overflow".into()))?
+            }
+            // Direct (same-chain) delivery: single forward DEX quote
+            // tBTC → output token (USDT or USDC on Arbitrum).
+            Bridge::Direct => {
+                let out = self
+                    .fetch_quote_in_for_token(tbtc_evm_units, dest.dex_output_token)
+                    .await?;
+                u64::try_from(out)
+                    .map_err(|_| BoltzError::Generic("output amount overflow".into()))?
+            }
         };
 
         let now = current_unix_timestamp();
         Ok(PreparedSwap {
             destination_address: destination.to_string(),
             destination_chain: chain,
-            bridge_kind: BridgeKind::Oft,
-            usdt_amount: usdt_output,
+            bridge_kind,
+            output_amount: output,
             invoice_amount_sats,
             boltz_fee_sats: fee_calc.boltz_fee_sats,
             estimated_onchain_amount: fee_calc.onchain_sats,
@@ -614,7 +524,7 @@ impl ReverseSwapExecutor {
             invoice: resp.invoice,
             invoice_amount_sats: prepared.invoice_amount_sats,
             onchain_amount: resp.onchain_amount,
-            expected_usdt_amount: prepared.usdt_amount,
+            expected_output_amount: prepared.output_amount,
             slippage_bps: prepared.slippage_bps,
             timeout_block_height: resp.timeout_block_height,
             lockup_tx_id: None,
@@ -838,12 +748,9 @@ impl ReverseSwapExecutor {
             .fetch_erc20swap_version(&swap.erc20swap_address)
             .await?;
 
-        // CCTP swaps deliver USDC and aren't in the USDT0 OFT registry, so
-        // resolve their addresses without it.
-        let addrs = match swap.bridge_kind {
-            BridgeKind::Cctp => ClaimAddresses::parse_cctp(swap)?,
-            BridgeKind::Oft => ClaimAddresses::parse(swap, &self.chain_registry)?,
-        };
+        // Addresses (including the DEX output token) come from the resolved
+        // destination, which covers every bridge uniformly.
+        let addrs = ClaimAddresses::parse(swap, &self.chain_registry)?;
         let tbtc_evm_amount = U256::from(swap.onchain_amount)
             .checked_mul(U256::from(SATS_TO_TBTC_FACTOR))
             .ok_or_else(|| BoltzError::Generic("tBTC EVM amount overflow".into()))?;
@@ -933,46 +840,56 @@ impl ReverseSwapExecutor {
         timelock: U256,
         skip_drift_check: bool,
     ) -> Result<String, BoltzError> {
-        if swap.bridge_kind == BridgeKind::Cctp {
-            self.try_claim_cctp(
-                swap,
-                gas_signer,
-                erc20swap_version,
-                preimage,
-                addrs,
-                tbtc_evm_amount,
-                timelock,
-                skip_drift_check,
-            )
-            .await
-        } else if self.chain_registry.is_source(&swap.destination_chain) {
-            self.try_claim_same_chain(
-                swap,
-                gas_signer,
-                erc20swap_version,
-                preimage,
-                addrs,
-                tbtc_evm_amount,
-                timelock,
-                skip_drift_check,
-            )
-            .await
-        } else {
-            self.try_claim_cross_chain(
-                swap,
-                gas_signer,
-                erc20swap_version,
-                preimage,
-                addrs,
-                tbtc_evm_amount,
-                timelock,
-                skip_drift_check,
-            )
-            .await
+        // Dispatch on the resolved destination's bridge — the single source of
+        // truth for how this swap is delivered.
+        let dest = self.resolve_destination(&swap.destination_chain)?;
+        match dest.bridge {
+            Bridge::Cctp { domain } => {
+                self.try_claim_cctp(
+                    swap,
+                    domain,
+                    dest.transport,
+                    gas_signer,
+                    erc20swap_version,
+                    preimage,
+                    addrs,
+                    tbtc_evm_amount,
+                    timelock,
+                    skip_drift_check,
+                )
+                .await
+            }
+            Bridge::Direct => {
+                self.try_claim_same_chain(
+                    swap,
+                    gas_signer,
+                    erc20swap_version,
+                    preimage,
+                    addrs,
+                    tbtc_evm_amount,
+                    timelock,
+                    skip_drift_check,
+                )
+                .await
+            }
+            Bridge::Oft { .. } => {
+                self.try_claim_cross_chain(
+                    swap,
+                    gas_signer,
+                    erc20swap_version,
+                    preimage,
+                    addrs,
+                    tbtc_evm_amount,
+                    timelock,
+                    skip_drift_check,
+                )
+                .await
+            }
         }
     }
 
-    /// Same-chain claim: claim tBTC + DEX swap to USDT + sweep to destination on Arbitrum.
+    /// Direct claim: claim tBTC + DEX swap to the output token (USDT or USDC)
+    /// + sweep to the destination on Arbitrum. No cross-chain bridge.
     #[expect(clippy::too_many_arguments)]
     async fn try_claim_same_chain(
         &self,
@@ -991,28 +908,27 @@ impl ReverseSwapExecutor {
 
         let quotes = self
             .api_client
-            .get_quote_in(
-                "ARB",
-                ARBITRUM_TBTC_ADDRESS,
-                ARBITRUM_USDT_ADDRESS,
-                amount_in,
-            )
+            .get_quote_in("ARB", ARBITRUM_TBTC_ADDRESS, addrs.output_token, amount_in)
             .await?;
         let best = pick_best_quote_with_data(&quotes, QuoteDirection::In)?;
         if best.amount == 0 {
             return Err(BoltzError::InvalidQuote(
-                "DEX quote returned zero USDT".into(),
+                "DEX quote returned zero output".into(),
             ));
         }
         let raw_quote_usdt = best.amount;
 
         if !skip_drift_check {
-            check_quote_drift(swap.expected_usdt_amount, raw_quote_usdt, swap.slippage_bps)?;
+            check_quote_drift(
+                swap.expected_output_amount,
+                raw_quote_usdt,
+                swap.slippage_bps,
+            )?;
         }
 
         let min_amount_out_u128 = compute_claim_floor(
             raw_quote_usdt,
-            swap.expected_usdt_amount,
+            swap.expected_output_amount,
             swap.slippage_bps,
             skip_drift_check,
         );
@@ -1105,6 +1021,8 @@ impl ReverseSwapExecutor {
     async fn try_claim_cctp(
         &self,
         swap: &BoltzSwap,
+        domain: u32,
+        transport: NetworkTransport,
         gas_signer: &EvmSigner,
         erc20swap_version: &str,
         preimage: &[u8; 32],
@@ -1113,13 +1031,6 @@ impl ReverseSwapExecutor {
         timelock: U256,
         skip_drift_check: bool,
     ) -> Result<String, BoltzError> {
-        let dest = cctp_destination(&swap.destination_chain).ok_or_else(|| {
-            BoltzError::Generic(format!(
-                "Unknown CCTP destination '{}' for swap {}",
-                swap.destination_chain, swap.id
-            ))
-        })?;
-
         let amount_in: u128 = tbtc_evm_amount
             .try_into()
             .map_err(|_| BoltzError::Generic("tBTC amount too large".into()))?;
@@ -1145,7 +1056,7 @@ impl ReverseSwapExecutor {
         // Re-quote the CCTP burn fee at claim time and cap it with a buffer.
         let fee = self
             .cctp_fee_client
-            .get_fee(CCTP_ARBITRUM_DOMAIN, dest.domain, CCTP_FINALITY_FAST)
+            .get_fee(CCTP_ARBITRUM_DOMAIN, domain, CCTP_FINALITY_FAST)
             .await?;
         let max_fee = cctp::add_fee_buffer(cctp::compute_total_fee(
             raw_quote_usdc,
@@ -1156,11 +1067,11 @@ impl ReverseSwapExecutor {
         // The amount that would actually land on the destination = burn - fee.
         let net_quote = raw_quote_usdc.saturating_sub(max_fee);
         if !skip_drift_check {
-            check_quote_drift(swap.expected_usdt_amount, net_quote, swap.slippage_bps)?;
+            check_quote_drift(swap.expected_output_amount, net_quote, swap.slippage_bps)?;
         }
         let delivered_floor = compute_claim_floor(
             net_quote,
-            swap.expected_usdt_amount,
+            swap.expected_output_amount,
             swap.slippage_bps,
             skip_drift_check,
         );
@@ -1195,7 +1106,7 @@ impl ReverseSwapExecutor {
 
         // Build CctpData.
         let token_messenger = parse_address(CCTP_TOKEN_MESSENGER_V2)?;
-        let mint_recipient = match dest.transport {
+        let mint_recipient = match transport {
             NetworkTransport::Evm => cctp::evm_mint_recipient(&swap.destination_address)?,
             NetworkTransport::Solana => cctp::solana_mint_recipient(&swap.destination_address)?,
             NetworkTransport::Tron => {
@@ -1204,10 +1115,12 @@ impl ReverseSwapExecutor {
                 ));
             }
         };
-        let hook_data = self.cctp_hook_data(dest, &swap.destination_address).await?;
+        let hook_data = self
+            .cctp_hook_data(transport, &swap.destination_address)
+            .await?;
 
         let cctp_data = CctpData {
-            destinationDomain: dest.domain,
+            destinationDomain: domain,
             mintRecipient: mint_recipient,
             destinationCaller: FixedBytes::<32>::ZERO,
             maxFee: U256::from(max_fee),
@@ -1275,10 +1188,10 @@ impl ReverseSwapExecutor {
     /// when it does not.
     async fn cctp_hook_data(
         &self,
-        dest: &CctpDestination,
+        transport: NetworkTransport,
         destination: &str,
     ) -> Result<Vec<u8>, BoltzError> {
-        if dest.transport != NetworkTransport::Solana {
+        if transport != NetworkTransport::Solana {
             return Ok(cctp::evm_forward_hook_data().to_vec());
         }
 
@@ -1309,21 +1222,19 @@ impl ReverseSwapExecutor {
         skip_drift_check: bool,
     ) -> Result<String, BoltzError> {
         let dst_info = self.resolve_destination(&swap.destination_chain)?;
-        let dst_eid = dst_info.lz_eid;
+        let (mesh, dst_eid) = dst_info.oft().ok_or_else(|| {
+            BoltzError::Generic(format!(
+                "Destination '{}' is not an OFT route",
+                swap.destination_chain
+            ))
+        })?;
 
         // The legacy and native USDT0 meshes deploy distinct OFT contracts
         // on the source chain — pick the one matching the destination's mesh
         // so quoting and sending bridge through the right contract.
-        let source_oft_address = self
-            .chain_registry
-            .source
-            .oft_for(dst_info.mesh)
-            .ok_or_else(|| {
-                BoltzError::Generic(format!(
-                    "Source chain has no {:?} mesh OFT deployment",
-                    dst_info.mesh
-                ))
-            })?;
+        let source_oft_address = self.chain_registry.oft_for(mesh).ok_or_else(|| {
+            BoltzError::Generic(format!("Source chain has no {mesh:?} mesh OFT deployment"))
+        })?;
         let oft_addr = parse_address(source_oft_address)?;
 
         let tbtc_amount: u128 = tbtc_evm_amount
@@ -1380,7 +1291,7 @@ impl ReverseSwapExecutor {
         // buffer size: it determines how much fee variance we absorb before
         // reverting. Crucially this does NOT affect the user-facing
         // promise — `min_amount_ld_slipped` below is anchored on
-        // `expected_usdt_amount`, so a bigger buffer just shrinks
+        // `expected_output_amount`, so a bigger buffer just shrinks
         // `raw_dest_amount` and is caught by the drift check, never by
         // delivering less than `expected × (1 − s)`.
         let native_fee: u128 = msg_fee
@@ -1452,7 +1363,7 @@ impl ReverseSwapExecutor {
 
         if !skip_drift_check {
             check_quote_drift(
-                swap.expected_usdt_amount,
+                swap.expected_output_amount,
                 raw_dest_amount,
                 swap.slippage_bps,
             )?;
@@ -1460,7 +1371,7 @@ impl ReverseSwapExecutor {
 
         let min_amount_ld_slipped = compute_claim_floor(
             raw_dest_amount,
-            swap.expected_usdt_amount,
+            swap.expected_output_amount,
             swap.slippage_bps,
             skip_drift_check,
         );
@@ -1725,7 +1636,7 @@ impl ReverseSwapExecutor {
     /// because the legacy bridge fee is not deducted by the staticcall.
     async fn estimate_oft_required_send_amount(
         &self,
-        spec: &ChainSpec,
+        dest: &Destination,
         target_amount: u128,
         extra_options: &Bytes,
     ) -> Result<u128, BoltzError> {
@@ -1733,10 +1644,14 @@ impl ReverseSwapExecutor {
             return Ok(0);
         }
 
+        let (mesh, _) = dest.oft().ok_or_else(|| {
+            BoltzError::Generic(format!("Destination '{}' is not an OFT route", dest.id))
+        })?;
+
         // Legacy-mesh routes: skip the binary search and apply the closed-form
         // 3 bps inverse. The legacy `quoteOFT` does not deduct the bridge fee,
         // so the search would converge to a too-low source amount.
-        if spec.mesh == Usdt0Kind::Legacy {
+        if mesh == Usdt0Kind::Legacy {
             return legacy_mesh_source_amount(target_amount)
                 .ok_or_else(|| BoltzError::Generic("Legacy mesh source amount overflow".into()));
         }
@@ -1752,7 +1667,7 @@ impl ReverseSwapExecutor {
         let mut attempts = 0u32;
         loop {
             let (_, received) = self
-                .quote_oft_messaging_fee(spec, high, extra_options)
+                .quote_oft_messaging_fee(dest, high, extra_options)
                 .await?;
             if received >= target_amount {
                 break;
@@ -1782,7 +1697,7 @@ impl ReverseSwapExecutor {
         while low < high {
             let mid = low + (high - low) / 2;
             let (_, received) = self
-                .quote_oft_messaging_fee(spec, mid, extra_options)
+                .quote_oft_messaging_fee(dest, mid, extra_options)
                 .await?;
             if received >= target_amount {
                 high = mid;
@@ -1803,27 +1718,24 @@ impl ReverseSwapExecutor {
     /// account creation, which materially affects the fee.
     async fn quote_oft_messaging_fee(
         &self,
-        spec: &ChainSpec,
+        dest: &Destination,
         usdt_amount: u128,
         extra_options: &Bytes,
     ) -> Result<(u128, u128), BoltzError> {
+        let (mesh, lz_eid) = dest.oft().ok_or_else(|| {
+            BoltzError::Generic(format!("Destination '{}' is not an OFT route", dest.id))
+        })?;
+
         // Match the source OFT to the destination's mesh: legacy and native
         // USDT0 use distinct contracts on the source chain.
-        let source_oft_address =
-            self.chain_registry
-                .source
-                .oft_for(spec.mesh)
-                .ok_or_else(|| {
-                    BoltzError::Generic(format!(
-                        "Source chain has no {:?} mesh OFT deployment",
-                        spec.mesh
-                    ))
-                })?;
+        let source_oft_address = self.chain_registry.oft_for(mesh).ok_or_else(|| {
+            BoltzError::Generic(format!("Source chain has no {mesh:?} mesh OFT deployment"))
+        })?;
 
         // The recipient is irrelevant for messaging-fee estimation; an all-zero
         // 32-byte placeholder is fine for both EVM and non-EVM destinations.
         let send_param = contracts::build_oft_send_param(
-            spec.lz_eid,
+            lz_eid,
             FixedBytes::<32>::ZERO,
             U256::from(usdt_amount),
             U256::ZERO,
@@ -1875,15 +1787,19 @@ impl ReverseSwapExecutor {
     /// Validate the destination address for the given chain's transport before
     /// committing to a swap, and reject addresses that are themselves a known
     /// token *contract* address (sending tokens there would burn them).
-    fn validate_destination(&self, spec: &ChainSpec, destination: &str) -> Result<(), BoltzError> {
-        if !is_valid_destination_address(spec.transport, destination) {
+    fn validate_destination(
+        &self,
+        dest: &Destination,
+        destination: &str,
+    ) -> Result<(), BoltzError> {
+        if !is_valid_destination_address(dest.transport, destination) {
             return Err(BoltzError::Generic(format!(
-                "Invalid destination address '{destination}' for {}",
-                spec.display_name
+                "Invalid destination address '{destination}' for {} ({})",
+                dest.chain_label, dest.asset
             )));
         }
 
-        if self.is_known_token_address(spec.transport, destination) {
+        if self.is_known_token_address(dest.transport, destination) {
             return Err(BoltzError::Generic(format!(
                 "Destination '{destination}' is a known token contract address; \
                  sending there would burn funds"
@@ -1909,9 +1825,9 @@ impl ReverseSwapExecutor {
             NetworkTransport::Solana => known.push(SOLANA_USDT0_MINT),
             NetworkTransport::Tron => {}
         }
-        for spec in self.chain_registry.destinations.values() {
-            if spec.transport == transport
-                && let Some(token) = &spec.token_address
+        for dest in self.chain_registry.destinations.values() {
+            if dest.transport == transport
+                && let Some(token) = &dest.dest_token_address
             {
                 known.push(token.as_str());
             }
@@ -1922,15 +1838,15 @@ impl ReverseSwapExecutor {
 
     async fn compute_extra_options(
         &self,
-        spec: &ChainSpec,
+        dest: &Destination,
         destination: &str,
     ) -> Result<Bytes, BoltzError> {
         // Temporary workaround: OFT sends to Polygon need a bumped `lzReceive`
         // gas limit (boltz-web-app#1500). Polygon is an EVM destination, so it
         // never overlaps the Solana ATA branch below.
-        let polygon_gas_bump = spec.evm_chain_id == Some(POLYGON_EVM_CHAIN_ID);
+        let polygon_gas_bump = dest.evm_chain_id == Some(POLYGON_EVM_CHAIN_ID);
 
-        if spec.transport != NetworkTransport::Solana {
+        if dest.transport != NetworkTransport::Solana {
             return Ok(Bytes::from(build_extra_options(false, polygon_gas_bump)));
         }
 
@@ -2103,7 +2019,12 @@ struct ClaimAddresses {
     erc20swap: alloy_primitives::Address,
     router: alloy_primitives::Address,
     tbtc: alloy_primitives::Address,
+    /// The DEX output token on Arbitrum — Arbitrum USDT for OFT/USDT-direct
+    /// routes, Arbitrum USDC for CCTP/USDC-direct routes. Named `usdt` for
+    /// historical reasons; see also [`Self::output_token`] for its string form.
     usdt: alloy_primitives::Address,
+    /// Canonical string form of the DEX output token, for DEX quote requests.
+    output_token: &'static str,
     refund: alloy_primitives::Address,
     /// EVM destination address. `Some` for EVM transports (used by the
     /// same-chain claim path which signs over the destination as an
@@ -2116,15 +2037,17 @@ struct ClaimAddresses {
 }
 
 impl ClaimAddresses {
-    fn parse(swap: &BoltzSwap, registry: &ChainRegistry) -> Result<Self, BoltzError> {
-        let spec = registry.get(&swap.destination_chain).ok_or_else(|| {
+    /// Resolve claim addresses for any bridge from the unified registry. The
+    /// DEX output token comes from the resolved [`Destination`] (USDT or USDC).
+    fn parse(swap: &BoltzSwap, registry: &DestinationRegistry) -> Result<Self, BoltzError> {
+        let dest = registry.get(&swap.destination_chain).ok_or_else(|| {
             BoltzError::Generic(format!(
-                "Unknown destination chain '{}' for swap {}",
+                "Unknown destination '{}' for swap {}",
                 swap.destination_chain, swap.id
             ))
         })?;
-        let destination_bytes32 = encode_oft_recipient(spec.transport, &swap.destination_address)?;
-        let destination_evm = match spec.transport {
+        let destination_bytes32 = encode_oft_recipient(dest.transport, &swap.destination_address)?;
+        let destination_evm = match dest.transport {
             NetworkTransport::Evm => Some(parse_address(&swap.destination_address)?),
             NetworkTransport::Solana | NetworkTransport::Tron => None,
         };
@@ -2132,26 +2055,11 @@ impl ClaimAddresses {
             erc20swap: parse_address(&swap.erc20swap_address)?,
             router: parse_address(&swap.router_address)?,
             tbtc: parse_address(ARBITRUM_TBTC_ADDRESS)?,
-            usdt: parse_address(ARBITRUM_USDT_ADDRESS)?,
+            usdt: parse_address(dest.dex_output_token)?,
+            output_token: dest.dex_output_token,
             refund: parse_address(&swap.refund_address)?,
             destination_evm,
             destination_bytes32,
-        })
-    }
-
-    /// Addresses for a CCTP (USDC) claim. CCTP destinations are not in the
-    /// USDT0 OFT registry, so this resolves them without it. `usdt` carries the
-    /// DEX output token, which for CCTP is Arbitrum USDC; the destination
-    /// fields are unused (the CCTP path derives its own `mintRecipient`).
-    fn parse_cctp(swap: &BoltzSwap) -> Result<Self, BoltzError> {
-        Ok(Self {
-            erc20swap: parse_address(&swap.erc20swap_address)?,
-            router: parse_address(&swap.router_address)?,
-            tbtc: parse_address(ARBITRUM_TBTC_ADDRESS)?,
-            usdt: parse_address(ARBITRUM_USDC_ADDRESS)?,
-            refund: parse_address(&swap.refund_address)?,
-            destination_evm: None,
-            destination_bytes32: FixedBytes::<32>::ZERO,
         })
     }
 }

@@ -48,7 +48,7 @@ pub struct BoltzService {
     swap_manager: SwapManager,
     event_emitter: Arc<EventEmitter>,
     ws_subscriber: Arc<SwapStatusSubscriber>,
-    chain_registry: Arc<ChainRegistry>,
+    chain_registry: Arc<DestinationRegistry>,
 }
 
 impl BoltzService {
@@ -234,12 +234,12 @@ impl BoltzService {
     pub async fn prepare_reverse_swap(
         &self,
         destination: &str,
-        chain: ChainId,
-        usdt_amount: u64,
+        chain: DestinationId,
+        output_amount: u64,
         max_slippage_bps: Option<u32>,
     ) -> Result<PreparedSwap, BoltzError> {
         self.executor
-            .prepare(destination, chain, usdt_amount, max_slippage_bps)
+            .prepare(destination, chain, output_amount, max_slippage_bps)
             .await
     }
 
@@ -251,7 +251,7 @@ impl BoltzService {
     pub async fn prepare_reverse_swap_from_sats(
         &self,
         destination: &str,
-        chain: ChainId,
+        chain: DestinationId,
         invoice_amount_sats: u64,
         max_slippage_bps: Option<u32>,
     ) -> Result<PreparedSwap, BoltzError> {
@@ -315,60 +315,25 @@ impl BoltzService {
         self.executor.create_probe_invoice(prepared).await
     }
 
-    /// All destination chain IDs published by USDT0 and supported by this
-    /// client. Populated from the USDT0 deployments fetch at init time.
-    pub fn supported_chains(&self) -> Vec<ChainId> {
-        self.chain_registry.supported_chains()
-    }
-
-    /// Full metadata for a destination chain (display name, transport, OFT
-    /// addresses, mesh, …). Returns `None` for an unknown ID.
-    pub fn chain_spec(&self, id: &ChainId) -> Option<&ChainSpec> {
-        self.chain_registry.get(id)
-    }
-
-    /// Destinations whose transport accepts `address` as a valid recipient.
-    /// Use this to drive UX flows that pick a chain from an address.
-    ///
-    /// NOTE: OFT (USDT0) destinations only. For a unified list that also
-    /// includes USDC (CCTP) destinations, use
-    /// [`destinations_accepting`](Self::destinations_accepting).
-    pub fn chains_accepting(&self, address: &str) -> Vec<&ChainSpec> {
+    /// Every selectable destination across all bridges (OFT/USDT0, CCTP/USDC,
+    /// and Arbitrum-direct USDT/USDC). Round-trip [`DestinationOption::id`]
+    /// back into `prepare_reverse_swap`.
+    pub fn supported_destinations(&self) -> Vec<DestinationOption> {
         self.chain_registry
             .destinations
             .values()
-            .filter(|spec| is_valid_destination_address(spec.transport, address))
+            .map(|dest| DestinationOption {
+                id: dest.id.clone(),
+                chain_label: dest.chain_label.clone(),
+                asset: dest.asset,
+                transport: dest.transport,
+                bridge_kind: dest.bridge.kind(),
+            })
             .collect()
     }
 
-    /// All selectable destinations across both bridges: USDT0 (OFT) from the
-    /// runtime registry plus the static USDC (CCTP) set. Each
-    /// [`DestinationOption::id`] is what you pass to `prepare_reverse_swap`.
-    pub fn supported_destinations(&self) -> Vec<DestinationOption> {
-        let mut out: Vec<DestinationOption> = self
-            .chain_registry
-            .destinations
-            .values()
-            .map(|spec| DestinationOption {
-                id: spec.id.clone(),
-                label: spec.display_name.clone(),
-                asset: spec.asset_symbol().to_string(),
-                transport: spec.transport,
-                bridge_kind: BridgeKind::Oft,
-            })
-            .collect();
-        out.extend(CCTP_DESTINATIONS.iter().map(|d| DestinationOption {
-            id: ChainId::new(d.id),
-            label: d.chain_label().to_string(),
-            asset: "USDC".to_string(),
-            transport: d.transport,
-            bridge_kind: BridgeKind::Cctp,
-        }));
-        out
-    }
-
-    /// Destinations (across both bridges) whose transport accepts `address`.
-    /// The CCTP-aware counterpart of [`chains_accepting`](Self::chains_accepting).
+    /// Destinations whose transport accepts `address` as a valid recipient.
+    /// Drives UX flows that pick a destination from an address.
     pub fn destinations_accepting(&self, address: &str) -> Vec<DestinationOption> {
         self.supported_destinations()
             .into_iter()

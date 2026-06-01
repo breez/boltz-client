@@ -87,7 +87,7 @@ mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
     use super::*;
-    use crate::models::{BoltzSwapStatus, BridgeKind, ChainId};
+    use crate::models::{BoltzSwapStatus, BridgeKind, DestinationId};
 
     fn test_swap(id: &str, status: BoltzSwapStatus) -> BoltzSwap {
         BoltzSwap {
@@ -98,14 +98,14 @@ mod tests {
             chain_id: 42161,
             claim_address: "0xabc".to_string(),
             destination_address: "0xdef".to_string(),
-            destination_chain: ChainId::new("arbitrum one"),
+            destination_chain: DestinationId::new("arbitrum one"),
             refund_address: "0x123".to_string(),
             erc20swap_address: "0xswap".to_string(),
             router_address: "0xrouter".to_string(),
             invoice: "lnbc...".to_string(),
             invoice_amount_sats: 100_000,
             onchain_amount: 99_500,
-            expected_usdt_amount: 71_000_000,
+            expected_output_amount: 71_000_000,
             slippage_bps: 100,
             timeout_block_height: 123_456,
             lockup_tx_id: None,

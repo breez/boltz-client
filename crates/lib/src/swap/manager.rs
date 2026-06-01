@@ -5,7 +5,7 @@ use platform_utils::tokio;
 use tokio::sync::{Mutex, mpsc, watch};
 
 use crate::api::ws::{SwapStatusSubscriber, SwapStatusUpdate};
-use crate::config::{ARBITRUM_USDT_ADDRESS, CCTP_MESSAGE_TRANSMITTER_V2};
+use crate::config::CCTP_MESSAGE_TRANSMITTER_V2;
 use crate::error::BoltzError;
 use crate::events::{BoltzSwapEvent, EventEmitter};
 use crate::evm::contracts::{
@@ -13,7 +13,7 @@ use crate::evm::contracts::{
 };
 use crate::evm::lockup::is_swap_still_locked_by_swap;
 use crate::evm::provider::TxReceipt;
-use crate::models::{BoltzSwap, BoltzSwapStatus, BridgeKind};
+use crate::models::{BoltzSwap, BoltzSwapStatus, Bridge};
 use crate::store::BoltzStorage;
 use crate::swap::reverse::{ReverseSwapExecutor, current_unix_timestamp};
 
@@ -634,23 +634,28 @@ fn delivered_source_for(
     executor: &ReverseSwapExecutor,
     swap: &BoltzSwap,
 ) -> Option<DeliveredAmountSource> {
-    // CCTP swaps emit a MessageSent log from the MessageTransmitter rather than
-    // an OFTSent / Transfer log; they are not in the OFT registry.
-    if swap.bridge_kind == BridgeKind::Cctp {
-        let message_transmitter = parse_address(CCTP_MESSAGE_TRANSMITTER_V2).ok()?;
-        return Some(DeliveredAmountSource::Cctp {
-            message_transmitter,
-        });
-    }
-
     let registry = &executor.chain_registry;
-    if registry.is_source(&swap.destination_chain) {
-        let token = parse_address(ARBITRUM_USDT_ADDRESS).ok()?;
-        let user = parse_address(&swap.destination_address).ok()?;
-        return Some(DeliveredAmountSource::ArbitrumTransfer { token, user });
+    let dest = registry.get(&swap.destination_chain)?;
+    match dest.bridge {
+        // CCTP swaps emit a MessageSent log from the MessageTransmitter rather
+        // than an OFTSent / Transfer log.
+        Bridge::Cctp { .. } => {
+            let message_transmitter = parse_address(CCTP_MESSAGE_TRANSMITTER_V2).ok()?;
+            Some(DeliveredAmountSource::Cctp {
+                message_transmitter,
+            })
+        }
+        // Direct delivery: read the final ERC20 Transfer of the output token
+        // (USDT or USDC) to the user on Arbitrum.
+        Bridge::Direct => {
+            let token = parse_address(dest.dex_output_token).ok()?;
+            let user = parse_address(&swap.destination_address).ok()?;
+            Some(DeliveredAmountSource::ArbitrumTransfer { token, user })
+        }
+        Bridge::Oft { mesh, .. } => {
+            let oft_addr = registry.oft_for(mesh)?;
+            let oft_contract = parse_address(oft_addr).ok()?;
+            Some(DeliveredAmountSource::OftSent { oft_contract })
+        }
     }
-    let spec = registry.get(&swap.destination_chain)?;
-    let oft_addr = registry.source.oft_for(spec.mesh)?;
-    let oft_contract = parse_address(oft_addr).ok()?;
-    Some(DeliveredAmountSource::OftSent { oft_contract })
 }
