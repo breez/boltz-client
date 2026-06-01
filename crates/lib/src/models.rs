@@ -406,10 +406,33 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
     },
 ];
 
+impl CctpDestination {
+    /// Human-ish chain label derived from the asset name (`"USDC-BASE"` ->
+    /// `"BASE"`), for discovery/UX listings.
+    #[must_use]
+    pub fn chain_label(&self) -> &'static str {
+        self.asset.strip_prefix("USDC-").unwrap_or(self.asset)
+    }
+}
+
 /// Resolve a CCTP destination by its [`ChainId`] (the lowercased asset name).
 #[must_use]
 pub fn cctp_destination(id: &ChainId) -> Option<&'static CctpDestination> {
     CCTP_DESTINATIONS.iter().find(|d| d.id == id.as_str())
+}
+
+/// A selectable swap destination, spanning both bridges. Returned by the
+/// discovery API so callers can present USDT0 (OFT) and USDC (CCTP) options
+/// uniformly; the `id` is what you pass to `prepare_reverse_swap`.
+#[derive(Clone, Debug)]
+pub struct DestinationOption {
+    pub id: ChainId,
+    /// Display label for the destination chain.
+    pub label: String,
+    /// Asset delivered there (`"USDT"`, `"USDT0"`, or `"USDC"`).
+    pub asset: String,
+    pub transport: NetworkTransport,
+    pub bridge_kind: BridgeKind,
 }
 
 /// Quote result returned to caller before committing to a swap.

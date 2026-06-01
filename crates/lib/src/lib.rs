@@ -330,11 +330,50 @@ impl BoltzService {
 
     /// Destinations whose transport accepts `address` as a valid recipient.
     /// Use this to drive UX flows that pick a chain from an address.
+    ///
+    /// NOTE: OFT (USDT0) destinations only. For a unified list that also
+    /// includes USDC (CCTP) destinations, use
+    /// [`destinations_accepting`](Self::destinations_accepting).
     pub fn chains_accepting(&self, address: &str) -> Vec<&ChainSpec> {
         self.chain_registry
             .destinations
             .values()
             .filter(|spec| is_valid_destination_address(spec.transport, address))
+            .collect()
+    }
+
+    /// All selectable destinations across both bridges: USDT0 (OFT) from the
+    /// runtime registry plus the static USDC (CCTP) set. Each
+    /// [`DestinationOption::id`] is what you pass to `prepare_reverse_swap`.
+    pub fn supported_destinations(&self) -> Vec<DestinationOption> {
+        let mut out: Vec<DestinationOption> = self
+            .chain_registry
+            .destinations
+            .values()
+            .map(|spec| DestinationOption {
+                id: spec.id.clone(),
+                label: spec.display_name.clone(),
+                asset: spec.asset_symbol().to_string(),
+                transport: spec.transport,
+                bridge_kind: BridgeKind::Oft,
+            })
+            .collect();
+        out.extend(CCTP_DESTINATIONS.iter().map(|d| DestinationOption {
+            id: ChainId::new(d.id),
+            label: d.chain_label().to_string(),
+            asset: "USDC".to_string(),
+            transport: d.transport,
+            bridge_kind: BridgeKind::Cctp,
+        }));
+        out
+    }
+
+    /// Destinations (across both bridges) whose transport accepts `address`.
+    /// The CCTP-aware counterpart of [`chains_accepting`](Self::chains_accepting).
+    pub fn destinations_accepting(&self, address: &str) -> Vec<DestinationOption> {
+        self.supported_destinations()
+            .into_iter()
+            .filter(|d| is_valid_destination_address(d.transport, address))
             .collect()
     }
 
