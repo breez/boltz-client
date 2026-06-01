@@ -313,10 +313,13 @@ pub enum BridgeKind {
 /// collide for chains that support both bridges.
 #[derive(Clone, Debug)]
 pub struct CctpDestination {
-    /// Lowercased asset name; join key used as a [`DestinationId`].
+    /// Lowercased asset name; join key used as a [`DestinationId`]. The
+    /// web-app asset identifier (e.g. `"USDC-BASE"`) is just its uppercase.
     pub id: &'static str,
-    /// Asset identifier as published by the web app (e.g. `"USDC-BASE"`).
-    pub asset: &'static str,
+    /// Human chain label for display (`"Base"`, `"Optimism"`). Matches the
+    /// USDT0 deployments-API spelling for chains that also support OFT, so a
+    /// chain never appears under two different names across the two bridges.
+    pub chain_label: &'static str,
     pub transport: NetworkTransport,
     /// Circle CCTP domain id of the destination chain.
     pub domain: u32,
@@ -331,126 +334,117 @@ pub struct CctpDestination {
 pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
     CctpDestination {
         id: "usdc-base",
-        asset: "USDC-BASE",
+        chain_label: "Base",
         transport: NetworkTransport::Evm,
         domain: 6,
         token_address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
     },
     CctpDestination {
         id: "usdc-eth",
-        asset: "USDC-ETH",
+        chain_label: "Ethereum",
         transport: NetworkTransport::Evm,
         domain: 0,
         token_address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
     },
     CctpDestination {
         id: "usdc-avax",
-        asset: "USDC-AVAX",
+        chain_label: "Avalanche",
         transport: NetworkTransport::Evm,
         domain: 1,
         token_address: "0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E",
     },
     CctpDestination {
         id: "usdc-op",
-        asset: "USDC-OP",
+        chain_label: "Optimism",
         transport: NetworkTransport::Evm,
         domain: 2,
         token_address: "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85",
     },
     CctpDestination {
         id: "usdc-pol",
-        asset: "USDC-POL",
+        chain_label: "Polygon PoS",
         transport: NetworkTransport::Evm,
         domain: 7,
         token_address: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
     },
     CctpDestination {
         id: "usdc-uni",
-        asset: "USDC-UNI",
+        chain_label: "Unichain",
         transport: NetworkTransport::Evm,
         domain: 10,
         token_address: "0x078D782b760474a361dDA0AF3839290b0EF57AD6",
     },
     CctpDestination {
         id: "usdc-linea",
-        asset: "USDC-LINEA",
+        chain_label: "Linea",
         transport: NetworkTransport::Evm,
         domain: 11,
         token_address: "0x176211869cA2b568f2A7D4EE941E073a821EE1ff",
     },
     CctpDestination {
         id: "usdc-codex",
-        asset: "USDC-CODEX",
+        chain_label: "Codex",
         transport: NetworkTransport::Evm,
         domain: 12,
         token_address: "0xd996633a415985DBd7D6D12f4A4343E31f5037cf",
     },
     CctpDestination {
         id: "usdc-sonic",
-        asset: "USDC-SONIC",
+        chain_label: "Sonic",
         transport: NetworkTransport::Evm,
         domain: 13,
         token_address: "0x29219dd400f2Bf60E5a23d13be72b486d4038894",
     },
     CctpDestination {
         id: "usdc-world",
-        asset: "USDC-WORLD",
+        chain_label: "World Chain",
         transport: NetworkTransport::Evm,
         domain: 14,
         token_address: "0x79A02482A880bCe3F13E09da970dC34dB4cD24D1",
     },
     CctpDestination {
         id: "usdc-mon",
-        asset: "USDC-MON",
+        chain_label: "Monad",
         transport: NetworkTransport::Evm,
         domain: 15,
         token_address: "0x754704Bc059F8C67012fEd69BC8A327a5aafb603",
     },
     CctpDestination {
         id: "usdc-sei",
-        asset: "USDC-SEI",
+        chain_label: "Sei",
         transport: NetworkTransport::Evm,
         domain: 16,
         token_address: "0xe15fC38F6D8c56aF07bbCBe3BAf5708A2Bf42392",
     },
     CctpDestination {
         id: "usdc-xdc",
-        asset: "USDC-XDC",
+        chain_label: "XDC",
         transport: NetworkTransport::Evm,
         domain: 18,
         token_address: "0xfA2958CB79b0491CC627c1557F441eF849Ca8eb1",
     },
     CctpDestination {
         id: "usdc-ink",
-        asset: "USDC-INK",
+        chain_label: "Ink",
         transport: NetworkTransport::Evm,
         domain: 21,
         token_address: "0x2D270e6886d130D724215A266106e6832161EAEd",
     },
     CctpDestination {
         id: "usdc-plume",
-        asset: "USDC-PLUME",
+        chain_label: "Plume",
         transport: NetworkTransport::Evm,
         domain: 22,
         token_address: "0x222365EF19F7947e5484218551B56bb3965Aa7aF",
     },
     CctpDestination {
         id: "usdc-sol",
-        asset: "USDC-SOL",
+        chain_label: "Solana",
         transport: NetworkTransport::Solana,
         domain: 5,
         token_address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
     },
 ];
-
-impl CctpDestination {
-    /// Human-ish chain label derived from the asset name (`"USDC-BASE"` ->
-    /// `"BASE"`), for discovery/UX listings.
-    #[must_use]
-    pub fn chain_label(&self) -> &'static str {
-        self.asset.strip_prefix("USDC-").unwrap_or(self.asset)
-    }
-}
 
 /// Resolve a CCTP destination by its [`DestinationId`] (the lowercased asset
 /// name, e.g. `"usdc-base"`).
@@ -670,7 +664,7 @@ mod tests {
     #[macros::test_all]
     fn cctp_destination_lookup_by_destination_id() {
         let base = cctp_destination(&DestinationId::new("usdc-base")).unwrap();
-        assert_eq!(base.asset, "USDC-BASE");
+        assert_eq!(base.chain_label, "Base");
         assert_eq!(base.domain, 6);
         assert_eq!(base.transport, NetworkTransport::Evm);
 

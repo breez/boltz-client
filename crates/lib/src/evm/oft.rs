@@ -198,7 +198,7 @@ pub fn parse_chain_registry(
             id.clone(),
             Destination {
                 id,
-                chain_label: d.chain_label().to_string(),
+                chain_label: d.chain_label.to_string(),
                 asset: Asset::Usdc,
                 transport: d.transport,
                 evm_chain_id: None,
@@ -217,7 +217,7 @@ pub fn parse_chain_registry(
         usdc_arb_id.clone(),
         Destination {
             id: usdc_arb_id,
-            chain_label: "Arbitrum".to_string(),
+            chain_label: "Arbitrum One".to_string(),
             asset: Asset::Usdc,
             transport: NetworkTransport::Evm,
             evm_chain_id: Some(source_evm_chain_id),
@@ -656,7 +656,7 @@ mod tests {
             .get(&DestinationId::new("usdc-base"))
             .expect("base");
         assert_eq!(base.asset, Asset::Usdc);
-        assert_eq!(base.chain_label, "BASE");
+        assert_eq!(base.chain_label, "Base");
         assert!(matches!(base.bridge, Bridge::Cctp { domain: 6 }));
         assert_eq!(base.dex_output_token, ARBITRUM_USDC_ADDRESS);
 
@@ -665,7 +665,7 @@ mod tests {
             .get(&DestinationId::new("usdc-arb"))
             .expect("usdc-arb");
         assert_eq!(arb_usdc.asset, Asset::Usdc);
-        assert_eq!(arb_usdc.chain_label, "Arbitrum");
+        assert_eq!(arb_usdc.chain_label, "Arbitrum One");
         assert!(matches!(arb_usdc.bridge, Bridge::Direct));
         assert_eq!(arb_usdc.transport, NetworkTransport::Evm);
         assert_eq!(arb_usdc.evm_chain_id, Some(ARBITRUM_CHAIN_ID));
