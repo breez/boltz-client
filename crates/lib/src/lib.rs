@@ -126,6 +126,14 @@ impl BoltzService {
             config.cctp_api_url.clone(),
         );
 
+        let lz_scan_client = crate::evm::lz_scan::LzScanClient::new(
+            Box::new(DefaultHttpClient::new(None)),
+            config.lz_scan_api_url.clone(),
+        );
+
+        // Capture before `config` is moved into the executor.
+        let delivery_poll_interval_secs = config.delivery_poll_interval_secs;
+
         let executor = Arc::new(ReverseSwapExecutor::new(
             api_client,
             key_manager,
@@ -135,6 +143,7 @@ impl BoltzService {
             config,
             store.clone(),
             cctp_fee_client,
+            lz_scan_client,
             erc20swap_address,
             solana_rpc,
         ));
@@ -147,6 +156,7 @@ impl BoltzService {
             event_emitter.clone(),
             ws_subscriber.clone(),
             ws_rx,
+            delivery_poll_interval_secs,
         );
 
         Ok(Self {
@@ -180,41 +190,19 @@ impl BoltzService {
         self.store.get_swap(swap_id).await
     }
 
-    /// Query the destination-delivery status of a USDC (CCTP) swap via Circle
-    /// Iris. The client verifies the Arbitrum burn on-chain, but the CCTP mint
-    /// on the destination chain lands asynchronously; this reports whether the
-    /// message has been attested and forwarded (minted).
+    /// Confirm cross-chain delivery for every swap currently `Settling`, and
+    /// finalize any whose bridge has delivered (CCTP via Circle Iris, OFT via
+    /// `LayerZero` Scan). For CCTP this also persists the authoritative
+    /// `feeExecuted`-adjusted delivered amount; completions emit a
+    /// [`BoltzSwapEvent::SwapUpdated`].
     ///
-    /// Returns `Ok(None)` for non-CCTP swaps, unknown swaps, or CCTP swaps
-    /// whose burn tx hash hasn't been recorded yet.
-    pub async fn cctp_delivery_status(
-        &self,
-        swap_id: &str,
-    ) -> Result<Option<CctpMessageStatus>, BoltzError> {
-        let Some(swap) = self.store.get_swap(swap_id).await? else {
-            return Ok(None);
-        };
-        if swap.bridge_kind != BridgeKind::Cctp {
-            return Ok(None);
-        }
-        let Some(ref guid) = swap.lz_guid else {
-            return Ok(None);
-        };
-        let status = self.executor.cctp_delivery_status(guid).await?;
-
-        // Once Circle has attested the message, its finalized feeExecuted gives
-        // the authoritative delivered amount (no destination RPC needed).
-        // Persist it over the source-side burn estimate set at completion.
-        if let Some(delivered) = status.delivered_amount
-            && swap.delivered_amount != Some(delivered)
-        {
-            let mut updated = swap;
-            updated.delivered_amount = Some(delivered);
-            updated.updated_at = swap::reverse::current_unix_timestamp();
-            self.store.update_swap(&updated).await?;
-        }
-
-        Ok(Some(status))
+    /// This runs automatically on the background poll cadence
+    /// ([`BoltzConfig::delivery_poll_interval_secs`]); call it directly only to
+    /// drive confirmation when background polling is disabled (`None`), or to
+    /// force an immediate check.
+    pub async fn refresh_pending_deliveries(&self) -> Result<(), BoltzError> {
+        swap::manager::poll_settling_swaps(&self.executor, &self.store, &self.event_emitter).await;
+        Ok(())
     }
 
     /// Shut down the swap manager and close the WebSocket connection.

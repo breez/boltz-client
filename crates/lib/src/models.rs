@@ -68,9 +68,15 @@ pub struct BoltzSwap {
     /// delivered amount; for `Direct` delivery it's the final ERC20 `Transfer`
     /// value to the user.
     pub delivered_amount: Option<u64>,
-    /// `LayerZero` message GUID (`0x`-prefixed hex) for bridged swaps.
-    /// `None` for Arbitrum-destination swaps (no bridge).
-    pub lz_guid: Option<String>,
+    /// Cross-chain bridge tracking handle, set only for bridged swaps (`None`
+    /// for `Direct` Arbitrum-destination swaps). Encoding depends on the
+    /// bridge: for `Oft` it's the `LayerZero` message GUID (`0x`-prefixed hex,
+    /// looked up on `LayerZero` Scan); for `Cctp` it's `"<source_domain>:<burn_tx_hash>"`,
+    /// the key Circle Iris indexes the message by. Used to confirm destination
+    /// delivery while the swap is `Settling`. (Serde alias `lz_guid` keeps
+    /// swaps persisted before the rename readable.)
+    #[serde(alias = "lz_guid")]
+    pub bridge_ref: Option<String>,
 
     // Timestamps (unix seconds)
     pub created_at: u64,
@@ -87,7 +93,13 @@ pub enum BoltzSwapStatus {
     TbtcLocked,
     /// Claim tx submitted, waiting for confirmation.
     Claiming,
-    /// USDT delivered to destination.
+    /// Claim mined on Arbitrum (burn/OFT-send committed), awaiting confirmation
+    /// that the cross-chain bridge delivered on the destination chain. Only
+    /// `Oft`/`Cctp` swaps pass through this state; `Direct` (same-chain)
+    /// completes immediately. Non-terminal: the background manager polls the
+    /// bridge's status API and advances to `Completed` once delivery confirms.
+    Settling,
+    /// Stablecoin delivered to destination.
     Completed,
     /// Swap failed.
     Failed { reason: String },
@@ -532,6 +544,7 @@ mod tests {
         assert!(!BoltzSwapStatus::InvoicePaid.is_terminal());
         assert!(!BoltzSwapStatus::TbtcLocked.is_terminal());
         assert!(!BoltzSwapStatus::Claiming.is_terminal());
+        assert!(!BoltzSwapStatus::Settling.is_terminal());
         assert!(BoltzSwapStatus::Completed.is_terminal());
         assert!(BoltzSwapStatus::Expired.is_terminal());
         assert!(
@@ -566,7 +579,7 @@ mod tests {
             claim_tx_hash: None,
             pending_call_id: None,
             delivered_amount: None,
-            lz_guid: None,
+            bridge_ref: None,
             created_at: 1_700_000_000,
             updated_at: 1_700_000_000,
         };
@@ -577,6 +590,65 @@ mod tests {
         assert_eq!(deserialized.status, BoltzSwapStatus::Created);
         assert_eq!(deserialized.chain_id, 42161);
         assert_eq!(deserialized.destination_chain.as_str(), "arbitrum one");
+    }
+
+    /// Swaps persisted before the `lz_guid` -> `bridge_ref` rename used the
+    /// `lz_guid` JSON key; the serde alias must keep them readable.
+    #[macros::test_all]
+    fn bridge_ref_deserializes_from_legacy_lz_guid_key() {
+        let legacy = r#"{
+            "id": "boltz-1", "status": "Created", "claim_key_index": 0,
+            "chain_id": 42161, "claim_address": "0xabc", "destination_address": "0xdef",
+            "destination_chain": "arbitrum one", "refund_address": "0x123",
+            "erc20swap_address": "0xswap", "router_address": "0xrouter",
+            "invoice": "lnbc", "invoice_amount_sats": 100000, "onchain_amount": 99500,
+            "expected_output_amount": 71000000, "slippage_bps": 100,
+            "timeout_block_height": 123456, "lockup_tx_id": null, "claim_tx_hash": null,
+            "pending_call_id": null, "delivered_amount": null,
+            "lz_guid": "0xdeadbeef", "created_at": 1700000000, "updated_at": 1700000000
+        }"#;
+        let swap: BoltzSwap = serde_json::from_str(legacy).unwrap();
+        assert_eq!(swap.bridge_ref.as_deref(), Some("0xdeadbeef"));
+    }
+
+    /// A `Settling` swap with a `bridge_ref` must round-trip (new variant +
+    /// new field name on the way out, not just the legacy alias inward).
+    #[macros::test_all]
+    fn settling_swap_with_bridge_ref_round_trips() {
+        let mut swap = BoltzSwap {
+            id: "s2".to_string(),
+            status: BoltzSwapStatus::Settling,
+            bridge_kind: BridgeKind::Cctp,
+            claim_key_index: 0,
+            chain_id: 42161,
+            claim_address: "0xabc".to_string(),
+            destination_address: "0xdef".to_string(),
+            destination_chain: DestinationId::new("usdc-base"),
+            refund_address: "0x123".to_string(),
+            erc20swap_address: "0xswap".to_string(),
+            router_address: "0xrouter".to_string(),
+            invoice: "lnbc".to_string(),
+            invoice_amount_sats: 100_000,
+            onchain_amount: 99_500,
+            expected_output_amount: 71_000_000,
+            slippage_bps: 100,
+            timeout_block_height: 123_456,
+            lockup_tx_id: None,
+            claim_tx_hash: None,
+            pending_call_id: None,
+            delivered_amount: None,
+            bridge_ref: Some("6:0xburn".to_string()),
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+        };
+        let json = serde_json::to_string(&swap).unwrap();
+        assert!(json.contains("\"bridge_ref\":\"6:0xburn\""));
+        let back: BoltzSwap = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.status, BoltzSwapStatus::Settling);
+        assert_eq!(back.bridge_ref.as_deref(), Some("6:0xburn"));
+        // Sanity: still non-terminal.
+        swap.status = back.status;
+        assert!(!swap.status.is_terminal());
     }
 
     #[macros::test_all]

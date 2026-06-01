@@ -13,7 +13,7 @@ use crate::evm::contracts::{
 };
 use crate::evm::lockup::is_swap_still_locked_by_swap;
 use crate::evm::provider::TxReceipt;
-use crate::models::{BoltzSwap, BoltzSwapStatus, Bridge};
+use crate::models::{BoltzSwap, BoltzSwapStatus, Bridge, BridgeKind};
 use crate::store::BoltzStorage;
 use crate::swap::reverse::{ReverseSwapExecutor, current_unix_timestamp};
 
@@ -60,6 +60,7 @@ impl SwapManager {
         event_emitter: Arc<EventEmitter>,
         ws_subscriber: Arc<SwapStatusSubscriber>,
         ws_rx: mpsc::Receiver<SwapStatusUpdate>,
+        delivery_poll_interval_secs: Option<u64>,
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (shutdown_tx, shutdown_rx) = watch::channel(());
@@ -72,6 +73,7 @@ impl SwapManager {
             ws_rx,
             cmd_rx,
             shutdown_rx,
+            delivery_poll_interval_secs,
         ));
 
         let abort_handle = handle.abort_handle();
@@ -121,6 +123,7 @@ impl Drop for SwapManager {
 impl SwapManager {
     // ─── Central event loop ─────────────────────────────────────────
 
+    #[expect(clippy::too_many_arguments)]
     async fn run_loop(
         executor: Arc<ReverseSwapExecutor>,
         store: Arc<dyn BoltzStorage>,
@@ -129,13 +132,32 @@ impl SwapManager {
         mut ws_rx: mpsc::Receiver<SwapStatusUpdate>,
         mut cmd_rx: mpsc::Receiver<String>,
         mut shutdown_rx: watch::Receiver<()>,
+        delivery_poll_interval_secs: Option<u64>,
     ) {
         // Swap IDs currently being tracked (for WS dispatch filtering).
         let mut tracked_ids: HashSet<String> = HashSet::new();
 
+        // Background delivery-confirmation ticker. `None` disables it (callers
+        // drive confirmation via `refresh_pending_deliveries`). The first tick
+        // fires immediately, re-arming any swaps resumed as `Settling`. Missed
+        // ticks (if a branch handler ran long) just coalesce into idempotent
+        // catch-up polls, so the default missed-tick behavior is fine — and
+        // `set_missed_tick_behavior` isn't available on the WASM tokio shim.
+        let mut delivery_ticker = delivery_poll_interval_secs.map(|secs| {
+            tokio::time::interval(platform_utils::time::Duration::from_secs(secs.max(1)))
+        });
+
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => break,
+                () = async {
+                    match delivery_ticker.as_mut() {
+                        Some(t) => { t.tick().await; }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    poll_settling_swaps(&executor, &store, &event_emitter).await;
+                }
                 should_break = async {
                     let Some(update) = ws_rx.recv().await else { return true };
                     if !tracked_ids.contains(&update.swap_id) {
@@ -213,6 +235,18 @@ impl SwapManager {
 
         if swap.status.is_terminal() {
             tracing::debug!(swap_id, status = ?swap.status, "Swap already terminal, cleaning up");
+            Self::cleanup_terminal(ws_subscriber, tracked_ids, swap_id).await;
+            return;
+        }
+
+        // Past the claim: the swap is awaiting cross-chain delivery, which the
+        // background poll (not the Boltz WS) drives. Stop tracking it on WS;
+        // `poll_settling_swaps` scans the store and finalizes it.
+        if swap.status == BoltzSwapStatus::Settling {
+            tracing::debug!(
+                swap_id,
+                "Swap settling; delivery confirmation is poll-driven"
+            );
             Self::cleanup_terminal(ws_subscriber, tracked_ids, swap_id).await;
             return;
         }
@@ -471,13 +505,8 @@ impl SwapManager {
                         tracing::info!(swap_id, tx_hash, "Claim receipt confirmed");
                         if let Ok(Some(mut swap)) = store.get_swap(swap_id).await {
                             apply_delivered_amount(executor, &mut swap, &receipt, tx_hash);
-                            update_swap_status(
-                                &**store,
-                                event_emitter,
-                                &mut swap,
-                                BoltzSwapStatus::Completed,
-                            )
-                            .await;
+                            let next = post_claim_status(&swap);
+                            update_swap_status(&**store, event_emitter, &mut swap, next).await;
                         }
                     } else {
                         tracing::error!(swap_id, tx_hash, "Claim tx reverted");
@@ -586,9 +615,19 @@ pub(crate) async fn update_swap_status(
         .await;
 }
 
-/// Decode the delivered amount (and LZ GUID for bridged swaps) from a
-/// successful claim receipt's logs and write it onto `swap` in memory.
-/// The caller is responsible for persisting `swap` afterwards.
+/// Decode the claim receipt's logs and write the bridge tracking handle (and,
+/// where it's already authoritative, the delivered amount) onto `swap` in
+/// memory. The caller persists `swap` afterwards.
+///
+/// Per bridge:
+/// - **OFT/Direct**: the decoded amount (`amountReceivedLD` / the ERC20
+///   transfer) is final, so `delivered_amount` is set now. For OFT, `bridge_ref`
+///   is the `LayerZero` GUID; Direct has no bridge.
+/// - **CCTP**: the on-chain figure is the *burn* amount (source `feeExecuted` is
+///   0), which overstates delivery by the fast-transfer fee, so `delivered_amount`
+///   is left unset until Circle attests the real `feeExecuted`. `bridge_ref` is
+///   synthesized as `"<source_domain>:<burn_tx_hash>"` (the tx hash isn't
+///   available to the log decoder) — the key Circle Iris indexes by.
 fn apply_delivered_amount(
     executor: &ReverseSwapExecutor,
     swap: &mut BoltzSwap,
@@ -606,18 +645,10 @@ fn apply_delivered_amount(
     };
 
     match decode_delivered_from_logs(&receipt.logs, &source) {
-        Some(DeliveredAmount {
-            amount,
-            lz_guid,
-            cctp_source_domain,
-        }) => {
-            swap.delivered_amount = Some(amount);
-            // CCTP guid needs the source tx hash (not available to the log
-            // decoder), so synthesize it here as "<domain>:<tx_hash>".
-            swap.lz_guid = match cctp_source_domain {
-                Some(domain) => Some(format!("{domain}:{tx_hash}")),
-                None => lz_guid,
-            };
+        Some(decoded) => {
+            let (delivered, bridge_ref) = delivered_and_ref(decoded, tx_hash);
+            swap.delivered_amount = delivered;
+            swap.bridge_ref = bridge_ref;
         }
         None => {
             tracing::warn!(
@@ -627,6 +658,128 @@ fn apply_delivered_amount(
                 "No matching log in claim receipt; delivered_amount left unset"
             );
         }
+    }
+}
+
+/// Map a decoded claim receipt to `(delivered_amount, bridge_ref)`.
+///
+/// CCTP defers the amount — the source `feeExecuted` is 0, so the decoded burn
+/// amount overstates delivery by the fast-transfer fee — and keys Circle Iris
+/// by `"<source_domain>:<burn_tx_hash>"`. OFT/Direct amounts are final at claim
+/// (`amountReceivedLD` / the ERC20 transfer); OFT carries the `LayerZero` GUID
+/// as its `bridge_ref`, Direct has none.
+fn delivered_and_ref(decoded: DeliveredAmount, tx_hash: &str) -> (Option<u64>, Option<String>) {
+    match decoded.cctp_source_domain {
+        Some(domain) => (None, Some(format!("{domain}:{tx_hash}"))),
+        None => (Some(decoded.amount), decoded.lz_guid),
+    }
+}
+
+/// Choose the post-claim status for a swap whose claim receipt just confirmed
+/// successfully. `Direct` delivery is complete on Arbitrum; `Oft`/`Cctp` enter
+/// `Settling` so the background poll can confirm cross-chain delivery — but only
+/// if a `bridge_ref` was recovered (without it we can't track delivery, so fall
+/// back to `Completed`).
+fn post_claim_status(swap: &BoltzSwap) -> BoltzSwapStatus {
+    match swap.bridge_kind {
+        BridgeKind::Direct => BoltzSwapStatus::Completed,
+        BridgeKind::Oft | BridgeKind::Cctp => {
+            if swap.bridge_ref.is_some() {
+                BoltzSwapStatus::Settling
+            } else {
+                tracing::warn!(
+                    swap_id = swap.id,
+                    "Bridged swap missing bridge_ref after claim; completing without delivery confirmation"
+                );
+                BoltzSwapStatus::Completed
+            }
+        }
+    }
+}
+
+/// Poll every `Settling` swap once and finalize any whose cross-chain delivery
+/// has confirmed. Store-driven (not tied to WS tracking), so it covers swaps
+/// resumed after a restart. Used by both the background tick and the on-demand
+/// [`crate::BoltzService::refresh_pending_deliveries`].
+pub(crate) async fn poll_settling_swaps(
+    executor: &ReverseSwapExecutor,
+    store: &Arc<dyn BoltzStorage>,
+    event_emitter: &EventEmitter,
+) {
+    let swaps = match store.list_active_swaps().await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to list active swaps for delivery poll");
+            return;
+        }
+    };
+    for mut swap in swaps
+        .into_iter()
+        .filter(|s| s.status == BoltzSwapStatus::Settling)
+    {
+        confirm_delivery(executor, store, event_emitter, &mut swap).await;
+    }
+}
+
+/// Confirm cross-chain delivery for a single `Settling` swap and finalize it if
+/// delivered. CCTP queries Circle Iris (and persists the authoritative
+/// `feeExecuted`-adjusted amount); OFT queries `LayerZero` Scan (amount already
+/// recorded at claim). Leaves the swap `Settling` on any not-yet-delivered or
+/// transient-error outcome — the next poll retries.
+async fn confirm_delivery(
+    executor: &ReverseSwapExecutor,
+    store: &Arc<dyn BoltzStorage>,
+    event_emitter: &EventEmitter,
+    swap: &mut BoltzSwap,
+) {
+    let Some(bridge_ref) = swap.bridge_ref.clone() else {
+        tracing::warn!(
+            swap_id = swap.id,
+            "Settling swap has no bridge_ref; cannot confirm delivery"
+        );
+        return;
+    };
+
+    match swap.bridge_kind {
+        BridgeKind::Cctp => match executor.cctp_delivery_status(&bridge_ref).await {
+            Ok(status) => {
+                if let Some(delivered) = cctp_completion_amount(&status) {
+                    swap.delivered_amount = Some(delivered);
+                    update_swap_status(&**store, event_emitter, swap, BoltzSwapStatus::Completed)
+                        .await;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(swap_id = swap.id, error = %e, "CCTP delivery status query failed");
+            }
+        },
+        BridgeKind::Oft => match executor.oft_delivery_status(&bridge_ref).await {
+            Ok(status) => {
+                if status.is_delivered() {
+                    update_swap_status(&**store, event_emitter, swap, BoltzSwapStatus::Completed)
+                        .await;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(swap_id = swap.id, error = %e, "OFT delivery status query failed");
+            }
+        },
+        // Direct swaps never enter Settling; defensively finalize.
+        BridgeKind::Direct => {
+            update_swap_status(&**store, event_emitter, swap, BoltzSwapStatus::Completed).await;
+        }
+    }
+}
+
+/// The authoritative CCTP delivered amount, but only once delivery is real:
+/// the message must be *forwarded* (minted on the destination) and *attested*
+/// (so the finalized `feeExecuted` — hence the amount — is known). Returns
+/// `None` while either is still pending, keeping the swap `Settling`.
+fn cctp_completion_amount(status: &crate::evm::cctp::CctpMessageStatus) -> Option<u64> {
+    if status.is_forwarded() {
+        status.delivered_amount
+    } else {
+        None
     }
 }
 
@@ -657,5 +810,137 @@ fn delivered_source_for(
             let oft_contract = parse_address(oft_addr).ok()?;
             Some(DeliveredAmountSource::OftSent { oft_contract })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "browser-tests")]
+    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    use super::*;
+    use crate::evm::cctp::CctpMessageStatus;
+    use crate::models::DestinationId;
+
+    fn swap_with(bridge_kind: BridgeKind, bridge_ref: Option<&str>) -> BoltzSwap {
+        BoltzSwap {
+            id: "s1".to_string(),
+            status: BoltzSwapStatus::Claiming,
+            bridge_kind,
+            claim_key_index: 0,
+            chain_id: 42161,
+            claim_address: "0xabc".to_string(),
+            destination_address: "0xdef".to_string(),
+            destination_chain: DestinationId::new("arbitrum one"),
+            refund_address: "0x123".to_string(),
+            erc20swap_address: "0xswap".to_string(),
+            router_address: "0xrouter".to_string(),
+            invoice: "lnbc".to_string(),
+            invoice_amount_sats: 100_000,
+            onchain_amount: 99_500,
+            expected_output_amount: 71_000_000,
+            slippage_bps: 100,
+            timeout_block_height: 123_456,
+            lockup_tx_id: None,
+            claim_tx_hash: None,
+            pending_call_id: None,
+            delivered_amount: None,
+            bridge_ref: bridge_ref.map(str::to_string),
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+        }
+    }
+
+    #[macros::test_all]
+    fn direct_completes_immediately() {
+        let swap = swap_with(BridgeKind::Direct, None);
+        assert_eq!(post_claim_status(&swap), BoltzSwapStatus::Completed);
+    }
+
+    #[macros::test_all]
+    fn bridged_with_ref_settles() {
+        let oft = swap_with(BridgeKind::Oft, Some("0xguid"));
+        assert_eq!(post_claim_status(&oft), BoltzSwapStatus::Settling);
+        let cctp = swap_with(BridgeKind::Cctp, Some("3:0xhash"));
+        assert_eq!(post_claim_status(&cctp), BoltzSwapStatus::Settling);
+    }
+
+    #[macros::test_all]
+    fn bridged_without_ref_falls_back_to_completed() {
+        // No bridge_ref means delivery can't be tracked, so don't strand the
+        // swap in Settling forever.
+        let swap = swap_with(BridgeKind::Cctp, None);
+        assert_eq!(post_claim_status(&swap), BoltzSwapStatus::Completed);
+    }
+
+    // ─── delivered_and_ref: per-bridge field mapping at claim time ──────
+
+    #[macros::test_all]
+    fn cctp_defers_amount_and_keys_iris_by_domain_and_tx() {
+        let decoded = DeliveredAmount {
+            amount: 1_000_000,
+            lz_guid: None,
+            cctp_source_domain: Some(3),
+        };
+        let (delivered, bridge_ref) = delivered_and_ref(decoded, "0xburn");
+        // CCTP amount is not authoritative at claim — deferred to attestation.
+        assert_eq!(delivered, None);
+        assert_eq!(bridge_ref.as_deref(), Some("3:0xburn"));
+    }
+
+    #[macros::test_all]
+    fn oft_sets_final_amount_and_carries_lz_guid() {
+        let decoded = DeliveredAmount {
+            amount: 990_000,
+            lz_guid: Some("0xguid".to_string()),
+            cctp_source_domain: None,
+        };
+        let (delivered, bridge_ref) = delivered_and_ref(decoded, "0xclaim");
+        assert_eq!(delivered, Some(990_000));
+        assert_eq!(bridge_ref.as_deref(), Some("0xguid"));
+    }
+
+    #[macros::test_all]
+    fn direct_sets_final_amount_and_no_bridge_ref() {
+        let decoded = DeliveredAmount {
+            amount: 500_000,
+            lz_guid: None,
+            cctp_source_domain: None,
+        };
+        let (delivered, bridge_ref) = delivered_and_ref(decoded, "0xclaim");
+        assert_eq!(delivered, Some(500_000));
+        assert_eq!(bridge_ref, None);
+    }
+
+    // ─── cctp_completion_amount: only complete once forwarded + attested ──
+
+    fn cctp_status(forward_tx: Option<&str>, delivered: Option<u64>) -> CctpMessageStatus {
+        CctpMessageStatus {
+            found: true,
+            forward_tx_hash: forward_tx.map(str::to_string),
+            delivered_amount: delivered,
+            ..Default::default()
+        }
+    }
+
+    #[macros::test_all]
+    fn cctp_completes_only_when_forwarded_and_attested() {
+        // Forwarded (minted) + attested (amount known) → complete with amount.
+        assert_eq!(
+            cctp_completion_amount(&cctp_status(Some("0xfwd"), Some(980_000))),
+            Some(980_000)
+        );
+        // Attested but not yet forwarded → still settling.
+        assert_eq!(
+            cctp_completion_amount(&cctp_status(None, Some(980_000))),
+            None
+        );
+        // Forwarded but no attested amount yet → still settling.
+        assert_eq!(
+            cctp_completion_amount(&cctp_status(Some("0xfwd"), None)),
+            None
+        );
+        // Neither → still settling.
+        assert_eq!(cctp_completion_amount(&cctp_status(None, None)), None);
     }
 }

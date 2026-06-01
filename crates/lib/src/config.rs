@@ -35,6 +35,16 @@ pub struct BoltzConfig {
     /// already exists so the cross-chain message can pre-fund its creation
     /// when it doesn't. Unused for EVM and Tron destinations.
     pub solana_rpc_url: String,
+    /// `LayerZero` Scan API base URL. Used to confirm OFT (USDT0) cross-chain
+    /// delivery by message GUID so a bridged swap advances from `Settling` to
+    /// `Completed`. Mainnet default: `https://scan.layerzero-api.com`.
+    pub lz_scan_api_url: String,
+    /// Cadence (seconds) at which the background manager polls Circle Iris
+    /// (CCTP) / `LayerZero` Scan (OFT) to advance `Settling` swaps to
+    /// `Completed`. `None` disables background polling entirely — callers then
+    /// drive confirmation on demand via
+    /// [`crate::BoltzService::refresh_pending_deliveries`]. Default: 30s.
+    pub delivery_poll_interval_secs: Option<u64>,
 }
 
 /// Alchemy configuration for EIP-7702 gas abstraction.
@@ -67,6 +77,8 @@ impl BoltzConfig {
             oft_deployments_url: DEFAULT_OFT_DEPLOYMENTS_URL.to_string(),
             cctp_api_url: DEFAULT_CCTP_API_URL.to_string(),
             solana_rpc_url: DEFAULT_SOLANA_RPC_URL.to_string(),
+            lz_scan_api_url: DEFAULT_LZ_SCAN_API_URL.to_string(),
+            delivery_poll_interval_secs: Some(DEFAULT_DELIVERY_POLL_INTERVAL_SECS),
         }
     }
 
@@ -164,6 +176,16 @@ pub const SOLANA_USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
 /// `https://iris-api-sandbox.circle.com`.
 pub const DEFAULT_CCTP_API_URL: &str = "https://iris-api.circle.com";
 
+/// Default `LayerZero` Scan API base URL (mainnet). Testnet is
+/// `https://scan-testnet.layerzero-api.com`.
+pub const DEFAULT_LZ_SCAN_API_URL: &str = "https://scan.layerzero-api.com";
+
+/// Default background delivery-confirmation poll cadence (seconds). Gentle by
+/// design: a bridged swap's funds are already committed at claim time, so a few
+/// missed ticks before `Completed` are harmless, and a tight loop against
+/// Circle Iris / `LayerZero` Scan would be wasteful for background callers.
+pub const DEFAULT_DELIVERY_POLL_INTERVAL_SECS: u64 = 30;
+
 /// Extra basis points added on top of Circle's quoted burn fee to absorb
 /// fee movement between prepare and claim (`maxFee` cushion — NOT user
 /// slippage). Matches the web app's `cctpMaxFeeBufferBps`.
@@ -218,5 +240,16 @@ mod tests {
     #[macros::test_all]
     fn cctp_fee_denominator_is_scaled_bps() {
         assert_eq!(CCTP_FEE_BPS_DENOMINATOR, 10_000 * CCTP_FEE_SCALE);
+    }
+
+    #[macros::test_all]
+    fn mainnet_enables_delivery_polling_with_lz_scan() {
+        let cfg = BoltzConfig::mainnet("ref".to_string());
+        // Background delivery confirmation is on by default.
+        assert_eq!(
+            cfg.delivery_poll_interval_secs,
+            Some(DEFAULT_DELIVERY_POLL_INTERVAL_SECS)
+        );
+        assert_eq!(cfg.lz_scan_api_url, DEFAULT_LZ_SCAN_API_URL);
     }
 }

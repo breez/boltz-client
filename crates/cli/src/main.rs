@@ -88,11 +88,10 @@ enum Command {
         swap_id: String,
     },
 
-    /// Check destination-delivery status of a USDC (CCTP) swap via Circle Iris.
-    CctpStatus {
-        /// Swap ID.
-        swap_id: String,
-    },
+    /// Force an immediate cross-chain delivery check for all settling swaps
+    /// (CCTP via Circle Iris, OFT via `LayerZero` Scan). Normally runs
+    /// automatically on the background poll cadence.
+    RefreshDeliveries,
 
     /// Exit the interactive shell.
     #[command(hide = true)]
@@ -247,17 +246,9 @@ async fn execute_command(command: Command, svc: &BoltzService, seed: &[u8]) -> R
             println!("Accepted degraded quote for {swap_id}");
             Ok(true)
         }
-        Command::CctpStatus { swap_id } => {
-            match svc.cctp_delivery_status(&swap_id).await? {
-                Some(status) => print_json(&serde_json::json!({
-                    "found": status.found,
-                    "status": status.status,
-                    "forwarded": status.is_forwarded(),
-                    "forwardTxHash": status.forward_tx_hash,
-                    "deliveredAmount": status.delivered_amount,
-                })),
-                None => println!("Not a CCTP swap, unknown swap, or no burn tx recorded yet."),
-            }
+        Command::RefreshDeliveries => {
+            svc.refresh_pending_deliveries().await?;
+            println!("Delivery check complete. Use `info`/status events to see any completions.");
             Ok(true)
         }
     }

@@ -112,7 +112,7 @@ mod tests {
             claim_tx_hash: None,
             pending_call_id: None,
             delivered_amount: None,
-            lz_guid: None,
+            bridge_ref: None,
             created_at: 1_700_000_000,
             updated_at: 1_700_000_000,
         }

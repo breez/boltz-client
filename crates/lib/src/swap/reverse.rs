@@ -22,6 +22,7 @@ use crate::evm::contracts::{
 };
 use crate::evm::lockup::is_swap_still_locked_by_swap;
 use crate::evm::lz_options::build_extra_options;
+use crate::evm::lz_scan::LzScanClient;
 use crate::evm::oft::legacy_mesh_source_amount;
 use crate::evm::provider::EvmProvider;
 use crate::evm::recipient::{
@@ -57,8 +58,11 @@ pub(crate) struct ReverseSwapExecutor {
     /// that window is recoverable on resume.
     store: Arc<dyn BoltzStorage>,
     /// Circle Iris fee client, used to quote the CCTP burn fee for USDC
-    /// destinations at prepare and claim time.
+    /// destinations at prepare and claim time, and to confirm CCTP delivery.
     cctp_fee_client: CctpFeeClient,
+    /// `LayerZero` Scan client, used to confirm OFT (USDT0) cross-chain
+    /// delivery while a swap is `Settling`.
+    lz_scan_client: LzScanClient,
     pub(crate) erc20swap_address: String,
     /// Used only when the destination chain is Solana, to query whether the
     /// recipient's Associated Token Account already exists. Always
@@ -82,6 +86,7 @@ impl ReverseSwapExecutor {
         config: BoltzConfig,
         store: Arc<dyn BoltzStorage>,
         cctp_fee_client: CctpFeeClient,
+        lz_scan_client: LzScanClient,
         erc20swap_address: String,
         solana_rpc: SolanaRpcClient,
     ) -> Self {
@@ -94,6 +99,7 @@ impl ReverseSwapExecutor {
             config,
             store,
             cctp_fee_client,
+            lz_scan_client,
             erc20swap_address,
             solana_rpc,
             ata_cache: Mutex::new(HashSet::new()),
@@ -531,7 +537,7 @@ impl ReverseSwapExecutor {
             claim_tx_hash: None,
             pending_call_id: None,
             delivered_amount: None,
-            lz_guid: None,
+            bridge_ref: None,
             created_at: now,
             updated_at: now,
         })
@@ -1626,6 +1632,16 @@ impl ReverseSwapExecutor {
         self.cctp_fee_client
             .get_message_status(source_domain, tx_hash)
             .await
+    }
+
+    /// Query `LayerZero` Scan for whether an OFT message (by its GUID) has been
+    /// delivered on the destination chain. Confirmation-only: the OFT delivered
+    /// amount is already known from the source `OFTSent` log at claim time.
+    pub(crate) async fn oft_delivery_status(
+        &self,
+        guid: &str,
+    ) -> Result<crate::evm::lz_scan::LzMessageStatus, BoltzError> {
+        self.lz_scan_client.get_message_status(guid).await
     }
 
     // ─── OFT fee estimation (for prepare-time quoting) ─────────────────

@@ -38,10 +38,7 @@ pub enum BoltzError {
     #[error(
         "DEX quote degraded beyond slippage tolerance: expected {expected_usd}, got {quoted_usd}"
     )]
-    QuoteDegradedBeyondSlippage {
-        expected_usd: u64,
-        quoted_usd: u64,
-    },
+    QuoteDegradedBeyondSlippage { expected_usd: u64, quoted_usd: u64 },
 
     /// Boltz rejected swap creation because the preimage hash was already used
     /// (HTTP 409 Conflict). This indicates a serious local state issue: the key
