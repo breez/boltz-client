@@ -223,8 +223,8 @@ impl BoltzService {
         self.ws_subscriber.close().await;
     }
 
-    /// Get a quote for converting sats to USDT.
-    /// Pure quote — no side effects, no swap created.
+    /// Get a quote for converting sats to a stablecoin (USDT/USDT0/USDC,
+    /// per the destination). Pure quote — no side effects, no swap created.
     ///
     /// `max_slippage_bps` overrides [`BoltzConfig::slippage_bps`] for this
     /// quote only. Must still fall within the `10..=MAX_SLIPPAGE_BPS` range.
@@ -243,7 +243,7 @@ impl BoltzService {
             .await
     }
 
-    /// Get a quote starting from input sats (computes expected USDT output).
+    /// Get a quote starting from input sats (computes expected stablecoin output).
     /// Pure quote — no side effects, no swap created.
     ///
     /// See [`prepare_reverse_swap`](Self::prepare_reverse_swap) for the

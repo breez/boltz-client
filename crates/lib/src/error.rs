@@ -36,11 +36,11 @@ pub enum BoltzError {
     InvalidQuote(String),
 
     #[error(
-        "DEX quote degraded beyond slippage tolerance: expected {expected_usdt}, got {quoted_usdt}"
+        "DEX quote degraded beyond slippage tolerance: expected {expected_usd}, got {quoted_usd}"
     )]
     QuoteDegradedBeyondSlippage {
-        expected_usdt: u64,
-        quoted_usdt: u64,
+        expected_usd: u64,
+        quoted_usd: u64,
     },
 
     /// Boltz rejected swap creation because the preimage hash was already used

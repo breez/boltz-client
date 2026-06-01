@@ -58,11 +58,11 @@ enum Command {
     /// The destination chain is picked interactively from the set of chains
     /// whose transport accepts the given address.
     Prepare {
-        /// Stablecoin amount, 6 decimals (e.g. 1.5 for 1.50 USDT/USDC). Mutually exclusive with --sats.
-        #[arg(long, value_parser = parse_usdt_amount, conflicts_with = "sats")]
-        usdt: Option<u64>,
-        /// Input amount in sats. Mutually exclusive with --usdt.
-        #[arg(long, conflicts_with = "usdt")]
+        /// Stablecoin amount, 6 decimals (e.g. 1.5 for 1.50 USD). Mutually exclusive with --sats.
+        #[arg(long, value_parser = parse_usd_amount, conflicts_with = "sats")]
+        usd: Option<u64>,
+        /// Input amount in sats. Mutually exclusive with --usd.
+        #[arg(long, conflicts_with = "usd")]
         sats: Option<u64>,
         /// Destination address (any transport — the CLI filters supported
         /// chains by the address format).
@@ -71,11 +71,11 @@ enum Command {
 
     /// Full swap flow: prepare -> create -> wait for payment -> complete.
     Swap {
-        /// Stablecoin amount, 6 decimals (e.g. 1.5 for 1.50 USDT/USDC). Mutually exclusive with --sats.
-        #[arg(long, value_parser = parse_usdt_amount, conflicts_with = "sats")]
-        usdt: Option<u64>,
-        /// Input amount in sats. Mutually exclusive with --usdt.
-        #[arg(long, conflicts_with = "usdt")]
+        /// Stablecoin amount, 6 decimals (e.g. 1.5 for 1.50 USD). Mutually exclusive with --sats.
+        #[arg(long, value_parser = parse_usd_amount, conflicts_with = "sats")]
+        usd: Option<u64>,
+        /// Input amount in sats. Mutually exclusive with --usd.
+        #[arg(long, conflicts_with = "usd")]
         sats: Option<u64>,
         /// Destination address (any transport — the CLI filters supported
         /// chains by the address format).
@@ -224,22 +224,22 @@ async fn execute_command(command: Command, svc: &BoltzService, seed: &[u8]) -> R
             Ok(true)
         }
         Command::Prepare {
-            usdt,
+            usd,
             sats,
             destination,
         } => {
             let chain = pick_chain_for_address(svc, &destination)?;
-            let prepared = prepare(svc, &destination, chain, usdt, sats).await?;
+            let prepared = prepare(svc, &destination, chain, usd, sats).await?;
             print_json(&prepared);
             Ok(true)
         }
         Command::Swap {
-            usdt,
+            usd,
             sats,
             destination,
         } => {
             let chain = pick_chain_for_address(svc, &destination)?;
-            cmd_swap(svc, &destination, chain, usdt, sats).await?;
+            cmd_swap(svc, &destination, chain, usd, sats).await?;
             Ok(true)
         }
         Command::Accept { swap_id } => {
@@ -345,17 +345,17 @@ async fn prepare(
     svc: &BoltzService,
     destination: &str,
     chain: DestinationId,
-    usdt: Option<u64>,
+    usd: Option<u64>,
     sats: Option<u64>,
 ) -> Result<boltz_client::PreparedSwap> {
-    match (usdt, sats) {
-        (Some(usdt_amount), _) => Ok(svc
-            .prepare_reverse_swap(destination, chain, usdt_amount, None)
+    match (usd, sats) {
+        (Some(usd_amount), _) => Ok(svc
+            .prepare_reverse_swap(destination, chain, usd_amount, None)
             .await?),
         (_, Some(sats_amount)) => Ok(svc
             .prepare_reverse_swap_from_sats(destination, chain, sats_amount, None)
             .await?),
-        _ => bail!("Either --usdt or --sats must be provided"),
+        _ => bail!("Either --usd or --sats must be provided"),
     }
 }
 
@@ -413,12 +413,12 @@ async fn cmd_swap(
     svc: &BoltzService,
     destination: &str,
     chain: DestinationId,
-    usdt: Option<u64>,
+    usd: Option<u64>,
     sats: Option<u64>,
 ) -> Result<()> {
     // Step 1: Prepare
     println!("Fetching quote...\n");
-    let prepared = prepare(svc, destination, chain, usdt, sats).await?;
+    let prepared = prepare(svc, destination, chain, usd, sats).await?;
     print_json(&prepared);
 
     // Confirm
@@ -453,13 +453,13 @@ impl BoltzEventListener for PrintingEventListener {
             }
             BoltzSwapEvent::QuoteDegraded {
                 swap,
-                expected_usdt,
-                quoted_usdt,
+                expected_usd,
+                quoted_usd,
             } => {
                 println!(
-                    "[{}] Quote degraded: expected {} USDT, got {} USDT. \
+                    "[{}] Quote degraded: expected {} USD, got {} USD. \
                      Call accept_degraded_quote to proceed.",
-                    swap.id, expected_usdt, quoted_usdt
+                    swap.id, expected_usd, quoted_usd
                 );
             }
         }
@@ -487,7 +487,7 @@ fn format_output_fields(value: &mut serde_json::Value) {
                 && let Some(raw) = val.as_u64()
             {
                 *val = serde_json::Value::String(format!(
-                    "{}.{:06} USDT",
+                    "{}.{:06} USD",
                     raw / 1_000_000,
                     raw % 1_000_000
                 ));
@@ -660,8 +660,8 @@ fn rand_entropy() -> [u8; 16] {
     out
 }
 
-/// Parse a human-readable USDT amount (e.g. "1.5") into 6-decimal raw units (1500000).
-fn parse_usdt_amount(s: &str) -> std::result::Result<u64, String> {
+/// Parse a human-readable USD amount (e.g. "1.5") into 6-decimal raw units (1500000).
+fn parse_usd_amount(s: &str) -> std::result::Result<u64, String> {
     const DECIMALS: u32 = 6;
     let parts: Vec<&str> = s.split('.').collect();
     match parts.len() {

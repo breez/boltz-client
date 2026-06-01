@@ -362,20 +362,20 @@ impl SwapManager {
                 }
             }
             Err(BoltzError::QuoteDegradedBeyondSlippage {
-                expected_usdt,
-                quoted_usdt,
+                expected_usd,
+                quoted_usd,
             }) => {
                 tracing::warn!(
                     swap_id,
-                    expected_usdt,
-                    quoted_usdt,
+                    expected_usd,
+                    quoted_usd,
                     "Claim-time quote degraded beyond slippage tolerance"
                 );
                 event_emitter
                     .emit(&BoltzSwapEvent::QuoteDegraded {
                         swap: swap.clone(),
-                        expected_usdt,
-                        quoted_usdt,
+                        expected_usd,
+                        quoted_usd,
                     })
                     .await;
             }

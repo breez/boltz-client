@@ -2258,16 +2258,16 @@ async fn sleep_1s() {
 /// before we commit the claim transaction.
 #[expect(clippy::arithmetic_side_effects)]
 fn check_quote_drift(
-    expected_usdt: u64,
-    fresh_quote_usdt: u128,
+    expected_usd: u64,
+    fresh_quote_usd: u128,
     slippage_bps: u32,
 ) -> Result<(), BoltzError> {
-    let threshold = u128::from(expected_usdt) * (10000 - u128::from(slippage_bps)) / 10000;
-    if fresh_quote_usdt < threshold {
-        let quoted = fresh_quote_usdt.try_into().unwrap_or(u64::MAX);
+    let threshold = u128::from(expected_usd) * (10000 - u128::from(slippage_bps)) / 10000;
+    if fresh_quote_usd < threshold {
+        let quoted = fresh_quote_usd.try_into().unwrap_or(u64::MAX);
         return Err(BoltzError::QuoteDegradedBeyondSlippage {
-            expected_usdt,
-            quoted_usdt: quoted,
+            expected_usd,
+            quoted_usd: quoted,
         });
     }
     Ok(())
@@ -2619,13 +2619,13 @@ mod tests {
 
     #[macros::test_all]
     fn test_check_quote_drift_beyond_tolerance() {
-        // Expected 1000 USDT, got 980 (2% drop), slippage 1% → error
+        // Expected 1000 USD, got 980 (2% drop), slippage 1% → error
         let err = check_quote_drift(1_000_000, 980_000, 100).unwrap_err();
         assert!(matches!(
             err,
             BoltzError::QuoteDegradedBeyondSlippage {
-                expected_usdt: 1_000_000,
-                quoted_usdt: 980_000,
+                expected_usd: 1_000_000,
+                quoted_usd: 980_000,
             }
         ));
     }

@@ -15,8 +15,8 @@ pub enum BoltzSwapEvent {
     /// Call `accept_degraded_quote` to proceed at the current rate.
     QuoteDegraded {
         swap: BoltzSwap,
-        expected_usdt: u64,
-        quoted_usdt: u64,
+        expected_usd: u64,
+        quoted_usd: u64,
     },
 }
 
