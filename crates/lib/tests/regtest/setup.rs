@@ -23,6 +23,8 @@ pub fn regtest_config() -> BoltzConfig {
         oft_deployments_url: boltz_client::DEFAULT_OFT_DEPLOYMENTS_URL.to_string(),
         cctp_api_url: boltz_client::DEFAULT_CCTP_API_URL.to_string(),
         solana_rpc_url: boltz_client::DEFAULT_SOLANA_RPC_URL.to_string(),
+        lz_scan_api_url: boltz_client::DEFAULT_LZ_SCAN_API_URL.to_string(),
+        delivery_poll_interval_secs: Some(boltz_client::DEFAULT_DELIVERY_POLL_INTERVAL_SECS),
     }
 }
 
