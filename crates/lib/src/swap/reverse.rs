@@ -160,8 +160,7 @@ impl ReverseSwapExecutor {
             // produce `target + fee` USDC — then quote that in tBTC.
             Bridge::Cctp { domain } => {
                 let fee = self
-                    .cctp_fee_client
-                    .get_fee(CCTP_ARBITRUM_DOMAIN, *domain, CCTP_FINALITY_FAST)
+                    .cctp_prepare_fee(dest.transport, destination, *domain)
                     .await?;
                 let required_burn = cctp::cctp_required_burn(u128::from(output_amount), &fee);
                 let required_burn_u64 = u64::try_from(required_burn)
@@ -344,8 +343,7 @@ impl ReverseSwapExecutor {
                     .fetch_quote_in_for_token(tbtc_evm_units, dest.dex_output_token)
                     .await?;
                 let fee = self
-                    .cctp_fee_client
-                    .get_fee(CCTP_ARBITRUM_DOMAIN, *domain, CCTP_FINALITY_FAST)
+                    .cctp_prepare_fee(dest.transport, destination, *domain)
                     .await?;
                 let total_fee = cctp::compute_total_fee(burn_usdc, fee.bps_units, fee.forward_fee);
                 let delivered = burn_usdc.saturating_sub(total_fee);
@@ -1060,9 +1058,19 @@ impl ReverseSwapExecutor {
         let raw_quote_usdc = best.amount;
 
         // Re-quote the CCTP burn fee at claim time and cap it with a buffer.
+        // The recipient-setup decision is taken once here and reused for both
+        // the fee query and the hook bytes so they can't drift apart.
+        let needs_recipient_setup = self
+            .cctp_needs_recipient_setup(transport, &swap.destination_address)
+            .await?;
         let fee = self
             .cctp_fee_client
-            .get_fee(CCTP_ARBITRUM_DOMAIN, domain, CCTP_FINALITY_FAST)
+            .get_fee(
+                CCTP_ARBITRUM_DOMAIN,
+                domain,
+                CCTP_FINALITY_FAST,
+                needs_recipient_setup,
+            )
             .await?;
         let max_fee = cctp::add_fee_buffer(cctp::compute_total_fee(
             raw_quote_usdc,
@@ -1121,9 +1129,7 @@ impl ReverseSwapExecutor {
                 ));
             }
         };
-        let hook_data = self
-            .cctp_hook_data(transport, &swap.destination_address)
-            .await?;
+        let hook_data = cctp_forward_hook(&swap.destination_address, needs_recipient_setup)?;
 
         let cctp_data = CctpData {
             destinationDomain: domain,
@@ -1192,22 +1198,45 @@ impl ReverseSwapExecutor {
     /// static forward tag. Solana uses the static tag when the recipient's USDC
     /// ATA already exists, or the ATA-creating variant (carrying the wallet)
     /// when it does not.
-    async fn cctp_hook_data(
+    /// Whether the CCTP forwarding hook must also create the destination
+    /// recipient's token account: true only for a Solana USDC destination whose
+    /// associated token account doesn't exist yet. This single decision drives
+    /// BOTH the Iris fee query (`includeRecipientSetup`) and the hook bytes
+    /// ([`cctp_forward_hook`]), keeping the quoted `maxFee` and the on-chain
+    /// hook in lockstep. Mirrors the web app's `shouldCreateSolanaTokenAccount`.
+    async fn cctp_needs_recipient_setup(
         &self,
         transport: NetworkTransport,
         destination: &str,
-    ) -> Result<Vec<u8>, BoltzError> {
+    ) -> Result<bool, BoltzError> {
         if transport != NetworkTransport::Solana {
-            return Ok(cctp::evm_forward_hook_data().to_vec());
+            return Ok(false);
         }
-
         let ata = cctp::solana_mint_recipient(destination)?;
         let ata_base58 = bs58::encode(ata.as_slice()).into_string();
-        if self.solana_rpc.account_exists(&ata_base58).await? {
-            Ok(cctp::evm_forward_hook_data().to_vec())
-        } else {
-            cctp::solana_forward_hook_data(destination)
-        }
+        Ok(!self.solana_rpc.account_exists(&ata_base58).await?)
+    }
+
+    /// Fetch the Iris burn fee for a CCTP `destination` on `domain`, requesting
+    /// the recipient-setup tier when a first-time Solana ATA must be created.
+    /// Shared by both prepare paths so the fee query stays consistent.
+    async fn cctp_prepare_fee(
+        &self,
+        transport: NetworkTransport,
+        destination: &str,
+        domain: u32,
+    ) -> Result<cctp::CctpFee, BoltzError> {
+        let needs_recipient_setup = self
+            .cctp_needs_recipient_setup(transport, destination)
+            .await?;
+        self.cctp_fee_client
+            .get_fee(
+                CCTP_ARBITRUM_DOMAIN,
+                domain,
+                CCTP_FINALITY_FAST,
+                needs_recipient_setup,
+            )
+            .await
     }
 
     /// Cross-chain claim: claim tBTC + DEX swap to USDT + OFT bridge to destination chain.
@@ -2216,6 +2245,21 @@ fn to_chain_id_u32(chain_id: u64) -> Result<u32, BoltzError> {
         .map_err(|_| BoltzError::Generic("Chain ID overflow".to_string()))
 }
 
+/// Build the CCTP forwarding hook bytes from the recipient-setup decision
+/// (see [`ReverseSwapExecutor::cctp_needs_recipient_setup`]). With setup, the
+/// Solana ATA-creating hook; otherwise the plain EVM-style forward tag (also
+/// used for Solana recipients whose ATA already exists).
+fn cctp_forward_hook(
+    destination: &str,
+    needs_recipient_setup: bool,
+) -> Result<Vec<u8>, BoltzError> {
+    if needs_recipient_setup {
+        cctp::solana_forward_hook_data(destination)
+    } else {
+        Ok(cctp::evm_forward_hook_data().to_vec())
+    }
+}
+
 /// Floor tBTC wei (18-decimal EVM units) to tBTC sats (8-decimal), for
 /// converting DEX quote outputs to claim amounts before summing.
 fn tbtc_wei_to_sats_u64(tbtc_wei: u128) -> Result<u64, BoltzError> {
@@ -2408,6 +2452,21 @@ mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
     use super::*;
+
+    #[macros::test_all]
+    fn cctp_forward_hook_picks_setup_vs_plain() {
+        // No recipient setup → the fixed 32-byte EVM forward tag (also used for
+        // Solana recipients whose ATA already exists). Destination is irrelevant.
+        let plain = cctp_forward_hook("0x1111111111111111111111111111111111111111", false).unwrap();
+        assert_eq!(plain, cctp::evm_forward_hook_data().to_vec());
+
+        // Recipient setup → the Solana ATA-creating hook, which is longer than
+        // the 32-byte tag and varies by recipient.
+        let recipient = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+        let setup = cctp_forward_hook(recipient, true).unwrap();
+        assert_eq!(setup, cctp::solana_forward_hook_data(recipient).unwrap());
+        assert_ne!(setup, plain);
+    }
 
     #[macros::test_all]
     fn matches_any_known_token_evm_case_insensitive() {

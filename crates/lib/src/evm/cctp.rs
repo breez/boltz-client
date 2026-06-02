@@ -207,15 +207,25 @@ impl CctpFeeClient {
 
     /// Fetch the burn fee for `source_domain -> dest_domain` at the given
     /// `finality_threshold` (Fast=1000 / Standard=2000), in Forwarded mode.
+    ///
+    /// `include_recipient_setup` must be set when the forwarding hook will also
+    /// create the destination recipient's token account (a first-time Solana
+    /// USDC recipient whose ATA doesn't exist yet). Circle then quotes the
+    /// higher forward fee that covers the account-creation rent, so the
+    /// `maxFee` we cap the burn with matches what will actually be deducted.
+    /// Mirrors the web app's `getCctpFee(..., includeRecipientSetup)`.
     pub async fn get_fee(
         &self,
         source_domain: u32,
         dest_domain: u32,
         finality_threshold: u32,
+        include_recipient_setup: bool,
     ) -> Result<CctpFee, BoltzError> {
-        let url = format!(
-            "{}/v2/burn/USDC/fees/{source_domain}/{dest_domain}?forward=true",
-            self.api_url
+        let url = Self::fee_url(
+            &self.api_url,
+            source_domain,
+            dest_domain,
+            include_recipient_setup,
         );
         let mut headers = HashMap::new();
         headers.insert("Accept".to_string(), "application/json".to_string());
@@ -234,6 +244,23 @@ impl CctpFeeClient {
         }
 
         Self::parse_fee_response(&response.body, finality_threshold)
+    }
+
+    /// Build the Iris burn-fee request URL. Always Forwarded (`forward=true`);
+    /// appends `includeRecipientSetup=true` when the forwarding hook will also
+    /// create the recipient's token account. Split out for testing.
+    fn fee_url(
+        api_url: &str,
+        source_domain: u32,
+        dest_domain: u32,
+        include_recipient_setup: bool,
+    ) -> String {
+        let mut url =
+            format!("{api_url}/v2/burn/USDC/fees/{source_domain}/{dest_domain}?forward=true");
+        if include_recipient_setup {
+            url.push_str("&includeRecipientSetup=true");
+        }
+        url
     }
 
     /// Query the status of a CCTP message by its source-chain burn tx hash.
@@ -537,6 +564,21 @@ mod tests {
         );
         // Zero.
         assert_eq!(parse_scaled(&json!("0"), 9).unwrap(), 0);
+    }
+
+    #[macros::test_all]
+    fn fee_url_appends_recipient_setup_only_when_needed() {
+        // Default: Forwarded fee, no setup param.
+        assert_eq!(
+            CctpFeeClient::fee_url("https://iris-api.circle.com", 3, 5, false),
+            "https://iris-api.circle.com/v2/burn/USDC/fees/3/5?forward=true"
+        );
+        // First-time Solana recipient: request the recipient-setup fee tier,
+        // matching the web app's `...?forward=true&includeRecipientSetup=true`.
+        assert_eq!(
+            CctpFeeClient::fee_url("https://iris-api.circle.com", 3, 5, true),
+            "https://iris-api.circle.com/v2/burn/USDC/fees/3/5?forward=true&includeRecipientSetup=true"
+        );
     }
 
     #[macros::test_all]
