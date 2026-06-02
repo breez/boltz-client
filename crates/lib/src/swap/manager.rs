@@ -242,6 +242,13 @@ impl SwapManager {
         // Past the claim: the swap is awaiting cross-chain delivery, which the
         // background poll (not the Boltz WS) drives. Stop tracking it on WS;
         // `poll_settling_swaps` scans the store and finalizes it.
+        //
+        // This guard must run BEFORE the status match below: once a swap is
+        // Settling the tBTC is already claimed, so a late `swap.expired` /
+        // `invoice.expired` (e.g. delivered to a still-subscribed swap after
+        // `resume_all` re-subscribes it) must NOT drive it to `Expired`. A
+        // Settling swap only ever leaves Settling via confirmed delivery; if
+        // delivery never confirms it stays Settling indefinitely, by design.
         if swap.status == BoltzSwapStatus::Settling {
             tracing::debug!(
                 swap_id,
@@ -302,15 +309,18 @@ impl SwapManager {
                     Self::do_claim(executor, store, event_emitter, &mut s, false).await;
                 }
             }
-            // `invoice.settled`: reverse swap success (Boltz settled the hold
-            //   invoice after detecting our on-chain claim).
+            // `invoice.settled`: reverse swap success. Boltz can only settle the
+            //   hold invoice once it holds the preimage, and the preimage only
+            //   reaches the chain inside our atomic claim tx (claim + DEX +
+            //   bridge-send, all-or-nothing). So a *genuine* settled event is
+            //   itself proof the source-side claim + send succeeded.
             // `transaction.claimed`: submarine/chain swap success (included
             //   for completeness, not expected for reverse swaps).
             //
-            // If we have a claim tx hash, verify the receipt on-chain before
-            // marking Completed. Without a tx hash we can't meaningfully verify
-            // (the on-chain lock check can't distinguish our claim from a Boltz
-            // refund), so trust the WS event and log a warning.
+            // We don't act on the WS event alone — a spoofed/buggy one mustn't
+            // finalize a swap. With a tx hash we verify the receipt; with a
+            // call_id we recover then verify it; with neither we fall back to the
+            // ERC20Swap lock state as a claim-retry guard (see below).
             "invoice.settled" | "transaction.claimed" => {
                 if let Some(ref tx_hash) = swap.claim_tx_hash {
                     let reached_terminal =
@@ -329,18 +339,53 @@ impl SwapManager {
                         Self::cleanup_terminal(ws_subscriber, tracked_ids, swap_id).await;
                     }
                 } else {
-                    tracing::warn!(
-                        swap_id,
-                        "No claim tx hash or pending call_id — cannot verify on-chain, trusting WS event"
-                    );
-                    update_swap_status(
-                        &**store,
-                        event_emitter,
-                        &mut swap,
-                        BoltzSwapStatus::Completed,
+                    // No tx hash and no call_id, so we can't fetch the receipt.
+                    // The lock state here is a CLAIM-RETRY GUARD, not a delivery
+                    // (or claim-vs-refund) check: it only tells us whether the
+                    // swap is still claimable, so a spoofed/premature settled
+                    // event can't make us abandon recoverable tBTC. Delivery is
+                    // gated separately (`post_claim_status` -> `Settling` poll).
+                    match is_swap_still_locked_by_swap(
+                        &executor.evm_provider,
+                        &swap,
+                        &executor.key_manager,
                     )
-                    .await;
-                    Self::cleanup_terminal(ws_subscriber, tracked_ids, swap_id).await;
+                    .await
+                    {
+                        Ok(true) => {
+                            // Still claimable: the claim hasn't happened (the
+                            // settled event was premature or spoofed). Retry it
+                            // rather than finalizing on a WS message alone — else
+                            // the tBTC would sit until it refunds back to Boltz.
+                            tracing::warn!(
+                                swap_id,
+                                "WS reports settled but swap still locked on-chain; retrying claim"
+                            );
+                            Self::check_on_chain_and_retry(executor, store, event_emitter, &swap)
+                                .await;
+                        }
+                        Ok(false) => {
+                            // Spent. Combined with the settled event — which
+                            // requires the preimage from our atomic claim — this
+                            // means the source-side claim + send succeeded (a
+                            // refund couldn't have produced a preimage to settle).
+                            // Gate delivery: `post_claim_status` completes `Direct`
+                            // (atomically delivered in that same tx) and holds
+                            // `Oft`/`Cctp` in `Settling` for the delivery poll.
+                            let next = post_claim_status(&swap);
+                            update_swap_status(&**store, event_emitter, &mut swap, next).await;
+                            Self::cleanup_terminal(ws_subscriber, tracked_ids, swap_id).await;
+                        }
+                        Err(e) => {
+                            // Couldn't read the lock state — leave the swap
+                            // tracked; the next WS update or `resume_all` retries.
+                            tracing::warn!(
+                                swap_id,
+                                error = %e,
+                                "On-chain lock check failed; leaving swap for retry"
+                            );
+                        }
+                    }
                 }
             }
             "invoice.expired" | "swap.expired" => {
@@ -677,22 +722,26 @@ fn delivered_and_ref(decoded: DeliveredAmount, tx_hash: &str) -> (Option<u64>, O
 
 /// Choose the post-claim status for a swap whose claim receipt just confirmed
 /// successfully. `Direct` delivery is complete on Arbitrum; `Oft`/`Cctp` enter
-/// `Settling` so the background poll can confirm cross-chain delivery — but only
-/// if a `bridge_ref` was recovered (without it we can't track delivery, so fall
-/// back to `Completed`).
+/// `Settling` so the background poll can confirm cross-chain delivery before
+/// `Completed`.
+///
+/// A bridged swap is *never* marked `Completed` here: completion only happens
+/// once delivery is confirmed (`confirm_delivery`). If a `bridge_ref` couldn't
+/// be recovered from the receipt (anomalous — a successful bridged claim should
+/// emit one), the swap still holds in `Settling` rather than falsely completing;
+/// `confirm_delivery` will log that it can't track it. This is the safe failure
+/// mode: a stuck-but-honest `Settling` beats a "Completed" we never verified.
 fn post_claim_status(swap: &BoltzSwap) -> BoltzSwapStatus {
     match swap.bridge_kind {
         BridgeKind::Direct => BoltzSwapStatus::Completed,
         BridgeKind::Oft | BridgeKind::Cctp => {
-            if swap.bridge_ref.is_some() {
-                BoltzSwapStatus::Settling
-            } else {
+            if swap.bridge_ref.is_none() {
                 tracing::warn!(
                     swap_id = swap.id,
-                    "Bridged swap missing bridge_ref after claim; completing without delivery confirmation"
+                    "Bridged swap missing bridge_ref after claim; holding in Settling (delivery unconfirmable)"
                 );
-                BoltzSwapStatus::Completed
             }
+            BoltzSwapStatus::Settling
         }
     }
 }
@@ -866,11 +915,14 @@ mod tests {
     }
 
     #[macros::test_all]
-    fn bridged_without_ref_falls_back_to_completed() {
-        // No bridge_ref means delivery can't be tracked, so don't strand the
-        // swap in Settling forever.
-        let swap = swap_with(BridgeKind::Cctp, None);
-        assert_eq!(post_claim_status(&swap), BoltzSwapStatus::Completed);
+    fn bridged_without_ref_holds_in_settling_not_completed() {
+        // Anomalous: a successful bridged claim should yield a bridge_ref.
+        // Without one we still must NOT mark the swap Completed unverified —
+        // it holds in Settling (delivery unconfirmable) rather than lying.
+        let oft = swap_with(BridgeKind::Oft, None);
+        assert_eq!(post_claim_status(&oft), BoltzSwapStatus::Settling);
+        let cctp = swap_with(BridgeKind::Cctp, None);
+        assert_eq!(post_claim_status(&cctp), BoltzSwapStatus::Settling);
     }
 
     // ─── delivered_and_ref: per-bridge field mapping at claim time ──────
