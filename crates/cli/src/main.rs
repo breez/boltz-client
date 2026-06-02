@@ -14,7 +14,7 @@ use rustyline::{Completer, Helper, Hinter, Validator, highlight::Highlighter};
 
 use boltz_client::{
     BoltzConfig, BoltzError, BoltzEventListener, BoltzService, BoltzStorage, BoltzSwapEvent,
-    DestinationId,
+    BoltzSwapStatus, DestinationId,
 };
 
 const PHRASE_FILE_NAME: &str = "phrase";
@@ -293,7 +293,20 @@ async fn init_service(config: BoltzConfig, seed: &[u8], data_dir: &Path) -> Resu
     // Resume any active swaps from a previous run.
     let resumed = svc.resume_swaps().await.context("Failed to resume swaps")?;
     if !resumed.is_empty() {
-        println!("Resumed {} active swap(s)", resumed.len());
+        println!("Resumed {} active swap(s):", resumed.len());
+        for id in &resumed {
+            match svc.get_swap(id).await {
+                Ok(Some(swap)) => {
+                    println!("  [{}] Status: {:?}", swap.id, swap.status);
+                    if swap.status == BoltzSwapStatus::Settling {
+                        let bridge_ref = swap.bridge_ref.as_deref().unwrap_or("<pending>");
+                        println!("    Bridge ref ({:?}): {bridge_ref}", swap.bridge_kind);
+                    }
+                }
+                Ok(None) => println!("  [{id}] (not found)"),
+                Err(e) => println!("  [{id}] (failed to load: {e})"),
+            }
+        }
     }
     Ok(svc)
 }
@@ -437,6 +450,18 @@ impl BoltzEventListener for PrintingEventListener {
         match &event {
             BoltzSwapEvent::SwapUpdated { swap } => {
                 println!("[{}] Status: {:?}", swap.id, swap.status);
+                if swap.status == BoltzSwapStatus::Settling {
+                    match &swap.bridge_ref {
+                        Some(bridge_ref) => println!(
+                            "  Bridge ref ({:?}): {bridge_ref}",
+                            swap.bridge_kind
+                        ),
+                        None => println!(
+                            "  Bridge ref ({:?}): <pending>",
+                            swap.bridge_kind
+                        ),
+                    }
+                }
                 if swap.status.is_terminal() {
                     println!("  Final state:");
                     print_json(swap);
