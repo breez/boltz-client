@@ -22,7 +22,10 @@ use std::collections::{HashMap, HashSet};
 use platform_utils::http::HttpClient;
 use serde::Deserialize;
 
-use crate::config::{ARBITRUM_USDC_ADDRESS, ARBITRUM_USDT_ADDRESS};
+use crate::config::{
+    ARBITRUM_USDC_ADDRESS, ARBITRUM_USDT_ADDRESS, ARBITRUM_USDT0_LEGACY_OFT,
+    ARBITRUM_USDT0_NATIVE_OFT,
+};
 use crate::error::BoltzError;
 use crate::models::{
     Asset, Bridge, CCTP_DESTINATIONS, Destination, DestinationId, DestinationRegistry,
@@ -152,6 +155,19 @@ pub fn parse_chain_registry(
         .and_then(resolve_chain_info)
         .map(|info| info.oft_address);
 
+    // Pin the source-side OFT contracts. These are the addresses the Router
+    // approves and calls `send` on during a cross-chain claim, so a hijacked
+    // deployments feed substituting them is the only feed-compromise path that
+    // yields theft. They never change per mesh: verify the feed matches the
+    // pinned constant and refuse to start on a mismatch. A feed that simply
+    // omits a mesh leaves that mesh unavailable (no `send` happens without an
+    // address) rather than failing init, so a benign upstream restructuring
+    // can't brick the client.
+    let source_native_oft =
+        verify_pinned_source_oft(source_native_oft, ARBITRUM_USDT0_NATIVE_OFT, "native")?;
+    let source_legacy_oft =
+        verify_pinned_source_oft(source_legacy_oft, ARBITRUM_USDT0_LEGACY_OFT, "legacy")?;
+
     // Build destinations. Native-mesh entries are inserted first so that a
     // chain appearing in both sections keeps the native spec. An EVM chain
     // can show up in both sections under different names ("Arbitrum One" in
@@ -240,6 +256,32 @@ fn source_evm_chain_id_as_u32(source: u64) -> Result<u32, BoltzError> {
     source
         .try_into()
         .map_err(|_| BoltzError::Generic(format!("Source chain ID {source} exceeds u32")))
+}
+
+/// Verify a feed-provided source OFT address against the compile-time pin.
+///
+/// - feed omits it (`None`) → `Ok(None)`: that mesh is simply unavailable; no
+///   `send` is ever signed without an address, so there's nothing to steal.
+/// - feed matches the pin (case-insensitive) → `Ok(Some(pin))`, canonicalized
+///   to the pinned casing.
+/// - feed provides a *different* address → `Err`: the substitution we refuse
+///   to trust, since the Router would approve and `send` on it.
+fn verify_pinned_source_oft(
+    feed_value: Option<String>,
+    pinned: &str,
+    mesh: &str,
+) -> Result<Option<String>, BoltzError> {
+    match feed_value {
+        None => Ok(None),
+        Some(addr) if addr.eq_ignore_ascii_case(pinned) => Ok(Some(pinned.to_string())),
+        Some(addr) => Err(BoltzError::Api {
+            reason: format!(
+                "USDT0 {mesh}-mesh source OFT {addr} does not match the pinned Arbitrum \
+                 contract {pinned}; refusing to use a substituted bridge contract"
+            ),
+            code: None,
+        }),
+    }
 }
 
 /// Build a USDT0 `Destination` for a single deployments entry, or `None` if
@@ -753,7 +795,7 @@ mod tests {
                         "chainId": 42161,
                         "lzEid": "30110",
                         "contracts": [
-                            {"name": "OFT", "address": "0xaa", "explorer": ""}
+                            {"name": "OFT", "address": "0x14E4A1B13bf7F943c8ff7C51fb60FA964A298D92", "explorer": ""}
                         ]
                     }
                 ]
@@ -767,6 +809,105 @@ mod tests {
                 .is_some_and(|d| matches!(d.bridge, Bridge::Direct))
         );
         assert!(registry.source_legacy_oft.is_none());
+    }
+
+    #[macros::test_all]
+    fn substituted_native_source_oft_is_rejected() {
+        // A hijacked feed swapping in a different Arbitrum native OFT — the
+        // one address the Router approves and `send`s on — must hard-fail
+        // init rather than let the claim path sign a send to an attacker
+        // contract.
+        let body = r#"{
+            "usdt0": {
+                "native": [
+                    {
+                        "name": "Arbitrum One",
+                        "chainId": 42161,
+                        "lzEid": "30110",
+                        "contracts": [
+                            {"name": "OFT", "address": "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "explorer": ""}
+                        ]
+                    }
+                ]
+            }
+        }"#;
+        let err = parse_chain_registry(body, ARBITRUM_CHAIN_ID).unwrap_err();
+        match err {
+            BoltzError::Api { reason, .. } => {
+                assert!(
+                    reason.contains("native-mesh source OFT"),
+                    "reason: {reason}"
+                );
+                assert!(reason.contains("pinned"), "reason: {reason}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[macros::test_all]
+    fn substituted_legacy_source_oft_is_rejected() {
+        // Native matches the pin, but the legacy-mesh source OFT is
+        // substituted → still rejected (the legacy OFT is an equally valid
+        // approve+send target for legacy-mesh routes).
+        let body = r#"{
+            "usdt0": {
+                "native": [
+                    {
+                        "name": "Arbitrum One",
+                        "chainId": 42161,
+                        "lzEid": "30110",
+                        "contracts": [
+                            {"name": "OFT", "address": "0x14E4A1B13bf7F943c8ff7C51fb60FA964A298D92", "explorer": ""}
+                        ]
+                    }
+                ],
+                "legacyMesh": [
+                    {
+                        "name": "Arbitrum",
+                        "chainId": 42161,
+                        "lzEid": "30110",
+                        "contracts": [
+                            {"name": "OFT", "address": "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "explorer": ""}
+                        ]
+                    }
+                ]
+            }
+        }"#;
+        let err = parse_chain_registry(body, ARBITRUM_CHAIN_ID).unwrap_err();
+        match err {
+            BoltzError::Api { reason, .. } => {
+                assert!(
+                    reason.contains("legacy-mesh source OFT"),
+                    "reason: {reason}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[macros::test_all]
+    fn source_oft_match_is_case_insensitive() {
+        // The pin compare must ignore EIP-55 casing: a feed returning the same
+        // address lowercased is accepted and canonicalized to the pin.
+        let body = r#"{
+            "usdt0": {
+                "native": [
+                    {
+                        "name": "Arbitrum One",
+                        "chainId": 42161,
+                        "lzEid": "30110",
+                        "contracts": [
+                            {"name": "OFT", "address": "0x14e4a1b13bf7f943c8ff7c51fb60fa964a298d92", "explorer": ""}
+                        ]
+                    }
+                ]
+            }
+        }"#;
+        let registry = parse_chain_registry(body, ARBITRUM_CHAIN_ID).unwrap();
+        assert_eq!(
+            registry.source_native_oft.as_deref(),
+            Some("0x14E4A1B13bf7F943c8ff7C51fb60FA964A298D92")
+        );
     }
 
     fn contract(name: &str, address: &str) -> OftApiContract {

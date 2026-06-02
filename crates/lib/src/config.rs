@@ -140,6 +140,23 @@ pub const ARBITRUM_USDT_ADDRESS: &str = "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FC
 /// this token, which the Router then burns via CCTP for USDC destinations.
 pub const ARBITRUM_USDC_ADDRESS: &str = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831";
 
+/// Pinned Arbitrum source OFT contracts (USDT0). The Router grants a USDT
+/// approval to — and calls `send` on — whichever of these the selected mesh
+/// resolves to during a cross-chain claim. They are the *only* values taken
+/// from the USDT0 deployments feed whose substitution yields theft (of the
+/// in-flight swap amount), so a hijacked feed swapping them in is the one
+/// feed-compromise path worth closing. They are immutable per mesh: the
+/// registry build verifies the feed's source OFT against these pins and
+/// refuses to start on a mismatch, while destination EIDs and contracts stay
+/// dynamically discovered (an unpinned destination at worst makes `send`
+/// revert, never steals). Verified against `https://docs.usdt0.to/api/deployments`.
+///
+/// Native (`OFTv2`) mesh source OFT on Arbitrum One.
+pub const ARBITRUM_USDT0_NATIVE_OFT: &str = "0x14E4A1B13bf7F943c8ff7C51fb60FA964A298D92";
+
+/// Legacy mesh (`OFTv1`) source OFT on Arbitrum One.
+pub const ARBITRUM_USDT0_LEGACY_OFT: &str = "0x77652D5aba086137b595875263FC200182919B92";
+
 /// Circle CCTP v2 `TokenMessenger` — same address on every supported EVM
 /// chain. The Router's `claimERC20ExecuteCctp` calls `depositForBurn` here.
 pub const CCTP_TOKEN_MESSENGER_V2: &str = "0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d";
