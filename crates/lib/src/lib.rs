@@ -33,6 +33,10 @@ use solana::rpc::SolanaRpcClient;
 use swap::manager::SwapManager;
 use swap::reverse::{ReverseSwapExecutor, current_unix_timestamp, resolve_slippage_bps};
 
+/// `User-Agent` sent on every outbound HTTP request. Some upstreams reject
+/// header-less requests.
+const USER_AGENT: &str = concat!("boltz-client/", env!("CARGO_PKG_VERSION"));
+
 /// Top-level Boltz service facade.
 ///
 /// Two-step swap flow:
@@ -70,8 +74,11 @@ impl BoltzService {
 
         // Each component gets its own DefaultHttpClient. Instances are cheap
         // (no shared connection pool), so sharing via Arc is not worth the
-        // signature churn.
-        let api_client = BoltzApiClient::new(&config, Box::new(DefaultHttpClient::new(None)));
+        // signature churn. All carry USER_AGENT — some upstreams 403 without it.
+        let api_client = BoltzApiClient::new(
+            &config,
+            Box::new(DefaultHttpClient::new(Some(USER_AGENT.to_string()))),
+        );
 
         // Create the global WS channel and subscriber.
         let (ws_tx, ws_rx) = mpsc::channel(256);
@@ -79,13 +86,13 @@ impl BoltzService {
 
         let alchemy_client = AlchemyGasClient::new(
             &config.alchemy_config,
-            Box::new(DefaultHttpClient::new(None)),
+            Box::new(DefaultHttpClient::new(Some(USER_AGENT.to_string()))),
             gas_signer,
         );
 
         let evm_provider = EvmProvider::new(
             config.arbitrum_rpc_url.clone(),
-            Box::new(DefaultHttpClient::new(None)),
+            Box::new(DefaultHttpClient::new(Some(USER_AGENT.to_string()))),
         );
 
         // Chain registry is fetched once from the USDT0 deployments API and
@@ -94,7 +101,7 @@ impl BoltzService {
         // shipping a new client.
         let chain_registry = Arc::new(
             fetch_chain_registry(
-                &DefaultHttpClient::new(None),
+                &DefaultHttpClient::new(Some(USER_AGENT.to_string())),
                 &config.oft_deployments_url,
                 config.chain_id,
             )
@@ -117,17 +124,17 @@ impl BoltzService {
             })?;
 
         let solana_rpc = SolanaRpcClient::new(
-            Box::new(DefaultHttpClient::new(None)),
+            Box::new(DefaultHttpClient::new(Some(USER_AGENT.to_string()))),
             config.solana_rpc_url.clone(),
         );
 
         let cctp_fee_client = crate::evm::cctp::CctpFeeClient::new(
-            Box::new(DefaultHttpClient::new(None)),
+            Box::new(DefaultHttpClient::new(Some(USER_AGENT.to_string()))),
             config.cctp_api_url.clone(),
         );
 
         let lz_scan_client = crate::evm::lz_scan::LzScanClient::new(
-            Box::new(DefaultHttpClient::new(None)),
+            Box::new(DefaultHttpClient::new(Some(USER_AGENT.to_string()))),
             config.lz_scan_api_url.clone(),
         );
 

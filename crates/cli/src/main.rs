@@ -452,14 +452,10 @@ impl BoltzEventListener for PrintingEventListener {
                 println!("[{}] Status: {:?}", swap.id, swap.status);
                 if swap.status == BoltzSwapStatus::Settling {
                     match &swap.bridge_ref {
-                        Some(bridge_ref) => println!(
-                            "  Bridge ref ({:?}): {bridge_ref}",
-                            swap.bridge_kind
-                        ),
-                        None => println!(
-                            "  Bridge ref ({:?}): <pending>",
-                            swap.bridge_kind
-                        ),
+                        Some(bridge_ref) => {
+                            println!("  Bridge ref ({:?}): {bridge_ref}", swap.bridge_kind);
+                        }
+                        None => println!("  Bridge ref ({:?}): <pending>", swap.bridge_kind),
                     }
                 }
                 if swap.status.is_terminal() {
