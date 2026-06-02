@@ -2,20 +2,26 @@
 
 Boltz client for cross-chain swaps.
 
-Swaps between Lightning (sats) and USDT via [boltz.exchange](https://boltz.exchange). Uses a two-hop architecture:
+Reverse-only swaps from Lightning (sats) to a stablecoin (USDT or USDC) via [boltz.exchange](https://boltz.exchange). Uses a two-hop architecture:
 
 ```
-Lightning <-> tBTC (Boltz reverse swap) <-> USDT (DEX swap on Arbitrum)
+Lightning -> tBTC (Boltz reverse swap) -> stablecoin (DEX swap on Arbitrum) -> destination
 ```
 
-A Router contract makes claim + DEX atomic — one EVM transaction claims tBTC from the ERC20Swap contract and executes the swap to USDT. Cross-chain delivery to other EVM chains uses OFT bridging (LayerZero).
+A Router contract makes claim + DEX atomic — one Alchemy-sponsored EVM transaction claims tBTC from the ERC20Swap contract, executes the DEX swap on Arbitrum, and bundles cross-chain delivery in the same call. How the stablecoin reaches the user depends on the destination's bridge:
+
+- **Direct** — delivered on Arbitrum (USDT, or USDC-on-Arbitrum); no cross-chain hop.
+- **OFT** — LayerZero USDT0 bridge (native or legacy mesh) to other EVM chains.
+- **CCTP** — Circle CCTP v2 burn + mint (USDC; EVM chains + Solana).
+
+OFT/CCTP swaps complete only once cross-chain delivery is confirmed (CCTP via Circle Iris, OFT via LayerZero Scan); Direct swaps complete immediately.
 
 ## Key Design Choices
 
 | Decision | Choice |
 |----------|--------|
 | EVM keys | SDK-managed, derived from seed via BIP-32 |
-| Gas | Alchemy EIP-7702 — users don't need ETH |
+| Gas | EIP-7702 via a configurable gas-sponsor URL (wraps Alchemy) — users don't need ETH |
 | ABI + signing | alloy-sol-types + k256 (WASM-compatible) |
 | Swap status | WebSocket (real-time updates) |
 
