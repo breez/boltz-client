@@ -252,8 +252,6 @@ impl EvmSigner {
 
     /// Sign the Router `ClaimCctp` EIP-712 typed data (cross-chain CCTP/USDC
     /// bridging). Same domain as the OFT `ClaimSend` path.
-    // TODO(cctp): remove `allow(dead_code)` once the CCTP claim path wires this in.
-    #[allow(dead_code)]
     pub fn sign_eip712_router_claim_cctp(
         &self,
         router_address: Address,

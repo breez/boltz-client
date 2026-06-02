@@ -24,6 +24,14 @@ pub struct LzScanClient {
 }
 
 /// Delivery status of a `LayerZero` message from the Scan API.
+///
+/// Response shape verified against the live mainnet `OpenAPI` spec
+/// (`GET https://scan.layerzero-api.com/v1/openapi`, 2026-06): the body is
+/// `{ "data": [ { "status": { "name": <enum>, "message": string }, ... } ] }`,
+/// and `status.name` is one of `INFLIGHT`, `CONFIRMING`, `FAILED`, `DELIVERED`,
+/// `BLOCKED`, `PAYLOAD_STORED`, `APPLICATION_BURNED`, `APPLICATION_SKIPPED`,
+/// `UNRESOLVABLE_COMMAND`, `MALFORMED_COMMAND`. A missing message is HTTP 404
+/// (`{"code":4040}`), treated as not-yet-indexed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LzMessageStatus {
     /// `false` when Scan hasn't indexed the source tx yet (HTTP 404 or empty
@@ -43,6 +51,13 @@ impl LzMessageStatus {
 
 /// `status.name` value Scan reports once a message is executed on the
 /// destination chain.
+///
+/// Note: only `DELIVERED` finalizes a swap. Every other value (including the
+/// terminal failures `FAILED` / `BLOCKED` / `MALFORMED_COMMAND` /
+/// `UNRESOLVABLE_COMMAND`) keeps the swap polling in `Settling`. That is a
+/// deliberate choice — a stuck-but-honest `Settling` over a false `Completed` —
+/// but a future change could short-circuit the known-terminal failures to a
+/// distinct surfaced status.
 const LZ_STATUS_DELIVERED: &str = "DELIVERED";
 
 impl LzScanClient {
