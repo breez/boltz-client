@@ -333,6 +333,9 @@ pub struct CctpDestination {
     /// chain never appears under two different names across the two bridges.
     pub chain_label: &'static str,
     pub transport: NetworkTransport,
+    /// EVM chain id of the destination chain. `None` for non-EVM transports
+    /// (Solana), which expose no numeric chain id.
+    pub evm_chain_id: Option<u64>,
     /// Circle CCTP domain id of the destination chain.
     pub domain: u32,
     /// USDC token contract on the destination chain (EVM `0x…`, Solana base58
@@ -348,6 +351,7 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
         id: "usdc-base",
         chain_label: "Base",
         transport: NetworkTransport::Evm,
+        evm_chain_id: Some(8453),
         domain: 6,
         token_address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
     },
@@ -355,6 +359,7 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
         id: "usdc-eth",
         chain_label: "Ethereum",
         transport: NetworkTransport::Evm,
+        evm_chain_id: Some(1),
         domain: 0,
         token_address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
     },
@@ -362,6 +367,7 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
         id: "usdc-avax",
         chain_label: "Avalanche",
         transport: NetworkTransport::Evm,
+        evm_chain_id: Some(43114),
         domain: 1,
         token_address: "0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E",
     },
@@ -369,6 +375,7 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
         id: "usdc-op",
         chain_label: "Optimism",
         transport: NetworkTransport::Evm,
+        evm_chain_id: Some(10),
         domain: 2,
         token_address: "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85",
     },
@@ -376,6 +383,7 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
         id: "usdc-pol",
         chain_label: "Polygon PoS",
         transport: NetworkTransport::Evm,
+        evm_chain_id: Some(137),
         domain: 7,
         token_address: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
     },
@@ -383,6 +391,7 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
         id: "usdc-uni",
         chain_label: "Unichain",
         transport: NetworkTransport::Evm,
+        evm_chain_id: Some(130),
         domain: 10,
         token_address: "0x078D782b760474a361dDA0AF3839290b0EF57AD6",
     },
@@ -390,6 +399,7 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
         id: "usdc-linea",
         chain_label: "Linea",
         transport: NetworkTransport::Evm,
+        evm_chain_id: Some(59144),
         domain: 11,
         token_address: "0x176211869cA2b568f2A7D4EE941E073a821EE1ff",
     },
@@ -397,6 +407,7 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
         id: "usdc-codex",
         chain_label: "Codex",
         transport: NetworkTransport::Evm,
+        evm_chain_id: Some(81224),
         domain: 12,
         token_address: "0xd996633a415985DBd7D6D12f4A4343E31f5037cf",
     },
@@ -404,6 +415,7 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
         id: "usdc-sonic",
         chain_label: "Sonic",
         transport: NetworkTransport::Evm,
+        evm_chain_id: Some(146),
         domain: 13,
         token_address: "0x29219dd400f2Bf60E5a23d13be72b486d4038894",
     },
@@ -411,6 +423,7 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
         id: "usdc-world",
         chain_label: "World Chain",
         transport: NetworkTransport::Evm,
+        evm_chain_id: Some(480),
         domain: 14,
         token_address: "0x79A02482A880bCe3F13E09da970dC34dB4cD24D1",
     },
@@ -418,6 +431,7 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
         id: "usdc-mon",
         chain_label: "Monad",
         transport: NetworkTransport::Evm,
+        evm_chain_id: Some(143),
         domain: 15,
         token_address: "0x754704Bc059F8C67012fEd69BC8A327a5aafb603",
     },
@@ -425,6 +439,7 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
         id: "usdc-sei",
         chain_label: "Sei",
         transport: NetworkTransport::Evm,
+        evm_chain_id: Some(1329),
         domain: 16,
         token_address: "0xe15fC38F6D8c56aF07bbCBe3BAf5708A2Bf42392",
     },
@@ -432,6 +447,7 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
         id: "usdc-xdc",
         chain_label: "XDC",
         transport: NetworkTransport::Evm,
+        evm_chain_id: Some(50),
         domain: 18,
         token_address: "0xfA2958CB79b0491CC627c1557F441eF849Ca8eb1",
     },
@@ -439,6 +455,7 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
         id: "usdc-ink",
         chain_label: "Ink",
         transport: NetworkTransport::Evm,
+        evm_chain_id: Some(57073),
         domain: 21,
         token_address: "0x2D270e6886d130D724215A266106e6832161EAEd",
     },
@@ -446,6 +463,7 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
         id: "usdc-plume",
         chain_label: "Plume",
         transport: NetworkTransport::Evm,
+        evm_chain_id: Some(98866),
         domain: 22,
         token_address: "0x222365EF19F7947e5484218551B56bb3965Aa7aF",
     },
@@ -453,6 +471,7 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
         id: "usdc-sol",
         chain_label: "Solana",
         transport: NetworkTransport::Solana,
+        evm_chain_id: None,
         domain: 5,
         token_address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
     },
@@ -476,6 +495,12 @@ pub struct DestinationOption {
     /// Asset delivered there.
     pub asset: Asset,
     pub transport: NetworkTransport,
+    /// EVM chain ID of the destination chain. `None` for non-EVM transports
+    /// (Solana, Tron), which expose no numeric chain id.
+    pub evm_chain_id: Option<u64>,
+    /// Token contract on the destination chain (`0x…` EVM, base58 Solana),
+    /// when known.
+    pub dest_token_address: Option<String>,
     /// Coarse bridge category (for delivery-status UX).
     pub bridge_kind: BridgeKind,
 }
@@ -721,10 +746,14 @@ mod tests {
                 NetworkTransport::Evm => {
                     assert!(d.token_address.starts_with("0x"));
                     assert_eq!(d.token_address.len(), 42);
+                    // Every EVM destination carries a numeric chain id.
+                    assert!(d.evm_chain_id.is_some(), "{} missing evm_chain_id", d.id);
                 }
                 NetworkTransport::Solana => {
                     solana_count += 1;
                     assert!(!d.token_address.starts_with("0x"));
+                    // Non-EVM transports expose no chain id.
+                    assert!(d.evm_chain_id.is_none(), "{} has evm_chain_id", d.id);
                 }
                 NetworkTransport::Tron => panic!("CCTP does not support Tron"),
             }

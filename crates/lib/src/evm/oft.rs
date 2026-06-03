@@ -217,7 +217,7 @@ pub fn parse_chain_registry(
                 chain_label: d.chain_label.to_string(),
                 asset: Asset::Usdc,
                 transport: d.transport,
-                evm_chain_id: None,
+                evm_chain_id: d.evm_chain_id,
                 dex_output_token: ARBITRUM_USDC_ADDRESS,
                 dest_token_address: Some(d.token_address.to_string()),
                 bridge: Bridge::Cctp { domain: d.domain },

@@ -322,6 +322,8 @@ impl BoltzService {
                 chain_label: dest.chain_label.clone(),
                 asset: dest.asset,
                 transport: dest.transport,
+                evm_chain_id: dest.evm_chain_id,
+                dest_token_address: dest.dest_token_address.clone(),
                 bridge_kind: dest.bridge.kind(),
             })
             .collect()
