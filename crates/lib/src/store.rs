@@ -1,3 +1,5 @@
+use platform_utils::tokio;
+
 use crate::error::BoltzError;
 use crate::models::BoltzSwap;
 

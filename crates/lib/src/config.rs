@@ -171,11 +171,10 @@ pub const CCTP_MESSAGE_TRANSMITTER_V2: &str = "0x81D40F21F12A8F0E3252Bccb954D722
 pub const CCTP_ARBITRUM_DOMAIN: u32 = 3;
 
 /// CCTP v2 `minFinalityThreshold` for Fast transfers (soft finality, lower
-/// latency). The web app defaults to Fast for every CCTP route.
+/// latency). The web app defaults to Fast for every CCTP route, so the crate
+/// only ever uses Fast — the Standard-finality (2000) threshold is intentionally
+/// not defined until a code path actually selects it.
 pub const CCTP_FINALITY_FAST: u32 = 1000;
-
-/// CCTP v2 `minFinalityThreshold` for Standard transfers (hard finality).
-pub const CCTP_FINALITY_STANDARD: u32 = 2000;
 
 /// CCTP v2 "forwarding service" `hookData` for EVM destinations: the ASCII tag
 /// `"cctp-forward"` (12 bytes) right-padded to 32 bytes. Circle's forwarder

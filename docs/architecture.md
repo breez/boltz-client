@@ -116,7 +116,7 @@ All paths are under `crates/lib/src/` unless noted.
 |---|---|---|
 | `api/mod.rs` | Thin REST client over the injected `HttpClient`: reverse pairs, create swap, status, lockup tx, DEX quote/encode, chain contracts. Sends the referral header on every request (attribution). | `BoltzApiClient` |
 | `api/types.rs` | serde request/response DTOs and WS wire types. `EncodeRequest` amounts serialize as decimal **strings** (the API rejects integer-typed amounts). | `ReversePairsResponse`, `CreateReverseSwap{Request,Response}`, `QuoteResponse`, `EncodeRequest/Response`, `QuoteCalldata`, `ContractsResponse`, `SwapStatusResponse`, `WsSubscribeMessage`, `WsMessage`, `WsSwapUpdate` |
-| `api/ws.rs` | One persistent, reconnecting WebSocket multiplexing `swap.update` for all tracked IDs onto a single mpsc channel. 15s keep-alive ping, 5s reconnect, re-subscribe after reconnect, Drop-time task abort. Does **not** replay missed updates — the manager reconciles via REST. | `SwapStatusSubscriber`, `SwapStatusUpdate` |
+| `api/ws.rs` | One persistent, reconnecting WebSocket multiplexing `swap.update` for all tracked IDs onto a single mpsc channel. 15s keep-alive ping, 5s reconnect, re-subscribe after reconnect, Drop-time task abort. Does **not** replay missed updates — on (re)subscribe Boltz re-pushes each swap's current status, and the manager reconciles state against the **on-chain `ERC20Swap` lock** (plus the receipt / persisted `call_id`), never on the WS event alone. | `SwapStatusSubscriber`, `SwapStatusUpdate` |
 
 ### Config & model
 
@@ -192,7 +192,7 @@ see [`docs/decisions.md`](./decisions.md).
 ### Load-bearing invariants worth surfacing
 
 - `create_reverse_swap` MUST persist the incremented key index durably before returning; Boltz's HTTP 409 (`DuplicatePreimage`) must **not** auto-retry with the next index.
-- `Settling` is non-terminal and is short-circuited *before* the WS status match in the manager — treating it as terminal, or letting a late `*.expired` past it, would strand or wrongly fail an already-claimed bridged swap.
+- `Settling` is non-terminal and is short-circuited *before* the WS status match in the manager — treating it as terminal, or letting a late `*.expired` past it, would strand or wrongly fail an already-claimed bridged swap. The same protection extends one state earlier: a swap in `Claiming` whose lockup is already spent on-chain must not be finalized `Expired`/`Failed` by a late/spoofed terminal WS event — the manager re-checks the lock and advances it through the post-claim path instead (`handle_terminal_ws_event`).
 - `create_probe_invoice` returns an invoice that must **never** be paid (its random preimage is discarded; payment locks funds unrecoverably).
 - OFT `extraOptions`/`composeMsg`/`oftCmd` must be byte-identical across every `quoteOFT`/`quoteSend` call, the on-chain `SendData`, and the EIP-712 hash input — the Router signs over their keccak hashes.
 

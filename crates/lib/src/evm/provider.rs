@@ -34,8 +34,12 @@ pub struct LogEntry {
 #[serde(rename_all = "camelCase")]
 pub struct TxReceipt {
     pub transaction_hash: String,
-    /// `"0x1"` = success, `"0x0"` = reverted.
-    pub status: String,
+    /// `"0x1"` = success, `"0x0"` = reverted. `None` if absent — Arbitrum
+    /// (post-Byzantium) always includes it, but defaulting keeps a missing
+    /// field from being a parse error, and the success/revert decision is never
+    /// inferred from an absent status (see `is_success` / `is_reverted`).
+    #[serde(default)]
+    pub status: Option<String>,
     pub block_hash: String,
     pub block_number: String,
     pub gas_used: String,
@@ -44,9 +48,16 @@ pub struct TxReceipt {
 }
 
 impl TxReceipt {
-    /// Returns true if the transaction succeeded (status == 0x1).
+    /// Returns true only if the transaction explicitly succeeded (status 0x1).
     pub fn is_success(&self) -> bool {
-        self.status == "0x1"
+        self.status.as_deref() == Some("0x1")
+    }
+
+    /// Returns true only if the transaction explicitly reverted (status 0x0).
+    /// An absent/unknown status is neither success nor revert — callers should
+    /// keep waiting rather than finalize.
+    pub fn is_reverted(&self) -> bool {
+        self.status.as_deref() == Some("0x0")
     }
 }
 
@@ -465,18 +476,28 @@ mod tests {
     fn test_tx_receipt_is_success() {
         let receipt = TxReceipt {
             transaction_hash: "0x".to_string(),
-            status: "0x1".to_string(),
+            status: Some("0x1".to_string()),
             block_hash: "0x".to_string(),
             block_number: "0x1".to_string(),
             gas_used: "0x0".to_string(),
             logs: vec![],
         };
         assert!(receipt.is_success());
+        assert!(!receipt.is_reverted());
 
         let reverted = TxReceipt {
-            status: "0x0".to_string(),
-            ..receipt
+            status: Some("0x0".to_string()),
+            ..receipt.clone()
         };
         assert!(!reverted.is_success());
+        assert!(reverted.is_reverted());
+
+        // Absent status is neither success nor revert (keep waiting).
+        let unknown = TxReceipt {
+            status: None,
+            ..receipt
+        };
+        assert!(!unknown.is_success());
+        assert!(!unknown.is_reverted());
     }
 }

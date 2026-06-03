@@ -783,10 +783,11 @@ impl ReverseSwapExecutor {
                     return Ok(tx_hash);
                 }
                 Err(e) => {
-                    // Quote drift is not transient — retrying immediately
-                    // won't help. Return without marking Failed so the swap
-                    // stays TbtcLocked and the consumer can accept the new
-                    // rate via `accept_degraded_quote`.
+                    // Quote drift is not transient — retrying immediately won't
+                    // help. Return the error without revealing the preimage; the
+                    // caller (`SwapManager::do_claim`) reverts the swap to
+                    // `TbtcLocked` so the consumer can accept the new rate via
+                    // `accept_degraded_quote`.
                     if matches!(e, BoltzError::QuoteDegradedBeyondSlippage { .. }) {
                         return Err(e);
                     }
@@ -1813,7 +1814,17 @@ impl ReverseSwapExecutor {
             .api_client
             .get_quote_out("ARB", ARBITRUM_TBTC_ADDRESS, ZERO_ADDRESS, eth_amount)
             .await?;
-        pick_best_quote(&quotes, QuoteDirection::Out)
+        let quote = pick_best_quote(&quotes, QuoteDirection::Out)?;
+        if quote == 0 {
+            // A degenerate "0" quote would value the LZ messaging-fee leg at 0
+            // tBTC, producing a too-optimistic prepare quote (the on-chain floor
+            // would only catch it later as a degraded/aborted claim). Fail fast,
+            // like the sibling DEX-quote helpers.
+            return Err(BoltzError::InvalidQuote(
+                "DEX quote returned zero tBTC for ETH".to_string(),
+            ));
+        }
+        Ok(quote)
     }
 
     // ─── LayerZero executor options ───────────────────────────────────

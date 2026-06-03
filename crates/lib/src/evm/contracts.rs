@@ -726,17 +726,35 @@ fn decode_cctp_sent(
 
         // `MessageSent(bytes)` is non-indexed: data is abi.encode(bytes), i.e.
         // the raw CCTP message with an offset+length prefix.
-        let data_bytes = parse_hex_bytes(&log.data).ok()?;
-        let message = <alloy_primitives::Bytes>::abi_decode(&data_bytes).ok()?;
+        //
+        // A matching-but-undecodable log is SKIPPED (not aborted on): the
+        // MessageTransmitter emits `MessageSent` for any message type, so a
+        // non-burn message (whose body is shorter than the burn offsets) may
+        // precede the real burn in the same receipt. `continue` keeps scanning
+        // so a valid later log is still found; `None` means "no matching log".
+        let Ok(data_bytes) = parse_hex_bytes(&log.data) else {
+            continue;
+        };
+        let Ok(message) = <alloy_primitives::Bytes>::abi_decode(&data_bytes) else {
+            continue;
+        };
         let msg = message.as_ref();
 
-        let source_domain = read_u32_be(msg, CCTP_SOURCE_DOMAIN_OFFSET)?;
-        let amount = read_u256_be(msg, CCTP_BURN_AMOUNT_OFFSET)?;
-        let fee_executed = read_u256_be(msg, CCTP_BURN_FEE_OFFSET)?;
+        let Some(source_domain) = read_u32_be(msg, CCTP_SOURCE_DOMAIN_OFFSET) else {
+            continue;
+        };
+        let Some(amount) = read_u256_be(msg, CCTP_BURN_AMOUNT_OFFSET) else {
+            continue;
+        };
+        let Some(fee_executed) = read_u256_be(msg, CCTP_BURN_FEE_OFFSET) else {
+            continue;
+        };
         // feeExecuted is 0 at the source (the fee is taken on the destination),
         // but guard anyway. Delivered estimate = burned amount - executed fee.
         let delivered = amount.saturating_sub(fee_executed);
-        let amount_u64: u64 = delivered.try_into().ok()?;
+        let Ok(amount_u64) = u64::try_from(delivered) else {
+            continue;
+        };
 
         return Some(DeliveredAmount {
             amount: amount_u64,
@@ -801,9 +819,16 @@ fn decode_arbitrum_transfer(
         if !topics_equal(&log.topics[2], &user_topic) {
             continue;
         }
-        let data_bytes = parse_hex_bytes(&log.data).ok()?;
-        let value = <U256>::abi_decode(&data_bytes).ok()?;
-        let amount: u64 = value.try_into().ok()?;
+        // Skip a matching-but-undecodable log rather than aborting the scan.
+        let Ok(data_bytes) = parse_hex_bytes(&log.data) else {
+            continue;
+        };
+        let Ok(value) = <U256>::abi_decode(&data_bytes) else {
+            continue;
+        };
+        let Ok(amount) = u64::try_from(value) else {
+            continue;
+        };
         return Some(DeliveredAmount {
             amount,
             lz_guid: None,
@@ -829,11 +854,19 @@ fn decode_oft_sent(
         if !topics_equal(&log.topics[0], &topic0) {
             continue;
         }
-        let data_bytes = parse_hex_bytes(&log.data).ok()?;
+        // Skip a matching-but-undecodable log rather than aborting the scan.
+        let Ok(data_bytes) = parse_hex_bytes(&log.data) else {
+            continue;
+        };
         // data = abi.encode(uint32 dstEid, uint256 amountSentLD, uint256 amountReceivedLD)
-        let (_dst_eid, _amount_sent, amount_received) =
-            <(u32, U256, U256)>::abi_decode(&data_bytes).ok()?;
-        let amount: u64 = amount_received.try_into().ok()?;
+        let Ok((_dst_eid, _amount_sent, amount_received)) =
+            <(u32, U256, U256)>::abi_decode(&data_bytes)
+        else {
+            continue;
+        };
+        let Ok(amount) = u64::try_from(amount_received) else {
+            continue;
+        };
         let guid_hex = log.topics[1]
             .strip_prefix("0x")
             .unwrap_or(&log.topics[1])

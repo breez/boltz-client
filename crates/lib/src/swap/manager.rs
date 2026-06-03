@@ -239,16 +239,12 @@ impl SwapManager {
             return;
         }
 
-        // Past the claim: the swap is awaiting cross-chain delivery, which the
-        // background poll (not the Boltz WS) drives. Stop tracking it on WS;
-        // `poll_settling_swaps` scans the store and finalizes it.
-        //
-        // This guard must run BEFORE the status match below: once a swap is
-        // Settling the tBTC is already claimed, so a late `swap.expired` /
-        // `invoice.expired` (e.g. delivered to a still-subscribed swap after
-        // `resume_all` re-subscribes it) must NOT drive it to `Expired`. A
-        // Settling swap only ever leaves Settling via confirmed delivery; if
-        // delivery never confirms it stays Settling indefinitely, by design.
+        // Settling = past the claim: delivery is confirmed by the background
+        // poll, not the WS. This MUST run before the status match below — else a
+        // late `swap.expired` / `invoice.expired` (re-delivered after
+        // `resume_all` re-subscribes) would wrongly drive an already-claimed
+        // swap to `Expired`. A Settling swap only leaves Settling via confirmed
+        // delivery, by design.
         if swap.status == BoltzSwapStatus::Settling {
             tracing::debug!(
                 swap_id,
@@ -389,9 +385,16 @@ impl SwapManager {
                 }
             }
             "invoice.expired" | "swap.expired" => {
-                update_swap_status(&**store, event_emitter, &mut swap, BoltzSwapStatus::Expired)
-                    .await;
-                Self::cleanup_terminal(ws_subscriber, tracked_ids, swap_id).await;
+                Self::handle_terminal_ws_event(
+                    executor,
+                    store,
+                    event_emitter,
+                    ws_subscriber,
+                    tracked_ids,
+                    &mut swap,
+                    BoltzSwapStatus::Expired,
+                )
+                .await;
             }
             "invoice.failedToPay"
             | "transaction.lockupFailed"
@@ -401,14 +404,16 @@ impl SwapManager {
                     .failure_reason
                     .clone()
                     .unwrap_or_else(|| update.status.clone());
-                update_swap_status(
-                    &**store,
+                Self::handle_terminal_ws_event(
+                    executor,
+                    store,
                     event_emitter,
+                    ws_subscriber,
+                    tracked_ids,
                     &mut swap,
                     BoltzSwapStatus::Failed { reason },
                 )
                 .await;
-                Self::cleanup_terminal(ws_subscriber, tracked_ids, swap_id).await;
             }
             _ => {
                 tracing::debug!(
@@ -450,6 +455,18 @@ impl SwapManager {
                     quoted_usd,
                     "Claim-time quote degraded beyond slippage tolerance"
                 );
+                // The claim was NOT attempted on-chain — the drift check
+                // short-circuits before any signing/submit, so the tBTC is
+                // still locked and the preimage was never revealed. Revert the
+                // status set above back to `TbtcLocked` so the persisted (and
+                // emitted) state matches the documented degraded-quote contract:
+                // the consumer accepts the new rate via `accept_degraded_quote`
+                // (which also tolerates `Claiming`) and the next claim retries.
+                swap.status = BoltzSwapStatus::TbtcLocked;
+                swap.updated_at = current_unix_timestamp();
+                if let Err(e) = store.update_swap(swap).await {
+                    tracing::error!(swap_id, error = %e, "Failed to persist TbtcLocked after degraded quote");
+                }
                 event_emitter
                     .emit(&BoltzSwapEvent::QuoteDegraded {
                         swap: swap.clone(),
@@ -462,6 +479,75 @@ impl SwapManager {
                 tracing::error!(swap_id, error = %e, "Claim failed, staying in Claiming for retry");
             }
         }
+    }
+
+    /// Handle a terminal Boltz WS event (`*.expired` / refund / `failedToPay`)
+    /// for a tracked swap.
+    ///
+    /// The naive action — mark the swap `Expired`/`Failed` and stop — is unsafe
+    /// when the swap is mid-claim: once `do_claim` records progress the swap
+    /// sits in `Claiming` until the receipt poll promotes it, and in that window
+    /// the atomic claim may have ALREADY revealed the preimage and committed the
+    /// bridge-send on-chain. Finalizing such a swap on a WS event alone would
+    /// strand an already-successful bridged swap (delivery never confirmed,
+    /// `delivered_amount` never recorded, dropped from tracking).
+    ///
+    /// So when `Claiming`, re-check the on-chain lock first: finalize only if the
+    /// tBTC is provably still locked (the claim never happened); if it is spent,
+    /// advance through the post-claim path instead. A failed lock read leaves the
+    /// swap for a later retry rather than finalizing on the event alone. For all
+    /// pre-claim states (`Created`/`InvoicePaid`/`TbtcLocked`) the event is
+    /// authoritative and finalizes directly.
+    async fn handle_terminal_ws_event(
+        executor: &ReverseSwapExecutor,
+        store: &Arc<dyn BoltzStorage>,
+        event_emitter: &EventEmitter,
+        ws_subscriber: &SwapStatusSubscriber,
+        tracked_ids: &mut HashSet<String>,
+        swap: &mut BoltzSwap,
+        terminal_status: BoltzSwapStatus,
+    ) {
+        let swap_id = swap.id.clone();
+
+        if swap.status == BoltzSwapStatus::Claiming {
+            match is_swap_still_locked_by_swap(&executor.evm_provider, swap, &executor.key_manager)
+                .await
+            {
+                Ok(true) => {
+                    // Claim never happened — the tBTC is still locked and will
+                    // refund to Boltz. The terminal event is legitimate.
+                }
+                Ok(false) => {
+                    // Already claimed on-chain. Do NOT finalize on the WS event;
+                    // advance through the post-claim path so a successful bridged
+                    // swap completes/settles instead of being wrongly failed.
+                    tracing::warn!(
+                        swap_id,
+                        ws_terminal = ?terminal_status,
+                        "Terminal WS event for an already-claimed swap; advancing post-claim instead of finalizing"
+                    );
+                    let resolved =
+                        Self::advance_claimed_swap(executor, store, event_emitter, swap).await;
+                    if resolved {
+                        Self::cleanup_terminal(ws_subscriber, tracked_ids, &swap_id).await;
+                    }
+                    return;
+                }
+                Err(e) => {
+                    // Couldn't verify the lock — don't finalize blindly. Leave
+                    // the swap tracked; the next WS update or `resume_all` retries.
+                    tracing::warn!(
+                        swap_id,
+                        error = %e,
+                        "Could not verify lock state on terminal WS event; leaving swap for retry"
+                    );
+                    return;
+                }
+            }
+        }
+
+        update_swap_status(&**store, event_emitter, swap, terminal_status).await;
+        Self::cleanup_terminal(ws_subscriber, tracked_ids, &swap_id).await;
     }
 
     /// Handle resuming a swap stuck in `Claiming` status. Either the tx hash
@@ -545,32 +631,34 @@ impl SwapManager {
                 .eth_get_transaction_receipt(tx_hash)
                 .await
             {
-                Ok(Some(receipt)) => {
-                    if receipt.is_success() {
-                        tracing::info!(swap_id, tx_hash, "Claim receipt confirmed");
-                        if let Ok(Some(mut swap)) = store.get_swap(swap_id).await {
-                            apply_delivered_amount(executor, &mut swap, &receipt, tx_hash);
-                            let next = post_claim_status(&swap);
-                            update_swap_status(&**store, event_emitter, &mut swap, next).await;
-                        }
-                    } else {
-                        tracing::error!(swap_id, tx_hash, "Claim tx reverted");
-                        if let Ok(Some(mut swap)) = store.get_swap(swap_id).await {
-                            update_swap_status(
-                                &**store,
-                                event_emitter,
-                                &mut swap,
-                                BoltzSwapStatus::Failed {
-                                    reason: "Claim transaction reverted".to_string(),
-                                },
-                            )
-                            .await;
-                        }
+                Ok(Some(receipt)) if receipt.is_success() => {
+                    tracing::info!(swap_id, tx_hash, "Claim receipt confirmed");
+                    if let Ok(Some(mut swap)) = store.get_swap(swap_id).await {
+                        apply_delivered_amount(executor, &mut swap, &receipt, tx_hash);
+                        let next = post_claim_status(&swap);
+                        update_swap_status(&**store, event_emitter, &mut swap, next).await;
                     }
                     return true;
                 }
-                Ok(None) => {
-                    // Not mined yet.
+                Ok(Some(receipt)) if receipt.is_reverted() => {
+                    tracing::error!(swap_id, tx_hash, "Claim tx reverted");
+                    if let Ok(Some(mut swap)) = store.get_swap(swap_id).await {
+                        update_swap_status(
+                            &**store,
+                            event_emitter,
+                            &mut swap,
+                            BoltzSwapStatus::Failed {
+                                reason: "Claim transaction reverted".to_string(),
+                            },
+                        )
+                        .await;
+                    }
+                    return true;
+                }
+                // Mined but status neither success nor revert (absent/unknown):
+                // never infer a terminal state from an ambiguous receipt — keep
+                // polling, same as not-yet-mined.
+                Ok(_) => {
                     if attempt < RECEIPT_POLL_MAX_ATTEMPTS.saturating_sub(1) {
                         platform_utils::tokio::time::sleep(
                             platform_utils::time::Duration::from_secs(RECEIPT_POLL_INTERVAL_SECS),
@@ -620,16 +708,96 @@ impl SwapManager {
                 Self::do_claim(executor, store, event_emitter, &mut s, false).await;
             }
             Ok(false) => {
-                // Already claimed — just wait for WS `transaction.claimed`.
+                // Already claimed on-chain: the preimage was revealed and the
+                // atomic claim + DEX + bridge-send committed. We must NOT leave
+                // the swap stranded in `Claiming` — advance it through the
+                // post-claim path (recovering the receipt-derived delivered
+                // amount when possible) so `Direct` completes and `Oft`/`Cctp`
+                // enter `Settling` for the delivery poll. Mirrors the inline
+                // `invoice.settled` already-claimed branch.
                 tracing::info!(
                     swap_id,
-                    "Swap already claimed on-chain, waiting for WS confirmation"
+                    "Swap already claimed on-chain; advancing through post-claim status"
                 );
+                Self::advance_claimed_swap(executor, store, event_emitter, swap).await;
             }
             Err(e) => {
                 tracing::error!(swap_id, error = %e, "On-chain check failed");
             }
         }
+    }
+
+    /// Advance a swap whose lockup is provably spent (the claim already happened
+    /// on-chain) to its post-claim status. The caller must have confirmed the
+    /// lock is spent — this routine does NOT re-check it.
+    ///
+    /// Resolution order, best to worst:
+    /// 1. Known `claim_tx_hash` → poll the receipt (records `delivered_amount`
+    ///    and `bridge_ref`, then sets the post-claim status).
+    /// 2. Persisted gas-sponsor `call_id` → recover the tx hash, persist it, and
+    ///    poll the receipt.
+    /// 3. Neither recoverable → set the post-claim status directly so the swap
+    ///    is not stranded in `Claiming`. `Direct` completes; `Oft`/`Cctp` enter
+    ///    `Settling` (a missing `bridge_ref` then holds in `Settling`, the safe
+    ///    failure mode — never a falsely `Completed` swap).
+    ///
+    /// Returns `true` if the swap reached a resolved state (caller may clean up
+    /// WS tracking), `false` if a receipt poll timed out and it is still
+    /// `Claiming` (keep tracking; the next event/resume retries).
+    async fn advance_claimed_swap(
+        executor: &ReverseSwapExecutor,
+        store: &Arc<dyn BoltzStorage>,
+        event_emitter: &EventEmitter,
+        swap: &BoltzSwap,
+    ) -> bool {
+        let swap_id = &swap.id;
+
+        if let Some(ref tx_hash) = swap.claim_tx_hash {
+            return Self::poll_receipt(executor, store, event_emitter, swap_id, tx_hash).await;
+        }
+
+        if let Some(ref call_id) = swap.pending_call_id {
+            match executor.poll_pending_call(call_id).await {
+                Ok(tx_hash) => {
+                    tracing::info!(
+                        swap_id,
+                        tx_hash,
+                        "Recovered claim tx hash from pending call_id"
+                    );
+                    if let Ok(Some(mut s)) = store.get_swap(swap_id).await {
+                        s.claim_tx_hash = Some(tx_hash.clone());
+                        s.pending_call_id = None;
+                        s.updated_at = current_unix_timestamp();
+                        if let Err(e) = store.update_swap(&s).await {
+                            tracing::error!(swap_id, error = %e, "Failed to persist recovered tx hash");
+                        }
+                    }
+                    return Self::poll_receipt(executor, store, event_emitter, swap_id, &tx_hash)
+                        .await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        swap_id,
+                        error = %e,
+                        "Could not recover tx hash for already-claimed swap; advancing on post-claim status without delivered amount"
+                    );
+                    // Fall through to step 3.
+                }
+            }
+        }
+
+        // No receipt recoverable. Advance anyway so the swap isn't stranded in
+        // `Claiming`; re-read first to avoid clobbering concurrent updates.
+        if let Ok(Some(mut s)) = store.get_swap(swap_id).await {
+            if s.status != BoltzSwapStatus::Claiming {
+                // Another path already advanced it.
+                return s.status.is_terminal() || s.status == BoltzSwapStatus::Settling;
+            }
+            let next = post_claim_status(&s);
+            update_swap_status(&**store, event_emitter, &mut s, next).await;
+            return true;
+        }
+        false
     }
 
     /// Unsubscribe from WS and remove from tracking set after a swap
@@ -762,11 +930,11 @@ pub(crate) async fn poll_settling_swaps(
             return;
         }
     };
-    for mut swap in swaps
+    for swap in swaps
         .into_iter()
         .filter(|s| s.status == BoltzSwapStatus::Settling)
     {
-        confirm_delivery(executor, store, event_emitter, &mut swap).await;
+        confirm_delivery(executor, store, event_emitter, &swap).await;
     }
 }
 
@@ -779,7 +947,7 @@ async fn confirm_delivery(
     executor: &ReverseSwapExecutor,
     store: &Arc<dyn BoltzStorage>,
     event_emitter: &EventEmitter,
-    swap: &mut BoltzSwap,
+    swap: &BoltzSwap,
 ) {
     let Some(bridge_ref) = swap.bridge_ref.clone() else {
         tracing::warn!(
@@ -793,9 +961,7 @@ async fn confirm_delivery(
         BridgeKind::Cctp => match executor.cctp_delivery_status(&bridge_ref).await {
             Ok(status) => {
                 if let Some(delivered) = cctp_completion_amount(&status) {
-                    swap.delivered_amount = Some(delivered);
-                    update_swap_status(&**store, event_emitter, swap, BoltzSwapStatus::Completed)
-                        .await;
+                    finalize_completed(store, event_emitter, &swap.id, Some(delivered)).await;
                 }
             }
             Err(e) => {
@@ -805,8 +971,7 @@ async fn confirm_delivery(
         BridgeKind::Oft => match executor.oft_delivery_status(&bridge_ref).await {
             Ok(status) => {
                 if status.is_delivered() {
-                    update_swap_status(&**store, event_emitter, swap, BoltzSwapStatus::Completed)
-                        .await;
+                    finalize_completed(store, event_emitter, &swap.id, None).await;
                 }
             }
             Err(e) => {
@@ -815,7 +980,46 @@ async fn confirm_delivery(
         },
         // Direct swaps never enter Settling; defensively finalize.
         BridgeKind::Direct => {
-            update_swap_status(&**store, event_emitter, swap, BoltzSwapStatus::Completed).await;
+            finalize_completed(store, event_emitter, &swap.id, None).await;
+        }
+    }
+}
+
+/// Mark a `Settling` swap `Completed`, idempotently.
+///
+/// `poll_settling_swaps` runs on two tasks — the background delivery ticker
+/// (event loop) and the on-demand [`crate::BoltzService::refresh_pending_deliveries`]
+/// (caller task) — each operating on its own snapshot. Re-reading here and
+/// bailing unless the swap is still `Settling` prevents a double `Completed`
+/// emission (and a redundant store write) when both observe the same swap as
+/// delivered. The delivered amount is identical on either path, so the only
+/// thing being deduplicated is the event/write, not the value.
+async fn finalize_completed(
+    store: &Arc<dyn BoltzStorage>,
+    event_emitter: &EventEmitter,
+    swap_id: &str,
+    delivered_amount: Option<u64>,
+) {
+    match store.get_swap(swap_id).await {
+        Ok(Some(mut fresh)) => {
+            if fresh.status != BoltzSwapStatus::Settling {
+                // Already finalized by a concurrent poll — don't double-emit.
+                return;
+            }
+            if let Some(amount) = delivered_amount {
+                fresh.delivered_amount = Some(amount);
+            }
+            update_swap_status(
+                &**store,
+                event_emitter,
+                &mut fresh,
+                BoltzSwapStatus::Completed,
+            )
+            .await;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(swap_id, error = %e, "Failed to re-read swap before completion");
         }
     }
 }

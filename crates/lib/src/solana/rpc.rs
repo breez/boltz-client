@@ -13,6 +13,13 @@ use serde_json::json;
 
 use crate::error::BoltzError;
 
+/// Maximum retries for rate-limited (429) Solana RPC requests. Mirrors the
+/// EVM provider's bounded backoff so a transient 429 doesn't fail-close a swap
+/// prepare on the ATA-existence check.
+const MAX_RPC_RETRIES: u32 = 5;
+/// Base delay in milliseconds for exponential backoff (doubles each retry).
+const RPC_RETRY_BASE_MS: u64 = 1000;
+
 /// Minimal Solana JSON-RPC client. Only implements `getAccountInfo` because
 /// that's all we need for the ATA existence check.
 pub struct SolanaRpcClient {
@@ -43,18 +50,54 @@ impl SolanaRpcClient {
         let mut headers = HashMap::new();
         headers.insert("Content-Type".to_string(), "application/json".to_string());
 
-        let response = self
-            .http
-            .post(self.rpc_url.clone(), Some(headers), Some(body))
-            .await
-            .map_err(|e| BoltzError::Generic(format!("Solana RPC request failed: {e}")))?;
+        let mut last_err = None;
+        let response = 'retry: {
+            for attempt in 0..MAX_RPC_RETRIES {
+                let response = self
+                    .http
+                    .post(
+                        self.rpc_url.clone(),
+                        Some(headers.clone()),
+                        Some(body.clone()),
+                    )
+                    .await
+                    .map_err(|e| BoltzError::Generic(format!("Solana RPC request failed: {e}")))?;
 
-        if !response.is_success() {
-            return Err(BoltzError::Generic(format!(
-                "Solana RPC HTTP error {}: {}",
-                response.status, response.body
-            )));
-        }
+                if response.status == 429 {
+                    let delay = RPC_RETRY_BASE_MS
+                        .saturating_mul(2u64.saturating_pow(attempt))
+                        .min(30_000);
+                    tracing::warn!(
+                        attempt,
+                        delay_ms = delay,
+                        "Solana RPC rate limited (429), retrying"
+                    );
+                    platform_utils::tokio::time::sleep(
+                        platform_utils::time::Duration::from_millis(delay),
+                    )
+                    .await;
+                    last_err = Some(BoltzError::Generic(format!(
+                        "Solana RPC HTTP error 429: {}",
+                        response.body
+                    )));
+                    continue;
+                }
+
+                if !response.is_success() {
+                    return Err(BoltzError::Generic(format!(
+                        "Solana RPC HTTP error {}: {}",
+                        response.status, response.body
+                    )));
+                }
+
+                break 'retry response;
+            }
+            return Err(last_err.unwrap_or_else(|| {
+                BoltzError::Generic(format!(
+                    "Solana RPC request failed after {MAX_RPC_RETRIES} retries"
+                ))
+            }));
+        };
 
         let parsed: JsonRpcResponse<AccountInfoResult> = serde_json::from_str(&response.body)
             .map_err(|e| {
