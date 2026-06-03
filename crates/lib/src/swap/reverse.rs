@@ -45,7 +45,7 @@ const MAX_CLAIM_RETRIES: u32 = 5;
 /// The public RPC endpoint may lag behind Boltz's node by a few seconds.
 const LOCKUP_CHECK_MAX_ATTEMPTS: u32 = 10;
 
-/// Orchestrates the LN -> USDT reverse swap flow.
+/// Orchestrates the LN -> stablecoin reverse swap flow.
 pub(crate) struct ReverseSwapExecutor {
     api_client: BoltzApiClient,
     pub(crate) key_manager: EvmKeyManager,
@@ -127,8 +127,8 @@ impl ReverseSwapExecutor {
     ///
     /// Works backwards from the caller's target USDT amount:
     ///
-    /// 1. Same-chain: one DEX quote (tBTC ← USDT for the target amount);
-    ///    floor to sats; apply the Boltz reverse fee.
+    /// 1. Same-chain: one DEX quote (tBTC ← output token, USDT or USDC, for
+    ///    the target amount); floor to sats; apply the Boltz reverse fee.
     /// 2. Cross-chain: invert the OFT to get the USDT needed on Arbitrum,
     ///    quote the LZ messaging fee, then convert **each** leg to tBTC
     ///    sats independently (tBTC ← USDT and tBTC ← ETH), floor each to
@@ -693,7 +693,7 @@ impl ReverseSwapExecutor {
             .map_err(|_| BoltzError::Generic("USDT amount overflow".into()))
     }
 
-    /// Claim tBTC locked on-chain and swap to USDT.
+    /// Claim tBTC locked on-chain and swap to the output token (USDT or USDC).
     /// Returns the claim tx hash on success.
     #[expect(clippy::too_many_lines)]
     pub(crate) async fn claim_and_swap(
@@ -920,18 +920,18 @@ impl ReverseSwapExecutor {
                 "DEX quote returned zero output".into(),
             ));
         }
-        let raw_quote_usdt = best.amount;
+        let raw_output_amount = best.amount;
 
         if !skip_drift_check {
             check_quote_drift(
                 swap.expected_output_amount,
-                raw_quote_usdt,
+                raw_output_amount,
                 swap.slippage_bps,
             )?;
         }
 
         let min_amount_out_u128 = compute_claim_floor(
-            raw_quote_usdt,
+            raw_output_amount,
             swap.expected_output_amount,
             swap.slippage_bps,
             skip_drift_check,
@@ -982,7 +982,7 @@ impl ReverseSwapExecutor {
         let router_sig = gas_signer.sign_eip712_router_claim(
             addrs.router,
             preimage,
-            addrs.usdt,
+            addrs.output_token_address,
             min_amount_out,
             destination_evm,
         )?;
@@ -1001,7 +1001,7 @@ impl ReverseSwapExecutor {
         let calldata = encode_claim_erc20_execute(
             &erc20_claim,
             &dex_calls,
-            addrs.usdt,
+            addrs.output_token_address,
             min_amount_out,
             destination_evm,
             router_sig.v,
@@ -1158,7 +1158,7 @@ impl ReverseSwapExecutor {
         let router_sig = gas_signer.sign_eip712_router_claim_cctp(
             addrs.router,
             preimage,
-            addrs.usdt, // = Arbitrum USDC for CCTP swaps
+            addrs.output_token_address, // = Arbitrum USDC for CCTP swaps
             token_messenger,
             cctp_data_hash,
             U256::from(min_amount),
@@ -1184,7 +1184,7 @@ impl ReverseSwapExecutor {
         let calldata = encode_claim_erc20_execute_cctp(
             &erc20_claim,
             &dex_calls,
-            addrs.usdt,
+            addrs.output_token_address,
             token_messenger,
             &cctp_data,
             &auth,
@@ -1496,7 +1496,7 @@ impl ReverseSwapExecutor {
             .build_oft_approval_call(
                 addrs.router,
                 oft_addr,
-                addrs.usdt,
+                addrs.output_token_address,
                 U256::from(trade_best.amount),
             )
             .await?
@@ -1535,7 +1535,7 @@ impl ReverseSwapExecutor {
         let router_sig = gas_signer.sign_eip712_router_claim_send(
             addrs.router,
             preimage,
-            addrs.usdt,
+            addrs.output_token_address,
             oft_addr,
             send_data_hash,
             U256::from(min_amount_ld_slipped),
@@ -1567,7 +1567,7 @@ impl ReverseSwapExecutor {
         let calldata = encode_claim_erc20_execute_oft(
             &erc20_claim,
             &all_calls,
-            addrs.usdt,
+            addrs.output_token_address,
             oft_addr,
             &send_data,
             &auth,
@@ -2065,9 +2065,9 @@ struct ClaimAddresses {
     router: alloy_primitives::Address,
     tbtc: alloy_primitives::Address,
     /// The DEX output token on Arbitrum — Arbitrum USDT for OFT/USDT-direct
-    /// routes, Arbitrum USDC for CCTP/USDC-direct routes. Named `usdt` for
-    /// historical reasons; see also [`Self::output_token`] for its string form.
-    usdt: alloy_primitives::Address,
+    /// routes, Arbitrum USDC for CCTP/USDC-direct routes. See also
+    /// [`Self::output_token`] for its string form.
+    output_token_address: alloy_primitives::Address,
     /// Canonical string form of the DEX output token, for DEX quote requests.
     output_token: &'static str,
     refund: alloy_primitives::Address,
@@ -2100,7 +2100,7 @@ impl ClaimAddresses {
             erc20swap: parse_address(&swap.erc20swap_address)?,
             router: parse_address(&swap.router_address)?,
             tbtc: parse_address(ARBITRUM_TBTC_ADDRESS)?,
-            usdt: parse_address(dest.dex_output_token)?,
+            output_token_address: parse_address(dest.dex_output_token)?,
             output_token: dest.dex_output_token,
             refund: parse_address(&swap.refund_address)?,
             destination_evm,
