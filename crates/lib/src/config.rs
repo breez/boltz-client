@@ -12,8 +12,8 @@ pub struct BoltzConfig {
     pub arbitrum_rpc_url: String,
     /// EVM chain ID (42161 for Arbitrum One).
     pub chain_id: u64,
-    /// Referral ID — sent as HTTP header on pairs endpoint (required to unlock TBTC pair)
-    /// and as `referralId` field in swap creation requests (attribution tracking).
+    /// Referral ID — sent as an HTTP header on every request and as the
+    /// `referralId` field in swap creation requests (attribution tracking).
     pub referral_id: String,
     /// User-facing slippage tolerance in basis points (default: 100 = 1%).
     /// Anchored on the prepare-time quote: a claim only proceeds if the

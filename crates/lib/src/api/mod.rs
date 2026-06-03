@@ -31,12 +31,8 @@ impl BoltzApiClient {
     // ─── Reverse Swap ────────────────────────────────────────────────────
 
     /// `GET /v2/swap/reverse` — fetch pair info (fees, limits, pairHash).
-    /// Sends the `referral` header to unlock the TBTC pair.
     pub async fn get_reverse_swap_pairs(&self) -> Result<ReversePairsResponse, BoltzError> {
-        let mut headers = Self::default_headers();
-        headers.insert("referral".to_string(), self.config.referral_id.clone());
-        self.get_request_with_headers("v2/swap/reverse", headers)
-            .await
+        self.get_request("v2/swap/reverse").await
     }
 
     /// `POST /v2/swap/reverse` — create a reverse swap.
@@ -110,15 +106,20 @@ impl BoltzApiClient {
 
     // ─── Internal Helpers ────────────────────────────────────────────────
 
-    fn default_headers() -> HashMap<String, String> {
-        HashMap::from([("Content-Type".to_string(), "application/json".to_string())])
+    /// Headers sent on every request: `Content-Type` plus the `referral`
+    /// header (used by Boltz for attribution).
+    fn default_headers(&self) -> HashMap<String, String> {
+        HashMap::from([
+            ("Content-Type".to_string(), "application/json".to_string()),
+            ("referral".to_string(), self.config.referral_id.clone()),
+        ])
     }
 
     async fn get_request<D>(&self, endpoint: &str) -> Result<D, BoltzError>
     where
         D: serde::de::DeserializeOwned,
     {
-        self.get_request_with_headers(endpoint, Self::default_headers())
+        self.get_request_with_headers(endpoint, self.default_headers())
             .await
     }
 
@@ -159,7 +160,7 @@ impl BoltzApiClient {
 
         let response = self
             .http_client
-            .post(url, Some(Self::default_headers()), Some(body_json))
+            .post(url, Some(self.default_headers()), Some(body_json))
             .await?;
 
         if !response.is_success() {
@@ -195,7 +196,13 @@ mod tests {
 
     #[macros::test_all]
     fn test_default_headers() {
-        let headers = BoltzApiClient::default_headers();
+        let config = BoltzConfig::mainnet("test_referral".to_string());
+        let client = BoltzApiClient::new(
+            &config,
+            Box::new(platform_utils::DefaultHttpClient::new(None)),
+        );
+        let headers = client.default_headers();
         assert_eq!(headers.get("Content-Type").unwrap(), "application/json");
+        assert_eq!(headers.get("referral").unwrap(), "test_referral");
     }
 }
