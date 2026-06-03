@@ -1041,7 +1041,7 @@ fn delivered_source_for(
     swap: &BoltzSwap,
 ) -> Option<DeliveredAmountSource> {
     let registry = &executor.chain_registry;
-    let dest = registry.get(&swap.destination_chain)?;
+    let dest = registry.find(&swap.destination_chain, swap.asset)?;
     match dest.bridge {
         // CCTP swaps emit a MessageSent log from the MessageTransmitter rather
         // than an OFTSent / Transfer log.
@@ -1073,7 +1073,7 @@ mod tests {
 
     use super::*;
     use crate::evm::cctp::CctpMessageStatus;
-    use crate::models::DestinationId;
+    use crate::models::Asset;
 
     fn swap_with(bridge_kind: BridgeKind, bridge_ref: Option<&str>) -> BoltzSwap {
         BoltzSwap {
@@ -1084,7 +1084,8 @@ mod tests {
             chain_id: 42161,
             claim_address: "0xabc".to_string(),
             destination_address: "0xdef".to_string(),
-            destination_chain: DestinationId::new("arbitrum one"),
+            destination_chain: "Arbitrum One".to_string(),
+            asset: Asset::Usdt,
             refund_address: "0x123".to_string(),
             erc20swap_address: "0xswap".to_string(),
             router_address: "0xrouter".to_string(),

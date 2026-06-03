@@ -31,8 +31,8 @@ use crate::evm::recipient::{
 use crate::evm::signing::EvmSigner;
 use crate::keys::EvmKeyManager;
 use crate::models::{
-    BoltzSwap, BoltzSwapStatus, Bridge, Destination, DestinationId, DestinationRegistry,
-    NetworkTransport, PreparedSwap, SwapLimits, Usdt0Kind,
+    Asset, BoltzSwap, BoltzSwapStatus, Bridge, Destination, DestinationRegistry, NetworkTransport,
+    PreparedSwap, SwapLimits, Usdt0Kind,
 };
 use crate::solana::ata::derive_ata;
 use crate::solana::rpc::SolanaRpcClient;
@@ -115,12 +115,13 @@ impl ReverseSwapExecutor {
         })
     }
 
-    /// Look up a [`Destination`], raising a hard error if the ID is unknown.
-    /// Used by every path that needs per-destination metadata.
-    fn resolve_destination(&self, id: &DestinationId) -> Result<&Destination, BoltzError> {
-        self.chain_registry
-            .get(id)
-            .ok_or_else(|| BoltzError::Generic(format!("Unsupported destination '{id}'")))
+    /// Look up a [`Destination`] by its `(chain, asset)` identity, raising a
+    /// hard error if unsupported. Used by every path that needs per-destination
+    /// metadata.
+    fn resolve_destination(&self, chain: &str, asset: Asset) -> Result<&Destination, BoltzError> {
+        self.chain_registry.find(chain, asset).ok_or_else(|| {
+            BoltzError::Generic(format!("Unsupported destination '{chain}' for {asset}"))
+        })
     }
 
     /// Prepare a reverse swap quote. No side effects.
@@ -141,13 +142,14 @@ impl ReverseSwapExecutor {
     pub async fn prepare(
         &self,
         destination: &str,
-        chain: DestinationId,
+        chain: &str,
+        asset: Asset,
         output_amount: u64,
         max_slippage_bps: Option<u32>,
     ) -> Result<PreparedSwap, BoltzError> {
         let slippage_bps = resolve_slippage_bps(max_slippage_bps, self.config.slippage_bps)?;
 
-        let dest = self.resolve_destination(&chain)?;
+        let dest = self.resolve_destination(chain, asset)?;
         self.validate_destination(dest, destination)?;
 
         // Compute the total tBTC claim amount (in sats) needed to fund the
@@ -236,7 +238,8 @@ impl ReverseSwapExecutor {
         let now = current_unix_timestamp();
         Ok(PreparedSwap {
             destination_address: destination.to_string(),
-            destination_chain: chain,
+            destination_chain: chain.to_string(),
+            asset,
             bridge_kind,
             output_amount,
             invoice_amount_sats: fee_calc.invoice_sats,
@@ -305,13 +308,14 @@ impl ReverseSwapExecutor {
     pub async fn prepare_from_sats(
         &self,
         destination: &str,
-        chain: DestinationId,
+        chain: &str,
+        asset: Asset,
         invoice_amount_sats: u64,
         max_slippage_bps: Option<u32>,
     ) -> Result<PreparedSwap, BoltzError> {
         let slippage_bps = resolve_slippage_bps(max_slippage_bps, self.config.slippage_bps)?;
 
-        let dest = self.resolve_destination(&chain)?;
+        let dest = self.resolve_destination(chain, asset)?;
         self.validate_destination(dest, destination)?;
 
         let bridge_kind = dest.bridge.kind();
@@ -415,7 +419,8 @@ impl ReverseSwapExecutor {
         let now = current_unix_timestamp();
         Ok(PreparedSwap {
             destination_address: destination.to_string(),
-            destination_chain: chain,
+            destination_chain: chain.to_string(),
+            asset,
             bridge_kind,
             output_amount: output,
             invoice_amount_sats,
@@ -519,6 +524,7 @@ impl ReverseSwapExecutor {
             claim_address: gas_signer.address_hex(),
             destination_address: prepared.destination_address.clone(),
             destination_chain: prepared.destination_chain.clone(),
+            asset: prepared.asset,
             refund_address: resp.refund_address.ok_or_else(|| BoltzError::Api {
                 reason: "Missing refund_address in swap response".to_string(),
                 code: None,
@@ -847,7 +853,7 @@ impl ReverseSwapExecutor {
     ) -> Result<String, BoltzError> {
         // Dispatch on the resolved destination's bridge — the single source of
         // truth for how this swap is delivered.
-        let dest = self.resolve_destination(&swap.destination_chain)?;
+        let dest = self.resolve_destination(&swap.destination_chain, swap.asset)?;
         match dest.bridge {
             Bridge::Cctp { domain } => {
                 self.try_claim_cctp(
@@ -1257,7 +1263,7 @@ impl ReverseSwapExecutor {
         timelock: U256,
         skip_drift_check: bool,
     ) -> Result<String, BoltzError> {
-        let dst_info = self.resolve_destination(&swap.destination_chain)?;
+        let dst_info = self.resolve_destination(&swap.destination_chain, swap.asset)?;
         let (mesh, dst_eid) = dst_info.oft().ok_or_else(|| {
             BoltzError::Generic(format!(
                 "Destination '{}' is not an OFT route",
@@ -1691,7 +1697,10 @@ impl ReverseSwapExecutor {
         }
 
         let (mesh, _) = dest.oft().ok_or_else(|| {
-            BoltzError::Generic(format!("Destination '{}' is not an OFT route", dest.id))
+            BoltzError::Generic(format!(
+                "Destination '{}/{}' is not an OFT route",
+                dest.chain_label, dest.asset
+            ))
         })?;
 
         // Legacy-mesh routes: skip the binary search and apply the closed-form
@@ -1769,7 +1778,10 @@ impl ReverseSwapExecutor {
         extra_options: &Bytes,
     ) -> Result<(u128, u128), BoltzError> {
         let (mesh, lz_eid) = dest.oft().ok_or_else(|| {
-            BoltzError::Generic(format!("Destination '{}' is not an OFT route", dest.id))
+            BoltzError::Generic(format!(
+                "Destination '{}/{}' is not an OFT route",
+                dest.chain_label, dest.asset
+            ))
         })?;
 
         // Match the source OFT to the destination's mesh: legacy and native
@@ -1881,7 +1893,7 @@ impl ReverseSwapExecutor {
             NetworkTransport::Solana => known.push(SOLANA_USDT0_MINT),
             NetworkTransport::Tron => {}
         }
-        for dest in self.chain_registry.destinations.values() {
+        for dest in &self.chain_registry.destinations {
             if dest.transport == transport
                 && let Some(token) = &dest.dest_token_address
             {
@@ -2096,12 +2108,14 @@ impl ClaimAddresses {
     /// Resolve claim addresses for any bridge from the unified registry. The
     /// DEX output token comes from the resolved [`Destination`] (USDT or USDC).
     fn parse(swap: &BoltzSwap, registry: &DestinationRegistry) -> Result<Self, BoltzError> {
-        let dest = registry.get(&swap.destination_chain).ok_or_else(|| {
-            BoltzError::Generic(format!(
-                "Unknown destination '{}' for swap {}",
-                swap.destination_chain, swap.id
-            ))
-        })?;
+        let dest = registry
+            .find(&swap.destination_chain, swap.asset)
+            .ok_or_else(|| {
+                BoltzError::Generic(format!(
+                    "Unknown destination '{}' for swap {}",
+                    swap.destination_chain, swap.id
+                ))
+            })?;
         let destination_bytes32 = encode_oft_recipient(dest.transport, &swap.destination_address)?;
         let destination_evm = match dest.transport {
             NetworkTransport::Evm => Some(parse_address(&swap.destination_address)?),

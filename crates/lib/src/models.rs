@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
 
 /// Persisted state for a single Boltz reverse swap.
@@ -11,9 +9,7 @@ pub struct BoltzSwap {
     /// Swap ID — the Boltz backend ID for normal swaps, or a `recovery-*` ID for recovered swaps.
     pub id: String,
     pub status: BoltzSwapStatus,
-    /// Which bridge carries the Arbitrum -> destination leg. Defaults to `Oft`
-    /// for swaps persisted before CCTP support existed.
-    #[serde(default)]
+    /// Which bridge carries the Arbitrum -> destination leg.
     pub bridge_kind: BridgeKind,
     /// HD derivation index for the per-swap preimage key.
     pub claim_key_index: u32,
@@ -25,8 +21,13 @@ pub struct BoltzSwap {
     pub claim_address: String,
     /// User's final destination address for the delivered stablecoin.
     pub destination_address: String,
-    /// Target destination (asset-on-chain) for delivery.
-    pub destination_chain: DestinationId,
+    /// Destination chain label (e.g. `"Arbitrum One"`, `"Base"`, `"Solana"`).
+    /// Together with [`asset`](Self::asset) this is the destination identity.
+    pub destination_chain: String,
+    /// Stablecoin delivered on the destination chain. The same chain can host
+    /// more than one (e.g. USDT0 via OFT and USDC via CCTP), so asset is part
+    /// of the destination identity, not derivable from the chain alone.
+    pub asset: Asset,
     /// Boltz's refund address (from swap response).
     pub refund_address: String,
 
@@ -42,7 +43,6 @@ pub struct BoltzSwap {
     /// tBTC amount locked on-chain (sats, from swap response `onchainAmount`).
     pub onchain_amount: u64,
     /// Expected stablecoin output (6 decimals).
-    #[serde(alias = "expected_usdt_amount")]
     pub expected_output_amount: u64,
     /// DEX slippage tolerance (basis points) snapshot at `prepare` time.
     /// Used for the claim-time quote drift check and on-chain `minOut`
@@ -73,9 +73,7 @@ pub struct BoltzSwap {
     /// bridge: for `Oft` it's the `LayerZero` message GUID (`0x`-prefixed hex,
     /// looked up on `LayerZero` Scan); for `Cctp` it's `"<source_domain>:<burn_tx_hash>"`,
     /// the key Circle Iris indexes the message by. Used to confirm destination
-    /// delivery while the swap is `Settling`. (Serde alias `lz_guid` keeps
-    /// swaps persisted before the rename readable.)
-    #[serde(alias = "lz_guid")]
+    /// delivery while the swap is `Settling`.
     pub bridge_ref: Option<String>,
 
     // Timestamps (unix seconds)
@@ -131,39 +129,6 @@ pub enum NetworkTransport {
 pub enum Usdt0Kind {
     Native,
     Legacy,
-}
-
-/// Opaque, stable identifier for a selectable swap destination — an
-/// *asset-on-chain*, not a bare chain (e.g. `"arbitrum one"` = USDT on
-/// Arbitrum, `"usdc-base"` = USDC on Base, `"usdc-arb"` = USDC on Arbitrum).
-/// Callers round-trip the `id` from [`DestinationOption`] back into the
-/// prepare API and never construct it by hand. Held lowercased; build via
-/// [`DestinationId::new`] for the canonical form.
-#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct DestinationId(String);
-
-impl DestinationId {
-    /// Build a `DestinationId` from any string, lowercasing to canonical form.
-    pub fn new(name: impl AsRef<str>) -> Self {
-        Self(name.as_ref().to_lowercase())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for DestinationId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl AsRef<str> for DestinationId {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
 }
 
 /// Stablecoin the user receives on the destination. First-class dimension:
@@ -236,9 +201,8 @@ impl Bridge {
 /// `ChainSpec` and static `CctpDestination`). Built once at service init.
 #[derive(Clone, Debug)]
 pub struct Destination {
-    /// Opaque join key / caller-facing handle.
-    pub id: DestinationId,
-    /// Human chain label for display (`"Arbitrum"`, `"Base"`, `"Solana"`).
+    /// Human chain label (`"Arbitrum One"`, `"Base"`, `"Solana"`). Together
+    /// with [`asset`](Self::asset) this is the destination identity.
     pub chain_label: String,
     /// Asset the user receives.
     pub asset: Asset,
@@ -272,20 +236,24 @@ impl Destination {
 /// Arbitrum-direct entries; stable for the process lifetime.
 #[derive(Clone, Debug)]
 pub struct DestinationRegistry {
-    /// Source-chain destination id (Arbitrum USDT direct).
-    pub source_id: DestinationId,
+    /// Source-chain label (Arbitrum USDT direct).
+    pub source_chain_label: String,
     pub source_evm_chain_id: u64,
     /// Source-side native-mesh OFT contract (`None` if not on the native mesh).
     pub source_native_oft: Option<String>,
     /// Source-side legacy-mesh OFT contract (`None` if not on the legacy mesh).
     pub source_legacy_oft: Option<String>,
-    pub destinations: HashMap<DestinationId, Destination>,
+    pub destinations: Vec<Destination>,
 }
 
 impl DestinationRegistry {
+    /// Look up a destination by its `(chain, asset)` identity. Chain match is
+    /// case-insensitive; asset must match exactly. `None` if unsupported.
     #[must_use]
-    pub fn get(&self, id: &DestinationId) -> Option<&Destination> {
-        self.destinations.get(id)
+    pub fn find(&self, chain: &str, asset: Asset) -> Option<&Destination> {
+        self.destinations
+            .iter()
+            .find(|d| d.asset == asset && d.chain_label.eq_ignore_ascii_case(chain))
     }
 
     /// Source OFT contract for the given mesh, or `None` if the source chain
@@ -310,27 +278,21 @@ impl DestinationRegistry {
 ///
 /// Defaults to `Oft` so swaps persisted before CCTP/Direct existed deserialize
 /// correctly (a missing field means a pre-CCTP OFT swap).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BridgeKind {
     Direct,
-    #[default]
     Oft,
     Cctp,
 }
 
 /// A USDC (CCTP) destination chain. Static compile-time table — CCTP routes
-/// are not published by the USDT0 deployments API. `id` is the lowercased
-/// asset name (e.g. `"usdc-base"`), kept distinct from OFT chain ids
-/// (`"polygon pos"`, `"solana"`, ...) so the two destination spaces never
-/// collide for chains that support both bridges.
+/// are not published by the USDT0 deployments API. Identified, like every
+/// destination, by its `(chain_label, asset = USDC)` pair.
 #[derive(Clone, Debug)]
 pub struct CctpDestination {
-    /// Lowercased asset name; join key used as a [`DestinationId`]. The
-    /// web-app asset identifier (e.g. `"USDC-BASE"`) is just its uppercase.
-    pub id: &'static str,
-    /// Human chain label for display (`"Base"`, `"Optimism"`). Matches the
-    /// USDT0 deployments-API spelling for chains that also support OFT, so a
-    /// chain never appears under two different names across the two bridges.
+    /// Human chain label (`"Base"`, `"Optimism"`). Matches the USDT0
+    /// deployments-API spelling for chains that also support OFT, so a chain
+    /// never appears under two different names across the two bridges.
     pub chain_label: &'static str,
     pub transport: NetworkTransport,
     /// EVM chain id of the destination chain. `None` for non-EVM transports
@@ -348,7 +310,6 @@ pub struct CctpDestination {
 /// against that source.
 pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
     CctpDestination {
-        id: "usdc-base",
         chain_label: "Base",
         transport: NetworkTransport::Evm,
         evm_chain_id: Some(8453),
@@ -356,7 +317,6 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
         token_address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
     },
     CctpDestination {
-        id: "usdc-eth",
         chain_label: "Ethereum",
         transport: NetworkTransport::Evm,
         evm_chain_id: Some(1),
@@ -364,7 +324,6 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
         token_address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
     },
     CctpDestination {
-        id: "usdc-avax",
         chain_label: "Avalanche",
         transport: NetworkTransport::Evm,
         evm_chain_id: Some(43114),
@@ -372,7 +331,6 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
         token_address: "0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E",
     },
     CctpDestination {
-        id: "usdc-op",
         chain_label: "Optimism",
         transport: NetworkTransport::Evm,
         evm_chain_id: Some(10),
@@ -380,7 +338,6 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
         token_address: "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85",
     },
     CctpDestination {
-        id: "usdc-pol",
         chain_label: "Polygon PoS",
         transport: NetworkTransport::Evm,
         evm_chain_id: Some(137),
@@ -388,7 +345,6 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
         token_address: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
     },
     CctpDestination {
-        id: "usdc-uni",
         chain_label: "Unichain",
         transport: NetworkTransport::Evm,
         evm_chain_id: Some(130),
@@ -396,7 +352,6 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
         token_address: "0x078D782b760474a361dDA0AF3839290b0EF57AD6",
     },
     CctpDestination {
-        id: "usdc-linea",
         chain_label: "Linea",
         transport: NetworkTransport::Evm,
         evm_chain_id: Some(59144),
@@ -404,7 +359,6 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
         token_address: "0x176211869cA2b568f2A7D4EE941E073a821EE1ff",
     },
     CctpDestination {
-        id: "usdc-codex",
         chain_label: "Codex",
         transport: NetworkTransport::Evm,
         evm_chain_id: Some(81224),
@@ -412,7 +366,6 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
         token_address: "0xd996633a415985DBd7D6D12f4A4343E31f5037cf",
     },
     CctpDestination {
-        id: "usdc-sonic",
         chain_label: "Sonic",
         transport: NetworkTransport::Evm,
         evm_chain_id: Some(146),
@@ -420,7 +373,6 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
         token_address: "0x29219dd400f2Bf60E5a23d13be72b486d4038894",
     },
     CctpDestination {
-        id: "usdc-world",
         chain_label: "World Chain",
         transport: NetworkTransport::Evm,
         evm_chain_id: Some(480),
@@ -428,7 +380,6 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
         token_address: "0x79A02482A880bCe3F13E09da970dC34dB4cD24D1",
     },
     CctpDestination {
-        id: "usdc-mon",
         chain_label: "Monad",
         transport: NetworkTransport::Evm,
         evm_chain_id: Some(143),
@@ -436,7 +387,6 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
         token_address: "0x754704Bc059F8C67012fEd69BC8A327a5aafb603",
     },
     CctpDestination {
-        id: "usdc-sei",
         chain_label: "Sei",
         transport: NetworkTransport::Evm,
         evm_chain_id: Some(1329),
@@ -444,7 +394,6 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
         token_address: "0xe15fC38F6D8c56aF07bbCBe3BAf5708A2Bf42392",
     },
     CctpDestination {
-        id: "usdc-xdc",
         chain_label: "XDC",
         transport: NetworkTransport::Evm,
         evm_chain_id: Some(50),
@@ -452,7 +401,6 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
         token_address: "0xfA2958CB79b0491CC627c1557F441eF849Ca8eb1",
     },
     CctpDestination {
-        id: "usdc-ink",
         chain_label: "Ink",
         transport: NetworkTransport::Evm,
         evm_chain_id: Some(57073),
@@ -460,7 +408,6 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
         token_address: "0x2D270e6886d130D724215A266106e6832161EAEd",
     },
     CctpDestination {
-        id: "usdc-plume",
         chain_label: "Plume",
         transport: NetworkTransport::Evm,
         evm_chain_id: Some(98866),
@@ -468,7 +415,6 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
         token_address: "0x222365EF19F7947e5484218551B56bb3965Aa7aF",
     },
     CctpDestination {
-        id: "usdc-sol",
         chain_label: "Solana",
         transport: NetworkTransport::Solana,
         evm_chain_id: None,
@@ -477,20 +423,14 @@ pub const CCTP_DESTINATIONS: &[CctpDestination] = &[
     },
 ];
 
-/// Resolve a CCTP destination by its [`DestinationId`] (the lowercased asset
-/// name, e.g. `"usdc-base"`).
-#[must_use]
-pub fn cctp_destination(id: &DestinationId) -> Option<&'static CctpDestination> {
-    CCTP_DESTINATIONS.iter().find(|d| d.id == id.as_str())
-}
-
 /// A selectable swap destination. Returned by the discovery API so callers can
-/// present every asset/chain/bridge combination uniformly; round-trip the `id`
-/// back into `prepare_reverse_swap` (never construct it by hand).
+/// present every asset/chain/bridge combination uniformly. The `(chain_label,
+/// asset)` pair is the destination identity to feed back into
+/// `prepare_reverse_swap`.
 #[derive(Clone, Debug)]
 pub struct DestinationOption {
-    pub id: DestinationId,
-    /// Human chain label for display (`"Arbitrum"`, `"Base"`, `"Solana"`).
+    /// Human chain label (`"Arbitrum One"`, `"Base"`, `"Solana"`). With
+    /// [`asset`](Self::asset), the destination identity for the prepare API.
     pub chain_label: String,
     /// Asset delivered there.
     pub asset: Asset,
@@ -509,7 +449,11 @@ pub struct DestinationOption {
 #[derive(Clone, Debug, Serialize)]
 pub struct PreparedSwap {
     pub destination_address: String,
-    pub destination_chain: DestinationId,
+    /// Destination chain label; with [`asset`](Self::asset), the destination
+    /// identity carried into `create_reverse_swap`.
+    pub destination_chain: String,
+    /// Stablecoin delivered on the destination chain.
+    pub asset: Asset,
     /// Coarse bridge category for the destination leg.
     pub bridge_kind: BridgeKind,
     /// Requested stablecoin output (6 decimals).
@@ -546,7 +490,10 @@ pub struct CompletedSwap {
     /// Actual stablecoin amount delivered (6 decimals).
     pub output_delivered: u64,
     pub destination_address: String,
-    pub destination_chain: DestinationId,
+    /// Destination chain label.
+    pub destination_chain: String,
+    /// Stablecoin delivered on the destination chain.
+    pub asset: Asset,
 }
 
 /// Min/max swap limits from the Boltz pairs endpoint.
@@ -590,7 +537,8 @@ mod tests {
             chain_id: 42161,
             claim_address: "0xabc".to_string(),
             destination_address: "0xdef".to_string(),
-            destination_chain: DestinationId::new("arbitrum one"),
+            destination_chain: "Arbitrum One".to_string(),
+            asset: Asset::Usdt,
             refund_address: "0x123".to_string(),
             erc20swap_address: "0xswap".to_string(),
             router_address: "0xrouter".to_string(),
@@ -614,26 +562,8 @@ mod tests {
         assert_eq!(deserialized.id, "boltz-1");
         assert_eq!(deserialized.status, BoltzSwapStatus::Created);
         assert_eq!(deserialized.chain_id, 42161);
-        assert_eq!(deserialized.destination_chain.as_str(), "arbitrum one");
-    }
-
-    /// Swaps persisted before the `lz_guid` -> `bridge_ref` rename used the
-    /// `lz_guid` JSON key; the serde alias must keep them readable.
-    #[macros::test_all]
-    fn bridge_ref_deserializes_from_legacy_lz_guid_key() {
-        let legacy = r#"{
-            "id": "boltz-1", "status": "Created", "claim_key_index": 0,
-            "chain_id": 42161, "claim_address": "0xabc", "destination_address": "0xdef",
-            "destination_chain": "arbitrum one", "refund_address": "0x123",
-            "erc20swap_address": "0xswap", "router_address": "0xrouter",
-            "invoice": "lnbc", "invoice_amount_sats": 100000, "onchain_amount": 99500,
-            "expected_output_amount": 71000000, "slippage_bps": 100,
-            "timeout_block_height": 123456, "lockup_tx_id": null, "claim_tx_hash": null,
-            "pending_call_id": null, "delivered_amount": null,
-            "lz_guid": "0xdeadbeef", "created_at": 1700000000, "updated_at": 1700000000
-        }"#;
-        let swap: BoltzSwap = serde_json::from_str(legacy).unwrap();
-        assert_eq!(swap.bridge_ref.as_deref(), Some("0xdeadbeef"));
+        assert_eq!(deserialized.destination_chain, "Arbitrum One");
+        assert_eq!(deserialized.asset, Asset::Usdt);
     }
 
     /// A `Settling` swap with a `bridge_ref` must round-trip (new variant +
@@ -648,7 +578,8 @@ mod tests {
             chain_id: 42161,
             claim_address: "0xabc".to_string(),
             destination_address: "0xdef".to_string(),
-            destination_chain: DestinationId::new("usdc-base"),
+            destination_chain: "Base".to_string(),
+            asset: Asset::Usdc,
             refund_address: "0x123".to_string(),
             erc20swap_address: "0xswap".to_string(),
             router_address: "0xrouter".to_string(),
@@ -677,42 +608,6 @@ mod tests {
     }
 
     #[macros::test_all]
-    fn destination_id_lowercases_on_construction() {
-        assert_eq!(DestinationId::new("Arbitrum One").as_str(), "arbitrum one");
-        assert_eq!(DestinationId::new("SOLANA").as_str(), "solana");
-        assert_eq!(DestinationId::new("USDC-ARB").as_str(), "usdc-arb");
-    }
-
-    #[macros::test_all]
-    fn destination_id_round_trips_via_serde() {
-        let id = DestinationId::new("Polygon PoS");
-        let json = serde_json::to_string(&id).unwrap();
-        // `#[serde(transparent)]` serialises as a bare string.
-        assert_eq!(json, r#""polygon pos""#);
-        let back: DestinationId = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, id);
-    }
-
-    #[macros::test_all]
-    fn bridge_kind_defaults_to_oft() {
-        // Pre-CCTP swaps have no `bridge_kind` field; it must default to Oft.
-        assert_eq!(BridgeKind::default(), BridgeKind::Oft);
-    }
-
-    #[macros::test_all]
-    fn bridge_kind_back_compat_deserializes() {
-        // Old persisted values must still deserialize after adding `Direct`.
-        assert_eq!(
-            serde_json::from_str::<BridgeKind>(r#""Oft""#).unwrap(),
-            BridgeKind::Oft
-        );
-        assert_eq!(
-            serde_json::from_str::<BridgeKind>(r#""Cctp""#).unwrap(),
-            BridgeKind::Cctp
-        );
-    }
-
-    #[macros::test_all]
     fn bridge_kind_from_bridge() {
         assert_eq!(Bridge::Direct.kind(), BridgeKind::Direct);
         assert_eq!(
@@ -733,13 +628,17 @@ mod tests {
         // 15 EVM destinations + Solana.
         assert_eq!(CCTP_DESTINATIONS.len(), 16);
 
-        let mut ids = HashSet::new();
+        let mut labels = HashSet::new();
         let mut domains = HashSet::new();
         let mut solana_count = 0;
         for d in CCTP_DESTINATIONS {
-            // ids are unique and already lowercased (valid DestinationId keys).
-            assert!(ids.insert(d.id), "duplicate id {}", d.id);
-            assert_eq!(d.id, d.id.to_lowercase());
+            // Chain labels are unique: with the implicit USDC asset they form
+            // each destination's identity.
+            assert!(
+                labels.insert(d.chain_label),
+                "duplicate chain_label {}",
+                d.chain_label
+            );
             // Circle domains are unique per destination.
             assert!(domains.insert(d.domain), "duplicate domain {}", d.domain);
             match d.transport {
@@ -747,35 +646,26 @@ mod tests {
                     assert!(d.token_address.starts_with("0x"));
                     assert_eq!(d.token_address.len(), 42);
                     // Every EVM destination carries a numeric chain id.
-                    assert!(d.evm_chain_id.is_some(), "{} missing evm_chain_id", d.id);
+                    assert!(
+                        d.evm_chain_id.is_some(),
+                        "{} missing evm_chain_id",
+                        d.chain_label
+                    );
                 }
                 NetworkTransport::Solana => {
                     solana_count += 1;
                     assert!(!d.token_address.starts_with("0x"));
                     // Non-EVM transports expose no chain id.
-                    assert!(d.evm_chain_id.is_none(), "{} has evm_chain_id", d.id);
+                    assert!(
+                        d.evm_chain_id.is_none(),
+                        "{} has evm_chain_id",
+                        d.chain_label
+                    );
                 }
                 NetworkTransport::Tron => panic!("CCTP does not support Tron"),
             }
         }
-        // Exactly one Solana destination (USDC-SOL).
+        // Exactly one Solana destination (USDC on Solana).
         assert_eq!(solana_count, 1);
-    }
-
-    #[macros::test_all]
-    fn cctp_destination_lookup_by_destination_id() {
-        let base = cctp_destination(&DestinationId::new("usdc-base")).unwrap();
-        assert_eq!(base.chain_label, "Base");
-        assert_eq!(base.domain, 6);
-        assert_eq!(base.transport, NetworkTransport::Evm);
-
-        // Lookup is case-insensitive via DestinationId normalization.
-        let sol = cctp_destination(&DestinationId::new("USDC-SOL")).unwrap();
-        assert_eq!(sol.domain, 5);
-        assert_eq!(sol.transport, NetworkTransport::Solana);
-
-        // OFT destination ids must NOT resolve as CCTP destinations.
-        assert!(cctp_destination(&DestinationId::new("polygon pos")).is_none());
-        assert!(cctp_destination(&DestinationId::new("solana")).is_none());
     }
 }

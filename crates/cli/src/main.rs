@@ -13,8 +13,8 @@ use rustyline::hint::HistoryHinter;
 use rustyline::{Completer, Helper, Hinter, Validator, highlight::Highlighter};
 
 use boltz_client::{
-    BoltzConfig, BoltzError, BoltzEventListener, BoltzService, BoltzStorage, BoltzSwapEvent,
-    BoltzSwapStatus, DestinationId,
+    Asset, BoltzConfig, BoltzError, BoltzEventListener, BoltzService, BoltzStorage, BoltzSwapEvent,
+    BoltzSwapStatus,
 };
 
 const PHRASE_FILE_NAME: &str = "phrase";
@@ -227,8 +227,8 @@ async fn execute_command(command: Command, svc: &BoltzService, seed: &[u8]) -> R
             sats,
             destination,
         } => {
-            let chain = pick_chain_for_address(svc, &destination)?;
-            let prepared = prepare(svc, &destination, chain, usd, sats).await?;
+            let (chain, asset) = pick_chain_for_address(svc, &destination)?;
+            let prepared = prepare(svc, &destination, &chain, asset, usd, sats).await?;
             print_json(&prepared);
             Ok(true)
         }
@@ -237,8 +237,8 @@ async fn execute_command(command: Command, svc: &BoltzService, seed: &[u8]) -> R
             sats,
             destination,
         } => {
-            let chain = pick_chain_for_address(svc, &destination)?;
-            cmd_swap(svc, &destination, chain, usd, sats).await?;
+            let (chain, asset) = pick_chain_for_address(svc, &destination)?;
+            cmd_swap(svc, &destination, &chain, asset, usd, sats).await?;
             Ok(true)
         }
         Command::Accept { swap_id } => {
@@ -348,16 +348,17 @@ async fn cmd_limits(svc: &BoltzService) -> Result<()> {
 async fn prepare(
     svc: &BoltzService,
     destination: &str,
-    chain: DestinationId,
+    chain: &str,
+    asset: Asset,
     usd: Option<u64>,
     sats: Option<u64>,
 ) -> Result<boltz_client::PreparedSwap> {
     match (usd, sats) {
         (Some(usd_amount), _) => Ok(svc
-            .prepare_reverse_swap(destination, chain, usd_amount, None)
+            .prepare_reverse_swap(destination, chain, asset, usd_amount, None)
             .await?),
         (_, Some(sats_amount)) => Ok(svc
-            .prepare_reverse_swap_from_sats(destination, chain, sats_amount, None)
+            .prepare_reverse_swap_from_sats(destination, chain, asset, sats_amount, None)
             .await?),
         _ => bail!("Either --usd or --sats must be provided"),
     }
@@ -369,11 +370,16 @@ async fn prepare(
 /// Filters via [`BoltzService::destinations_accepting`] so the list contains
 /// only transports compatible with the address format, spanning both USDT0
 /// (OFT) and USDC (CCTP). Auto-selects if exactly one matches; errors if none.
-fn pick_chain_for_address(svc: &BoltzService, destination: &str) -> Result<DestinationId> {
-    let mut candidates: Vec<(String, DestinationId)> = svc
+fn pick_chain_for_address(svc: &BoltzService, destination: &str) -> Result<(String, Asset)> {
+    let mut candidates: Vec<(String, (String, Asset))> = svc
         .destinations_accepting(destination)
         .into_iter()
-        .map(|d| (format!("{} ({})", d.chain_label, d.asset), d.id))
+        .map(|d| {
+            (
+                format!("{} ({})", d.chain_label, d.asset),
+                (d.chain_label, d.asset),
+            )
+        })
         .collect();
     candidates.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -382,9 +388,9 @@ fn pick_chain_for_address(svc: &BoltzService, destination: &str) -> Result<Desti
             "No supported destination accepts the address '{destination}'. Run `info` for the list."
         ),
         1 => {
-            let (name, id) = candidates.into_iter().next().unwrap();
+            let (name, dest) = candidates.into_iter().next().unwrap();
             println!("Only one destination supports this address: {name} — proceeding.");
-            Ok(id)
+            Ok(dest)
         }
         _ => {
             println!("\nWhich destination?");
@@ -403,8 +409,8 @@ fn pick_chain_for_address(svc: &BoltzService, destination: &str) -> Result<Desti
                 match trimmed.parse::<usize>() {
                     Ok(n) if n >= 1 && n <= candidates.len() => {
                         let idx = n.saturating_sub(1);
-                        let (_, id) = candidates.into_iter().nth(idx).unwrap();
-                        return Ok(id);
+                        let (_, dest) = candidates.into_iter().nth(idx).unwrap();
+                        return Ok(dest);
                     }
                     _ => println!("Enter a number between 1 and {}.", candidates.len()),
                 }
@@ -416,13 +422,14 @@ fn pick_chain_for_address(svc: &BoltzService, destination: &str) -> Result<Desti
 async fn cmd_swap(
     svc: &BoltzService,
     destination: &str,
-    chain: DestinationId,
+    chain: &str,
+    asset: Asset,
     usd: Option<u64>,
     sats: Option<u64>,
 ) -> Result<()> {
     // Step 1: Prepare
     println!("Fetching quote...\n");
-    let prepared = prepare(svc, destination, chain, usd, sats).await?;
+    let prepared = prepare(svc, destination, chain, asset, usd, sats).await?;
     print_json(&prepared);
 
     // Confirm

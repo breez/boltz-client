@@ -229,12 +229,13 @@ impl BoltzService {
     pub async fn prepare_reverse_swap(
         &self,
         destination: &str,
-        chain: DestinationId,
+        chain: &str,
+        asset: Asset,
         output_amount: u64,
         max_slippage_bps: Option<u32>,
     ) -> Result<PreparedSwap, BoltzError> {
         self.executor
-            .prepare(destination, chain, output_amount, max_slippage_bps)
+            .prepare(destination, chain, asset, output_amount, max_slippage_bps)
             .await
     }
 
@@ -246,12 +247,19 @@ impl BoltzService {
     pub async fn prepare_reverse_swap_from_sats(
         &self,
         destination: &str,
-        chain: DestinationId,
+        chain: &str,
+        asset: Asset,
         invoice_amount_sats: u64,
         max_slippage_bps: Option<u32>,
     ) -> Result<PreparedSwap, BoltzError> {
         self.executor
-            .prepare_from_sats(destination, chain, invoice_amount_sats, max_slippage_bps)
+            .prepare_from_sats(
+                destination,
+                chain,
+                asset,
+                invoice_amount_sats,
+                max_slippage_bps,
+            )
             .await
     }
 
@@ -311,14 +319,13 @@ impl BoltzService {
     }
 
     /// Every selectable destination across all bridges (OFT/USDT0, CCTP/USDC,
-    /// and Arbitrum-direct USDT/USDC). Round-trip [`DestinationOption::id`]
-    /// back into `prepare_reverse_swap`.
+    /// and Arbitrum-direct USDT/USDC). Round-trip a destination's `(chain_label,
+    /// asset)` back into `prepare_reverse_swap`.
     pub fn supported_destinations(&self) -> Vec<DestinationOption> {
         self.chain_registry
             .destinations
-            .values()
+            .iter()
             .map(|dest| DestinationOption {
-                id: dest.id.clone(),
                 chain_label: dest.chain_label.clone(),
                 asset: dest.asset,
                 transport: dest.transport,

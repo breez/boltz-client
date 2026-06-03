@@ -89,7 +89,7 @@ mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
     use super::*;
-    use crate::models::{BoltzSwapStatus, BridgeKind, DestinationId};
+    use crate::models::{Asset, BoltzSwapStatus, BridgeKind};
 
     fn test_swap(id: &str, status: BoltzSwapStatus) -> BoltzSwap {
         BoltzSwap {
@@ -100,7 +100,8 @@ mod tests {
             chain_id: 42161,
             claim_address: "0xabc".to_string(),
             destination_address: "0xdef".to_string(),
-            destination_chain: DestinationId::new("arbitrum one"),
+            destination_chain: "Arbitrum One".to_string(),
+            asset: Asset::Usdt,
             refund_address: "0x123".to_string(),
             erc20swap_address: "0xswap".to_string(),
             router_address: "0xrouter".to_string(),
