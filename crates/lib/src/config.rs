@@ -166,8 +166,17 @@ pub const ARBITRUM_USDC_ADDRESS: &str = "0xaf88d065e77c8cC2239327C5EDb3A432268e5
 /// feed-compromise path worth closing. They are immutable per mesh: the
 /// registry build verifies the feed's source OFT against these pins and
 /// refuses to start on a mismatch, while destination EIDs and contracts stay
-/// dynamically discovered (an unpinned destination at worst makes `send`
-/// revert, never steals). Verified against `https://docs.usdt0.to/api/deployments`.
+/// dynamically discovered — a deliberate trade so a newly-supported chain needs
+/// no crate release. An unpinned destination almost always at worst makes
+/// `send` revert (invalid/mismatched EID), never steals. The one genuine loss
+/// edge: a hijacked feed substitutes a *valid* peer EID for a known chain,
+/// misrouting the OFT send to a different EVM chain. For a self-custody
+/// recipient the same key controls the same address on every EVM chain, so the
+/// tokens land at a recoverable address; loss only occurs when the recipient
+/// `to` is not controllable on the substituted chain (e.g. a CEX deposit
+/// address). Accepting this is the cost of runtime chain discovery — pinning
+/// destination EIDs would defeat that goal. Verified against
+/// `https://docs.usdt0.to/api/deployments`.
 ///
 /// Native (`OFTv2`) mesh source OFT on Arbitrum One.
 pub const ARBITRUM_USDT0_NATIVE_OFT: &str = "0x14E4A1B13bf7F943c8ff7C51fb60FA964A298D92";
