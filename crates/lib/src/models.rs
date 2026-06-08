@@ -161,6 +161,22 @@ impl std::fmt::Display for Asset {
     }
 }
 
+/// Inverse of [`Asset::as_str`]: parse a ticker back into the enum. Kept next to
+/// `as_str` so adding an asset updates both directions in one place. Case
+/// insensitive. `Err(())` for tickers Boltz does not deliver.
+impl TryFrom<&str> for Asset {
+    type Error = ();
+
+    fn try_from(ticker: &str) -> Result<Self, Self::Error> {
+        match ticker.to_ascii_uppercase().as_str() {
+            "USDT" => Ok(Asset::Usdt),
+            "USDT0" => Ok(Asset::Usdt0),
+            "USDC" => Ok(Asset::Usdc),
+            _ => Err(()),
+        }
+    }
+}
+
 /// How a destination's Arbitrum DEX output reaches the user. Carries the
 /// per-bridge routing data the claim path needs. Internal to the registry and
 /// claim paths; the public API surfaces only the coarse [`BridgeKind`].
