@@ -53,6 +53,10 @@ curve25519-dalek = { version = "4", default-features = false, features = ["alloc
 # Key derivation (BIP-32 over secp256k1, matching the `@scure/bip32` JS library)
 bip32 = "0.5"
 
+# Zeroize transient raw-private-key copies (the underlying SigningKey/XPrv
+# already self-zeroize; this covers the standalone byte copies we materialize).
+zeroize = "1"
+
 # BOLT11 invoice decoding (amount validation in swap response)
 lightning-invoice = { version = "0.34", default-features = false }
 

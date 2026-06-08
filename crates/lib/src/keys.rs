@@ -2,6 +2,7 @@ use bip32::{ChildNumber, XPrv};
 use k256::ecdsa::SigningKey;
 use sha2::{Digest, Sha256};
 use tiny_keccak::{Hasher, Keccak};
+use zeroize::Zeroizing;
 
 use crate::error::BoltzError;
 
@@ -84,8 +85,8 @@ impl EvmKeyManager {
                 .map_err(|e| BoltzError::Signing(format!("BIP-32 derivation error: {e}")))?;
         }
 
-        let key_bytes = derived.to_bytes();
-        let signing_key = SigningKey::from_bytes((&key_bytes).into())
+        let key_bytes = Zeroizing::new(derived.to_bytes());
+        let signing_key = SigningKey::from_bytes((&*key_bytes).into())
             .map_err(|e| BoltzError::Signing(format!("Invalid derived key: {e}")))?;
 
         Ok(EvmKeyPair::from_signing_key(signing_key))
@@ -126,9 +127,11 @@ impl EvmKeyPair {
         &self.signing_key
     }
 
-    /// Returns the raw private key bytes (32 bytes).
-    pub(crate) fn private_key_bytes(&self) -> [u8; 32] {
-        self.signing_key.to_bytes().into()
+    /// Returns the raw private key bytes (32 bytes), wrapped in `Zeroizing` so
+    /// the copy is wiped when the caller drops it (the `SigningKey` self-zeroizes
+    /// its own storage, but this standalone copy would otherwise linger).
+    pub(crate) fn private_key_bytes(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.signing_key.to_bytes().into())
     }
 
     /// Returns the Ethereum address as a hex string with `0x` prefix (checksummed).
