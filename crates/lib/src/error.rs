@@ -40,6 +40,14 @@ pub enum BoltzError {
     )]
     QuoteDegradedBeyondSlippage { expected_usd: u64, quoted_usd: u64 },
 
+    /// The claim `UserOp` was broadcast (`wallet_sendPreparedCalls` returned a
+    /// `call_id`, so the preimage is already on-chain) but the confirming poll
+    /// failed transiently. The claim must NOT be re-submitted — doing so would
+    /// broadcast a second, reverting claim. The `call_id` is persisted; the
+    /// manager recovers the tx hash via `resume_pending_call` / on-chain rescan.
+    #[error("Claim broadcast but unconfirmed (call_id {call_id}); awaiting recovery")]
+    ClaimBroadcastUnconfirmed { call_id: String },
+
     /// Boltz rejected swap creation because the preimage hash was already used
     /// (HTTP 409 Conflict). This indicates a serious local state issue: the key
     /// index counter has regressed, causing preimage reuse. Callers must NOT

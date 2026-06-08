@@ -840,6 +840,21 @@ impl ReverseSwapExecutor {
                         return Err(e);
                     }
 
+                    // The claim was already broadcast (preimage public) but the
+                    // confirmation poll failed. Re-submitting would broadcast a
+                    // second, reverting claim. Stop here; the call_id is
+                    // persisted, so the manager recovers the tx hash via
+                    // `resume_pending_call` / on-chain rescan.
+                    if matches!(e, BoltzError::ClaimBroadcastUnconfirmed { .. }) {
+                        tracing::warn!(
+                            attempt,
+                            swap_id = swap.id,
+                            error = %e,
+                            "Claim broadcast but unconfirmed; not re-submitting"
+                        );
+                        return Err(e);
+                    }
+
                     tracing::warn!(attempt, swap_id = swap.id, error = %e, "Claim attempt failed");
 
                     // Check if funds are still locked on-chain. If not, stop
@@ -1656,7 +1671,18 @@ impl ReverseSwapExecutor {
         // claim.
         self.persist_pending_call_id(&swap.id, &call_id).await;
 
-        let result = self.alchemy_client.poll_call_status(&call_id).await?;
+        // The preimage is now public (broadcast in the claim UserOp). A poll
+        // failure here must NOT bubble up as a generic claim error: that would
+        // let the retry loop re-enter `submit_calls` and broadcast a second,
+        // reverting claim. Signal "broadcast, unconfirmed" so the loop stops and
+        // recovery proceeds via the persisted call_id.
+        let result = self
+            .alchemy_client
+            .poll_call_status(&call_id)
+            .await
+            .map_err(|_| BoltzError::ClaimBroadcastUnconfirmed {
+                call_id: call_id.clone(),
+            })?;
 
         tracing::info!(
             tx_hash = result.tx_hash,
