@@ -1,9 +1,8 @@
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use futures::{SinkExt, StreamExt};
 use platform_utils::tokio;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tokio_tungstenite_wasm::{Message, WebSocketStream};
 
 use crate::error::BoltzError;
@@ -44,9 +43,6 @@ enum ReaderCommand {
 /// swap IDs the subscriber tracks; status updates for all tracked swaps flow
 /// through the same channel.
 pub struct SwapStatusSubscriber {
-    /// IDs currently subscribed on the WS. Also used for resubscription on
-    /// reconnect.
-    subscribed_ids: Arc<Mutex<HashSet<String>>>,
     cmd_tx: mpsc::Sender<ReaderCommand>,
     /// Sync-safe handle used by `Drop` to abort the reader task if `close()`
     /// was never called.
@@ -59,14 +55,12 @@ impl SwapStatusSubscriber {
         ws_url: &str,
         global_tx: mpsc::Sender<SwapStatusUpdate>,
     ) -> Result<Self, BoltzError> {
-        let subscribed_ids: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
 
         let reader_handle = tokio::spawn(Self::reader_loop(ws_url.to_string(), global_tx, cmd_rx));
         let abort_handle = reader_handle.abort_handle();
 
         Ok(Self {
-            subscribed_ids,
             cmd_tx,
             abort_handle,
         })
@@ -75,8 +69,6 @@ impl SwapStatusSubscriber {
     /// Start tracking a swap ID. Status updates will be sent through the
     /// global channel provided at construction.
     pub async fn subscribe(&self, swap_id: &str) -> Result<(), BoltzError> {
-        self.subscribed_ids.lock().await.insert(swap_id.to_string());
-
         self.cmd_tx
             .send(ReaderCommand::Subscribe(swap_id.to_string()))
             .await
@@ -90,8 +82,6 @@ impl SwapStatusSubscriber {
 
     /// Stop tracking a swap ID.
     pub async fn unsubscribe(&self, swap_id: &str) {
-        self.subscribed_ids.lock().await.remove(swap_id);
-
         if self
             .cmd_tx
             .send(ReaderCommand::Unsubscribe(swap_id.to_string()))
@@ -111,7 +101,6 @@ impl SwapStatusSubscriber {
         if self.cmd_tx.send(ReaderCommand::Shutdown).await.is_err() {
             tracing::warn!("Reader loop is not running, shutdown not delivered");
         }
-        self.subscribed_ids.lock().await.clear();
         tracing::info!("WebSocket subscriber closed");
     }
 }
@@ -128,9 +117,10 @@ impl SwapStatusSubscriber {
         global_tx: mpsc::Sender<SwapStatusUpdate>,
         mut cmd_rx: mpsc::Receiver<ReaderCommand>,
     ) {
-        // Track subscribed IDs locally in the loop for WS (re)subscription
-        // messages. The authoritative set is `subscribed_ids` on the struct,
-        // but we need a local copy to avoid holding the lock during I/O.
+        // The reader owns the authoritative set of subscribed IDs, driven by the
+        // ordered `ReaderCommand` stream from subscribe/unsubscribe/close. Kept
+        // local to the loop so resubscription on reconnect needs no shared lock
+        // held across I/O.
         let mut local_ids: HashSet<String> = HashSet::new();
 
         loop {
