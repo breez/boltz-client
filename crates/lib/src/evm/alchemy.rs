@@ -240,8 +240,11 @@ impl AlchemyGasClient {
     ///
     /// A transient RPC error on a single iteration does not abort the poll
     /// — it is stashed as `last_err` and only returned if every subsequent
-    /// attempt also fails. A receipt with status `0x0` is a terminal revert
-    /// and returns immediately.
+    /// attempt also fails. Success requires an explicit `0x1` receipt status;
+    /// `0x0` is a terminal revert. Any other value (absent/unknown) is treated
+    /// as not-yet-final and keeps polling — mirroring the strictness of
+    /// [`crate::evm::provider::TxReceipt::is_success`], so a lenient/odd
+    /// response can never be mistaken for a confirmed claim.
     pub(crate) async fn poll_call_status(
         &self,
         call_id: &str,
@@ -264,23 +267,33 @@ impl AlchemyGasClient {
                     {
                         let receipt = &receipts[0];
 
-                        if receipt.status.as_deref() == Some("0x0") {
-                            return Err(BoltzError::Evm {
-                                reason: "Transaction reverted".to_string(),
-                                tx_hash: receipt.transaction_hash.clone(),
-                            });
+                        match receipt.status.as_deref() {
+                            Some("0x1") => {
+                                let tx_hash =
+                                    receipt.transaction_hash.clone().ok_or_else(|| {
+                                        BoltzError::Evm {
+                                            reason: "Receipt missing transactionHash".to_string(),
+                                            tx_hash: None,
+                                        }
+                                    })?;
+                                return Ok(AlchemyResult { tx_hash });
+                            }
+                            Some("0x0") => {
+                                return Err(BoltzError::Evm {
+                                    reason: "Transaction reverted".to_string(),
+                                    tx_hash: receipt.transaction_hash.clone(),
+                                });
+                            }
+                            // Absent/unknown status: not final. Keep polling
+                            // rather than treating it as success.
+                            other => {
+                                tracing::debug!(
+                                    attempt,
+                                    status = ?other,
+                                    "Receipt present but status not final, continuing poll"
+                                );
+                            }
                         }
-
-                        let tx_hash =
-                            receipt
-                                .transaction_hash
-                                .clone()
-                                .ok_or_else(|| BoltzError::Evm {
-                                    reason: "Receipt missing transactionHash".to_string(),
-                                    tx_hash: None,
-                                })?;
-
-                        return Ok(AlchemyResult { tx_hash });
                     }
                 }
                 Err(e) => {
@@ -871,6 +884,36 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.tx_hash, "0xrecovered");
+    }
+
+    #[macros::async_test_all]
+    async fn test_poll_status_absent_status_is_not_success() {
+        let config = AlchemyConfig {
+            gas_sponsor_url: "https://sponsor.test/".to_string(),
+        };
+        // First poll returns a receipt with NO status field (and a tx hash that
+        // must not be accepted). Under the old logic "not 0x0 => success" this
+        // would return "0xpending". The strict logic keeps polling until the
+        // explicit 0x1 receipt, returning "0xfinal".
+        let responses = vec![
+            alchemy_rpc_success(&serde_json::json!({
+                "status": 1,
+                "receipts": [{ "transactionHash": "0xpending" }]
+            })),
+            alchemy_rpc_success(&serde_json::json!({
+                "status": 1,
+                "receipts": [{ "transactionHash": "0xfinal", "status": "0x1" }]
+            })),
+        ];
+
+        let client = AlchemyGasClient::new(
+            &config,
+            Box::new(MockAlchemyHttpClient::new(responses)),
+            test_signer(),
+        );
+
+        let result = client.poll_call_status("call_x").await.unwrap();
+        assert_eq!(result.tx_hash, "0xfinal");
     }
 
     #[macros::test_all]
