@@ -18,6 +18,15 @@ pub struct EvmProvider {
     http_client: Box<dyn HttpClient>,
 }
 
+/// Minimal block header from `eth_getBlockByNumber`. Only the Arbitrum-specific
+/// `l1BlockNumber` field is decoded — the L1 (Ethereum) height that Solidity
+/// `block.number` reflects on Arbitrum.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BlockHeader {
+    l1_block_number: String,
+}
+
 /// A single log entry from `eth_getLogs`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -136,11 +145,32 @@ impl EvmProvider {
     }
 
     /// Get the latest block number.
+    ///
+    /// On Arbitrum this is the **L2** (Arbitrum) block number — it can advance
+    /// several times per L1 block. Do NOT compare it against values denominated
+    /// in L1 block height (e.g. a swap `timeout_block_height`); use
+    /// [`Self::eth_l1_block_number`] for that.
     pub async fn eth_block_number(&self) -> Result<u64, BoltzError> {
         let result: String = self
             .rpc_request("eth_blockNumber", serde_json::json!([]))
             .await?;
         parse_hex_u64(&result)
+    }
+
+    /// Get the current **L1** (Ethereum) block number as seen on Arbitrum.
+    ///
+    /// Reads the Arbitrum-specific `l1BlockNumber` field from the latest block
+    /// header. This is the value Solidity `block.number` reflects on Arbitrum,
+    /// so it is the correct reference for anything denominated in L1 block
+    /// height — notably the `ERC20Swap` lockup `timeout_block_height`, which
+    /// Boltz denominates in L1 blocks. The standard `eth_blockNumber`
+    /// ([`Self::eth_block_number`]) returns the L2 number and must not be used
+    /// for that comparison.
+    pub async fn eth_l1_block_number(&self) -> Result<u64, BoltzError> {
+        let header: BlockHeader = self
+            .rpc_request("eth_getBlockByNumber", serde_json::json!(["latest", false]))
+            .await?;
+        parse_hex_u64(&header.l1_block_number)
     }
 
     /// Internal: send a JSON-RPC request and parse the result.
@@ -389,6 +419,33 @@ mod tests {
 
         let block = provider.eth_block_number().await.unwrap();
         assert_eq!(block, 0x1234);
+    }
+
+    #[macros::async_test_all]
+    async fn test_eth_l1_block_number() {
+        // `eth_getBlockByNumber` returns a header object; we decode only the
+        // Arbitrum-specific `l1BlockNumber` field (and ignore the rest).
+        let header = serde_json::json!({
+            "number": "0x1c180a0c",        // L2 number — must NOT be returned
+            "l1BlockNumber": "0x181b3b4",  // 25_278_900
+            "hash": "0xabc",
+        });
+        let client = MockHttpClient::new(vec![rpc_success(&header)]);
+        let provider = EvmProvider::new("http://localhost:8545".to_string(), Box::new(client));
+
+        let l1 = provider.eth_l1_block_number().await.unwrap();
+        assert_eq!(l1, 0x0181_b3b4);
+    }
+
+    #[macros::async_test_all]
+    async fn test_eth_l1_block_number_missing_field() {
+        // A header without `l1BlockNumber` (e.g. a non-Arbitrum RPC) must error,
+        // not silently succeed — the timeout guard fails closed on the result.
+        let header = serde_json::json!({ "number": "0x10", "hash": "0xabc" });
+        let client = MockHttpClient::new(vec![rpc_success(&header)]);
+        let provider = EvmProvider::new("http://localhost:8545".to_string(), Box::new(client));
+
+        assert!(provider.eth_l1_block_number().await.is_err());
     }
 
     #[macros::async_test_all]

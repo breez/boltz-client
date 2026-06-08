@@ -108,6 +108,24 @@ pub const DEFAULT_SLIPPAGE_BPS: u32 = 100;
 /// Matches the Boltz web app's upper bound.
 pub const MAX_SLIPPAGE_BPS: u32 = 500;
 
+/// Minimum required headroom, in **L1** (Ethereum) blocks, between the lockup
+/// `timeout_block_height` and the current L1 height before we proceed with a
+/// swap. `timeout_block_height` is denominated in L1 block height (Solidity
+/// `block.number` on Arbitrum returns the L1 number), so the comparison must
+/// use [`crate::evm::provider::EvmProvider::eth_l1_block_number`], never
+/// `eth_blockNumber` (which returns the L2 number).
+///
+/// At ~12s per L1 block, 60 blocks ≈ 12 minutes — enough to cover the full
+/// claim pipeline (WS confirmation, on-chain lockup re-checks, gas-sponsor
+/// submission and inclusion, receipt polling) with anti-race headroom. Boltz's
+/// honest reverse-swap timeout is ~7200 L1 blocks (~24h), so this floor never
+/// rejects a legitimate swap; it only catches a malicious/buggy server that
+/// returns a too-short timeout to win a refund-vs-claim race and steal the
+/// preimage. Used both as an early abort in `create()` and — as the load-
+/// bearing, fail-safe gate — immediately before the preimage is revealed at
+/// claim time.
+pub const MIN_TIMEOUT_L1_MARGIN: u64 = 60;
+
 /// Default URL for fetching OFT (USDT0) deployment data.
 pub const DEFAULT_OFT_DEPLOYMENTS_URL: &str = "https://docs.usdt0.to/api/deployments";
 

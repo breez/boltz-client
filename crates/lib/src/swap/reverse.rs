@@ -9,8 +9,8 @@ use crate::api::types::{EncodeRequest, QuoteResponse, ReversePairInfo};
 use crate::config::{
     ARBITRUM_ROUTER_ADDRESS, ARBITRUM_TBTC_ADDRESS, ARBITRUM_USDC_ADDRESS, ARBITRUM_USDT_ADDRESS,
     BoltzConfig, CCTP_ARBITRUM_DOMAIN, CCTP_FINALITY_FAST, CCTP_TOKEN_MESSENGER_V2,
-    MAX_SLIPPAGE_BPS, POLYGON_EVM_CHAIN_ID, PROBE_INVOICE_EXPIRY_SECS, SATS_TO_TBTC_FACTOR,
-    SOLANA_USDT0_MINT, ZERO_ADDRESS,
+    MAX_SLIPPAGE_BPS, MIN_TIMEOUT_L1_MARGIN, POLYGON_EVM_CHAIN_ID, PROBE_INVOICE_EXPIRY_SECS,
+    SATS_TO_TBTC_FACTOR, SOLANA_USDT0_MINT, ZERO_ADDRESS,
 };
 use crate::error::BoltzError;
 use crate::evm::alchemy::{AlchemyGasClient, EvmCall};
@@ -510,9 +510,14 @@ impl ReverseSwapExecutor {
             )));
         }
 
-        // TODO: Validate timeout_block_height for reasonableness (minimum
-        // delta from current block). A very short timeout could allow Boltz
-        // to refund before the user can claim.
+        // Early abort: reject an unreasonably short lockup timeout before the
+        // invoice is returned, so the user never commits sats to a swap that
+        // could let Boltz refund before we can claim. This is a UX fast-fail;
+        // the load-bearing protection is re-checked against the live block
+        // height immediately before the preimage is revealed at claim time
+        // (`claim_and_swap` -> `ensure_timeout_margin`).
+        self.ensure_timeout_margin(resp.timeout_block_height)
+            .await?;
 
         let now = current_unix_timestamp();
         Ok(BoltzSwap {
@@ -699,6 +704,21 @@ impl ReverseSwapExecutor {
             .map_err(|_| BoltzError::Generic("USDT amount overflow".into()))
     }
 
+    /// Reject a swap whose lockup `timeout_block_height` leaves too little
+    /// headroom before the current block, narrowing the preimage-exposure
+    /// window (see [`MIN_TIMEOUT_L1_MARGIN`]).
+    ///
+    /// `timeout_block_height` is denominated in **L1** block height, so this
+    /// fetches the current L1 height (NOT the L2 `eth_blockNumber`) and requires
+    /// at least `MIN_TIMEOUT_L1_MARGIN` blocks of margin. **Fail-closed:** an
+    /// RPC error rejects the swap rather than proceeding blind, because the
+    /// whole point is to guard the preimage reveal against a malicious/buggy
+    /// server returning a too-short timeout to win a refund-vs-claim race.
+    async fn ensure_timeout_margin(&self, timeout_block_height: u64) -> Result<(), BoltzError> {
+        let current_l1 = self.evm_provider.eth_l1_block_number().await?;
+        check_timeout_margin(timeout_block_height, current_l1)
+    }
+
     /// Claim tBTC locked on-chain and swap to the output token (USDT or USDC).
     /// Returns the claim tx hash on success.
     #[expect(clippy::too_many_lines)]
@@ -747,6 +767,16 @@ impl ReverseSwapExecutor {
                     .to_string(),
             ));
         }
+
+        // Load-bearing, fail-safe gate: confirm the lockup timeout still leaves
+        // enough block headroom BEFORE revealing the preimage. The lockup check
+        // above only proves the funds are locked *right now*; it cannot prove
+        // the lock survives until our claim mines. Revealing the preimage with a
+        // near-expired timeout lets a malicious/buggy server refund and then
+        // settle the LN HTLC with the leaked preimage. Aborting here is loss-
+        // free: the preimage stays secret and the LN payment refunds on timeout.
+        self.ensure_timeout_margin(swap.timeout_block_height)
+            .await?;
 
         let chain_id_u32 = to_chain_id_u32(swap.chain_id)?;
         let preimage = self
@@ -2270,6 +2300,22 @@ fn to_chain_id_u32(chain_id: u64) -> Result<u32, BoltzError> {
         .map_err(|_| BoltzError::Generic("Chain ID overflow".to_string()))
 }
 
+/// Pure check behind [`ReverseSwapExecutor::ensure_timeout_margin`]: reject the
+/// swap unless the lockup timeout sits at least [`MIN_TIMEOUT_L1_MARGIN`] L1
+/// blocks above the current L1 height. `saturating_sub` makes a timeout at or
+/// below the current block yield a zero margin (rejected).
+fn check_timeout_margin(timeout_block_height: u64, current_l1: u64) -> Result<(), BoltzError> {
+    let margin = timeout_block_height.saturating_sub(current_l1);
+    if margin < MIN_TIMEOUT_L1_MARGIN {
+        return Err(BoltzError::Generic(format!(
+            "Lockup timeout_block_height ({timeout_block_height}) leaves only {margin} L1 \
+             block(s) of headroom over the current L1 height ({current_l1}); require at least \
+             {MIN_TIMEOUT_L1_MARGIN}"
+        )));
+    }
+    Ok(())
+}
+
 /// Build the CCTP forwarding hook bytes from the recipient-setup decision
 /// (see [`ReverseSwapExecutor::cctp_needs_recipient_setup`]). With setup, the
 /// Solana ATA-creating hook; otherwise the plain EVM-style forward tag (also
@@ -2477,6 +2523,34 @@ mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
     use super::*;
+
+    #[macros::test_all]
+    fn check_timeout_margin_enforces_l1_headroom() {
+        let l1 = 25_273_396; // a realistic Arbitrum-reported L1 height
+
+        // Honest Boltz timeout (~7200 blocks out) passes comfortably.
+        assert!(check_timeout_margin(l1 + 7200, l1).is_ok());
+        // Exactly the minimum margin is accepted (boundary is inclusive).
+        assert!(check_timeout_margin(l1 + MIN_TIMEOUT_L1_MARGIN, l1).is_ok());
+
+        // One block under the minimum is rejected.
+        assert!(check_timeout_margin(l1 + MIN_TIMEOUT_L1_MARGIN - 1, l1).is_err());
+        // A timeout equal to or below the current block (zero/negative headroom)
+        // is rejected — `saturating_sub` floors the margin at 0.
+        assert!(check_timeout_margin(l1, l1).is_err());
+        assert!(check_timeout_margin(l1 - 1_000, l1).is_err());
+    }
+
+    #[macros::test_all]
+    fn check_timeout_margin_does_not_confuse_l1_and_l2() {
+        // Regression guard for the L1/L2 denomination trap: an L1-denominated
+        // timeout (~25.3M) compared against an L2 height (~471M, what
+        // `eth_blockNumber` returns) yields a huge negative headroom and must be
+        // rejected — proving we must feed `eth_l1_block_number`, not the L2 one.
+        let timeout_l1 = 25_280_598;
+        let l2_height = 471_376_588;
+        assert!(check_timeout_margin(timeout_l1, l2_height).is_err());
+    }
 
     #[macros::test_all]
     fn cctp_forward_hook_picks_setup_vs_plain() {
