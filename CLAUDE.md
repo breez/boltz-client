@@ -45,10 +45,20 @@ In one line: a headless, WASM-compatible Rust library for **reverse-only** swaps
 (Lightning sats → stablecoin at a destination), ported from `boltz-web-app` with
 deliberate, documented divergences.
 
-**Keep both docs current.** Update `architecture.md` in the same change that
-alters the design; append a dated entry to `decisions.md` whenever you make a
-notable or divergent decision. Record *why*, not *what* — the code and
-`architecture.md` own the "what".
+**Keep both docs current — but keep the bar high.** Update `architecture.md`
+in the same change that alters the design; append a dated entry to
+`decisions.md` whenever you make a notable or divergent decision. Record *why*,
+not *what* — the code and `architecture.md` own the "what".
+
+Only document decisions that are **high-impact or non-obvious**: a divergence
+from `boltz-web-app`, a security boundary, a money-critical invariant, or a
+trade-off a future reader would otherwise re-litigate. Do **not** log routine,
+self-explanatory hardening — input validation, status-machine ordering guards,
+defensive re-checks, overflow guards, renames — even when it closes an audit
+finding; the code and its comments already carry that. The same bar applies to
+`architecture.md`: it describes subsystem structure and load-bearing
+invariants, not low-level mechanics obvious from reading the function. When in
+doubt, leave it out: a thorough code comment at the site usually suffices.
 
 ## Test Conventions
 
