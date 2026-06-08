@@ -972,7 +972,7 @@ impl ReverseSwapExecutor {
             swap.expected_output_amount,
             swap.slippage_bps,
             skip_drift_check,
-        );
+        )?;
         if min_amount_out_u128 == 0 {
             return Err(BoltzError::Generic(
                 "Amount too small: slippage-adjusted minimum is zero".into(),
@@ -1125,7 +1125,7 @@ impl ReverseSwapExecutor {
             swap.expected_output_amount,
             swap.slippage_bps,
             skip_drift_check,
-        );
+        )?;
         if delivered_floor == 0 {
             return Err(BoltzError::Generic(
                 "Amount too small: slippage-adjusted minimum is zero".into(),
@@ -1370,7 +1370,7 @@ impl ReverseSwapExecutor {
             .nativeFee
             .try_into()
             .map_err(|_| BoltzError::Generic("LZ fee too large".into()))?;
-        let fee_with_slippage = apply_slippage_up(native_fee, u128::from(swap.slippage_bps));
+        let fee_with_slippage = apply_slippage_up(native_fee, u128::from(swap.slippage_bps))?;
 
         // Quote DEX: how much tBTC for the ETH messaging fee
         let fee_dex = pick_best_quote_with_data(
@@ -1446,7 +1446,7 @@ impl ReverseSwapExecutor {
             swap.expected_output_amount,
             swap.slippage_bps,
             skip_drift_check,
-        );
+        )?;
         if min_amount_ld_slipped == 0 {
             return Err(BoltzError::Generic(
                 "Amount too small: cross-chain slippage-adjusted minimum is zero".into(),
@@ -2387,13 +2387,15 @@ async fn sleep_1s() {
 /// tolerance compared to the creation-time estimate. Rejects a swap whose
 /// effective receive amount would drift below `expected * (1 - slippage)`
 /// before we commit the claim transaction.
-#[expect(clippy::arithmetic_side_effects)]
 fn check_quote_drift(
     expected_usd: u64,
     fresh_quote_usd: u128,
     slippage_bps: u32,
 ) -> Result<(), BoltzError> {
-    let threshold = u128::from(expected_usd) * (10000 - u128::from(slippage_bps)) / 10000;
+    let factor = 10000u128
+        .checked_sub(u128::from(slippage_bps))
+        .ok_or_else(|| BoltzError::Generic("slippage_bps exceeds 10000".to_string()))?;
+    let threshold = slippage_mul_div(u128::from(expected_usd), factor)?;
     if fresh_quote_usd < threshold {
         let quoted = fresh_quote_usd.try_into().unwrap_or(u64::MAX);
         return Err(BoltzError::QuoteDegradedBeyondSlippage {
@@ -2404,18 +2406,30 @@ fn check_quote_drift(
     Ok(())
 }
 
+/// `amount * numerator / 10000` with overflow checked rather than wrapping.
+/// The multiplicands can be RPC-controlled u128 quote values, so an absurd
+/// response must surface a bounded error identically in debug and release
+/// rather than silently wrapping (release has no `overflow-checks`).
+fn slippage_mul_div(amount: u128, numerator: u128) -> Result<u128, BoltzError> {
+    amount
+        .checked_mul(numerator)
+        .and_then(|scaled| scaled.checked_div(10000))
+        .ok_or_else(|| BoltzError::Generic("slippage arithmetic overflow".to_string()))
+}
+
 /// Apply slippage upward (for fees that might increase).
 /// Returns `amount * (10000 + slippage_bps) / 10000`.
-#[expect(clippy::arithmetic_side_effects)]
-fn apply_slippage_up(amount: u128, slippage_bps: u128) -> u128 {
-    amount * (10000 + slippage_bps) / 10000
+fn apply_slippage_up(amount: u128, slippage_bps: u128) -> Result<u128, BoltzError> {
+    slippage_mul_div(amount, 10000u128.saturating_add(slippage_bps))
 }
 
 /// Apply slippage downward (for output floors).
 /// Returns `amount * (10000 - slippage_bps) / 10000`.
-#[expect(clippy::arithmetic_side_effects)]
-fn apply_slippage_down(amount: u128, slippage_bps: u32) -> u128 {
-    amount * u128::from(10000u32 - slippage_bps) / 10000
+fn apply_slippage_down(amount: u128, slippage_bps: u32) -> Result<u128, BoltzError> {
+    let factor = 10000u32
+        .checked_sub(slippage_bps)
+        .ok_or_else(|| BoltzError::Generic("slippage_bps exceeds 10000".to_string()))?;
+    slippage_mul_div(amount, u128::from(factor))
 }
 
 /// Compute the on-chain output floor for a claim. In normal mode the
@@ -2431,7 +2445,7 @@ fn compute_claim_floor(
     expected_amount: u64,
     slippage_bps: u32,
     skip_drift_check: bool,
-) -> u128 {
+) -> Result<u128, BoltzError> {
     if skip_drift_check {
         apply_slippage_down(raw_quote, slippage_bps)
     } else {
@@ -2867,22 +2881,25 @@ mod tests {
 
     #[macros::test_all]
     fn apply_slippage_down_zero_bps_is_identity() {
-        assert_eq!(apply_slippage_down(1_000_000, 0), 1_000_000);
+        assert_eq!(apply_slippage_down(1_000_000, 0).unwrap(), 1_000_000);
     }
 
     #[macros::test_all]
     fn apply_slippage_down_one_percent() {
-        assert_eq!(apply_slippage_down(1_000_000, 100), 990_000);
+        assert_eq!(apply_slippage_down(1_000_000, 100).unwrap(), 990_000);
     }
 
     #[macros::test_all]
     fn apply_slippage_down_max_bound() {
-        assert_eq!(apply_slippage_down(1_000_000, MAX_SLIPPAGE_BPS), 950_000);
+        assert_eq!(
+            apply_slippage_down(1_000_000, MAX_SLIPPAGE_BPS).unwrap(),
+            950_000
+        );
     }
 
     #[macros::test_all]
     fn apply_slippage_down_floors_to_zero_for_tiny_amounts() {
-        assert_eq!(apply_slippage_down(1, 100), 0);
+        assert_eq!(apply_slippage_down(1, 100).unwrap(), 0);
     }
 
     #[macros::test_all]
@@ -2892,16 +2909,26 @@ mod tests {
         // `amount * (1 - s)²`. Regression guard against any future
         // re-introduction of per-leg compounding.
         let raw = 1_000_000_u128;
-        let single = apply_slippage_down(raw, 100); // 990_000
-        let compound = apply_slippage_down(single, 100); // 980_100
+        let single = apply_slippage_down(raw, 100).unwrap(); // 990_000
+        let compound = apply_slippage_down(single, 100).unwrap(); // 980_100
         assert_eq!(single, 990_000);
         assert_eq!(compound, 980_100);
         assert!(compound < single);
     }
 
     #[macros::test_all]
+    fn apply_slippage_overflow_errors_instead_of_wrapping() {
+        // A pathological (RPC-controlled) amount near u128::MAX must surface a
+        // bounded error, not wrap silently in release.
+        assert!(apply_slippage_up(u128::MAX, 100).is_err());
+        assert!(apply_slippage_down(u128::MAX, 100).is_err());
+        // Out-of-range slippage can't underflow the factor either.
+        assert!(apply_slippage_down(1_000_000, 10_001).is_err());
+    }
+
+    #[macros::test_all]
     fn apply_slippage_up_one_percent() {
-        assert_eq!(apply_slippage_up(1_000_000, 100), 1_010_000);
+        assert_eq!(apply_slippage_up(1_000_000, 100).unwrap(), 1_010_000);
     }
 
     // ─── Claim floor (promise honoring) ──────────────────────────────
@@ -2913,7 +2940,7 @@ mod tests {
         // which would compound and break the user's promise.
         let expected = 1_000_000_u64;
         let raw = 992_000_u128; // dropped 0.8% from prepare quote, within 1% drift
-        let floor = compute_claim_floor(raw, expected, 100, false);
+        let floor = compute_claim_floor(raw, expected, 100, false).unwrap();
         assert_eq!(floor, 990_000); // expected × 0.99
         assert_ne!(floor, 982_080); // would be raw × 0.99 (the broken case)
     }
@@ -2925,7 +2952,10 @@ mod tests {
         // above that is a bonus.
         let expected = 1_000_000_u64;
         let raw = 1_010_000_u128;
-        assert_eq!(compute_claim_floor(raw, expected, 100, false), 990_000);
+        assert_eq!(
+            compute_claim_floor(raw, expected, 100, false).unwrap(),
+            990_000
+        );
     }
 
     #[macros::test_all]
@@ -2933,14 +2963,14 @@ mod tests {
         // When the drift check is skipped (accept_degraded_quote), the floor
         // is anchored on the live quote so the claim still has a meaningful min.
         let raw = 500_000_u128;
-        assert_eq!(compute_claim_floor(raw, 0, 100, true), 495_000);
+        assert_eq!(compute_claim_floor(raw, 0, 100, true).unwrap(), 495_000);
     }
 
     #[macros::test_all]
     fn claim_floor_zero_expected_in_normal_mode_is_zero() {
         // Defensive: a normal-mode claim with expected=0 returns floor=0,
         // and the call site rejects that as "amount too small".
-        assert_eq!(compute_claim_floor(500_000, 0, 100, false), 0);
+        assert_eq!(compute_claim_floor(500_000, 0, 100, false).unwrap(), 0);
     }
 
     // ─── OFT approval gate tests ─────────────────────────────────────
