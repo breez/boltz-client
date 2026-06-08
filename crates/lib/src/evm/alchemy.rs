@@ -198,7 +198,16 @@ impl AlchemyGasClient {
         }
 
         // TRUST NOTE: We sign Alchemy's returned payloads without independent
-        // verification. Exploiting this requires compromising Alchemy's infrastructure.
+        // verification. In particular the EIP-7702 authorization digest below
+        // is blind-signed — we do NOT reconstruct it to check the delegated
+        // implementation or the embedded chainId (an auth with chainId 0 is
+        // valid on every chain, i.e. cross-chain replayable). Exploiting this
+        // requires compromising Alchemy's infrastructure, and the blast radius
+        // is bounded: the gas-signer EOA never custodies funds (swap output is
+        // swept by the Router straight to the destination and gas is
+        // sponsor-paid), so an attacker-installed delegation has nothing to
+        // drain — UNLESS the EOA is ever funded. Standing rule: never fund the
+        // gas-signer EOA on Arbitrum or any chain sharing its derivation.
 
         // Entry 0: authorization — raw ECDSA sign of signatureRequest.rawPayload
         let auth_entry = &data[0];
