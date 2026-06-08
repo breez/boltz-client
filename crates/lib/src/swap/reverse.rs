@@ -489,6 +489,11 @@ impl ReverseSwapExecutor {
                 other => other,
             })?;
 
+        // The swap id is server-controlled and later interpolated into request
+        // URLs; validate it as a plain alphanumeric token at the point it first
+        // enters, so a hostile id can't reshape a request path downstream.
+        validate_swap_id(&resp.id)?;
+
         if resp.onchain_amount < prepared.estimated_onchain_amount {
             return Err(BoltzError::Generic(format!(
                 "Boltz onchain_amount ({}) less than prepared estimate ({})",
@@ -2340,6 +2345,20 @@ fn to_chain_id_u32(chain_id: u64) -> Result<u32, BoltzError> {
         .map_err(|_| BoltzError::Generic("Chain ID overflow".to_string()))
 }
 
+/// Validate a server-supplied swap id before it is persisted and later
+/// interpolated into request URLs (`v2/swap/{id}`...). Boltz ids are short
+/// alphanumeric tokens; rejecting anything else stops a hostile server from
+/// returning path/query characters that reshape a request path (the fixed base
+/// URL already bounds the host, so this is defense-in-depth).
+fn validate_swap_id(id: &str) -> Result<(), BoltzError> {
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(BoltzError::Generic(format!(
+            "Boltz returned an invalid swap id: {id:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// Pure check behind [`ReverseSwapExecutor::ensure_timeout_margin`]: reject the
 /// swap unless the lockup timeout sits at least [`MIN_TIMEOUT_L1_MARGIN`] L1
 /// blocks above the current L1 height. `saturating_sub` makes a timeout at or
@@ -2577,6 +2596,19 @@ mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
     use super::*;
+
+    #[macros::test_all]
+    fn validate_swap_id_accepts_alphanumeric_rejects_path_chars() {
+        assert!(validate_swap_id("gEzPzETWJGgy").is_ok());
+        assert!(validate_swap_id("abc123XYZ").is_ok());
+        // Empty, path/query separators, and other punctuation are rejected.
+        assert!(validate_swap_id("").is_err());
+        assert!(validate_swap_id("../v2/swap").is_err());
+        assert!(validate_swap_id("id/with/slash").is_err());
+        assert!(validate_swap_id("id?q=1").is_err());
+        assert!(validate_swap_id("id#frag").is_err());
+        assert!(validate_swap_id("id with space").is_err());
+    }
 
     #[macros::test_all]
     fn check_timeout_margin_enforces_l1_headroom() {
