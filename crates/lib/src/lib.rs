@@ -21,7 +21,7 @@ pub use evm::cctp::CctpMessageStatus;
 pub use evm::recipient::is_valid_destination_address;
 pub use keys::EvmKeyManager;
 pub use models::*;
-pub use store::{BoltzStorage, MemoryBoltzStorage};
+pub use store::BoltzStorage;
 
 use api::BoltzApiClient;
 use api::ws::SwapStatusSubscriber;

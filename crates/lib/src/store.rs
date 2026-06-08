@@ -1,3 +1,4 @@
+#[cfg(test)]
 use platform_utils::tokio;
 
 use crate::error::BoltzError;
@@ -6,7 +7,8 @@ use crate::models::BoltzSwap;
 /// Persistence interface for Boltz swap state.
 ///
 /// The boltz crate defines the trait; the caller provides the implementation.
-/// For testing, use `MemoryBoltzStorage`.
+/// (A volatile `MemoryBoltzStorage` exists for the crate's own unit tests only,
+/// gated behind `#[cfg(test)]`, so it is never reachable by an embedder.)
 ///
 /// # Key index durability
 ///
@@ -25,19 +27,29 @@ pub trait BoltzStorage: Send + Sync {
     async fn increment_key_index(&self) -> Result<u32, BoltzError>;
 }
 
-/// In-memory store for testing.
+/// In-memory store for the crate's own unit tests, gated behind `#[cfg(test)]`
+/// so it is compiled only when testing this crate — never in a build where the
+/// crate is a dependency, so an embedder can't reach it.
+///
+/// Its `key_index` lives in a volatile `Mutex<u32>` that resets to 0 on every
+/// process restart, which would violate the [`BoltzStorage`] durability
+/// invariant above (index regression re-derives used preimages — a fund-theft
+/// vector). That is exactly why it must stay test-only.
+#[cfg(test)]
 #[derive(Default)]
 pub struct MemoryBoltzStorage {
     swaps: tokio::sync::Mutex<std::collections::HashMap<String, BoltzSwap>>,
     key_index: tokio::sync::Mutex<u32>,
 }
 
+#[cfg(test)]
 impl MemoryBoltzStorage {
     pub fn new() -> Self {
         Self::default()
     }
 }
 
+#[cfg(test)]
 #[macros::async_trait]
 impl BoltzStorage for MemoryBoltzStorage {
     async fn insert_swap(&self, swap: &BoltzSwap) -> Result<(), BoltzError> {
