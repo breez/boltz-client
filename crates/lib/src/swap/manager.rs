@@ -655,9 +655,28 @@ impl SwapManager {
                 .await
             {
                 Ok(Some(receipt)) if receipt.is_success() => {
-                    tracing::info!(swap_id, tx_hash, "Claim receipt confirmed");
                     if let Ok(Some(mut swap)) = store.get_swap(swap_id).await {
                         apply_delivered_amount(executor, &mut swap, &receipt, tx_hash);
+                        // A Direct swap completes only with positive in-receipt
+                        // evidence that the output token was delivered to the
+                        // destination (the decoded ERC20 transfer, surfaced as
+                        // `delivered_amount`). `claim_tx_hash` comes from the gas
+                        // sponsor; a successful-but-unrelated tx (compromised
+                        // sponsor) lacks that log and must not drive a false
+                        // `Completed`. Without evidence we don't finalize — the
+                        // swap stays in `Claiming`; if the real claim never ran
+                        // the preimage was never revealed and the LN HTLC
+                        // refunds. Bridged swaps gate on confirmed delivery
+                        // downstream (`post_claim_status` -> `confirm_delivery`).
+                        if !direct_completion_has_evidence(&swap) {
+                            tracing::error!(
+                                swap_id,
+                                tx_hash,
+                                "Direct claim receipt missing delivery evidence; not completing"
+                            );
+                            return false;
+                        }
+                        tracing::info!(swap_id, tx_hash, "Claim receipt confirmed");
                         let next = post_claim_status(&swap);
                         update_swap_status(&**store, event_emitter, &mut swap, next).await;
                     }
@@ -943,6 +962,17 @@ fn ws_progress_stage(ws_status: &str) -> Option<BoltzSwapStatus> {
     }
 }
 
+/// Whether a confirmed-success claim receipt is sufficient to mark this swap
+/// `Completed`. A `Direct` swap requires positive in-receipt delivery evidence
+/// (a decoded transfer of the output token to the destination, surfaced as
+/// `delivered_amount`) because `claim_tx_hash` originates from the gas sponsor
+/// and a successful-but-unrelated tx must not drive a false `Completed`. Bridged
+/// swaps don't complete in `poll_receipt` at all (`post_claim_status` holds them
+/// in `Settling`), so they are unaffected here.
+fn direct_completion_has_evidence(swap: &BoltzSwap) -> bool {
+    swap.bridge_kind != BridgeKind::Direct || swap.delivered_amount.is_some()
+}
+
 fn post_claim_status(swap: &BoltzSwap) -> BoltzSwapStatus {
     match swap.bridge_kind {
         BridgeKind::Direct => BoltzSwapStatus::Completed,
@@ -1153,6 +1183,23 @@ mod tests {
     fn direct_completes_immediately() {
         let swap = swap_with(BridgeKind::Direct, None);
         assert_eq!(post_claim_status(&swap), BoltzSwapStatus::Completed);
+    }
+
+    #[macros::test_all]
+    fn direct_completion_requires_delivery_evidence() {
+        // Direct + no decoded transfer log => not enough to complete.
+        let mut direct = swap_with(BridgeKind::Direct, None);
+        direct.delivered_amount = None;
+        assert!(!direct_completion_has_evidence(&direct));
+
+        // Direct + decoded delivered amount => evidence present, may complete.
+        direct.delivered_amount = Some(71_000_000);
+        assert!(direct_completion_has_evidence(&direct));
+
+        // Bridged swaps aren't gated by this predicate (they hold in Settling
+        // and complete only via confirmed delivery), so it's vacuously true.
+        let oft = swap_with(BridgeKind::Oft, None);
+        assert!(direct_completion_has_evidence(&oft));
     }
 
     #[macros::test_all]
