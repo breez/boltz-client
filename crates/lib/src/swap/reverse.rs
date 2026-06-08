@@ -843,8 +843,10 @@ impl ReverseSwapExecutor {
                     // The claim was already broadcast (preimage public) but the
                     // confirmation poll failed. Re-submitting would broadcast a
                     // second, reverting claim. Stop here; the call_id is
-                    // persisted, so the manager recovers the tx hash via
-                    // `resume_pending_call` / on-chain rescan.
+                    // persisted and the swap stays in `Claiming`. Boltz's
+                    // `invoice.settled` WS event then drives `resume_pending_call`
+                    // to re-resolve the tx hash (falling back to the on-chain
+                    // lock-state check in `check_on_chain_and_retry`).
                     if matches!(e, BoltzError::ClaimBroadcastUnconfirmed { .. }) {
                         tracing::warn!(
                             attempt,

@@ -43,8 +43,11 @@ pub enum BoltzError {
     /// The claim `UserOp` was broadcast (`wallet_sendPreparedCalls` returned a
     /// `call_id`, so the preimage is already on-chain) but the confirming poll
     /// failed transiently. The claim must NOT be re-submitted — doing so would
-    /// broadcast a second, reverting claim. The `call_id` is persisted; the
-    /// manager recovers the tx hash via `resume_pending_call` / on-chain rescan.
+    /// broadcast a second, reverting claim. The swap stays in `Claiming` with
+    /// the `call_id` persisted; when Boltz sends the `invoice.settled` WS event
+    /// the manager re-resolves it via `resume_pending_call` (and, if that still
+    /// can't reach the sponsor, the on-chain lock-state check in
+    /// `check_on_chain_and_retry`).
     #[error("Claim broadcast but unconfirmed (call_id {call_id}); awaiting recovery")]
     ClaimBroadcastUnconfirmed { call_id: String },
 
