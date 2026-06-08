@@ -254,6 +254,29 @@ impl SwapManager {
             return;
         }
 
+        // Monotonicity guard: ignore a forward-progress WS event that maps to an
+        // earlier lifecycle stage than the swap has already reached. This
+        // generalizes the terminal/Settling short-circuits above to the
+        // intermediate states, so a late or replayed `invoice.paid` can't demote
+        // an already-advanced (e.g. `Claiming`) swap back to `InvoicePaid` —
+        // which would strip the `handle_terminal_ws_event` `Claiming` re-check
+        // from a subsequent terminal event and let it finalize (and drop) a
+        // successful, preimage-revealed claim. `transaction.confirmed` is
+        // intentionally NOT covered (it is status-aware: it resumes a `Claiming`
+        // swap rather than regressing it) — see `ws_progress_stage`.
+        if let Some(stage) = ws_progress_stage(update.status.as_str())
+            && stage < swap.status
+        {
+            tracing::debug!(
+                swap_id,
+                ws_status = update.status,
+                event_stage = ?stage,
+                current = ?swap.status,
+                "Ignoring stale forward-progress WS event that would regress status"
+            );
+            return;
+        }
+
         tracing::info!(
             swap_id,
             local_status = ?swap.status,
@@ -899,6 +922,27 @@ fn delivered_and_ref(decoded: DeliveredAmount, tx_hash: &str) -> (Option<u64>, O
 /// emit one), the swap still holds in `Settling` rather than falsely completing;
 /// `confirm_delivery` will log that it can't track it. This is the safe failure
 /// mode: a stuck-but-honest `Settling` beats a "Completed" we never verified.
+/// Lifecycle stage a forward-progress WS status corresponds to, for the
+/// monotonicity guard in `handle_ws_update`. Returns `None` for events that are
+/// not pure forward-progress and must reach the status match on their own:
+///
+/// - `transaction.confirmed` — status-aware (resumes a `Claiming` swap; would be
+///   wrongly suppressed if gated by its `TbtcLocked` stage).
+/// - `transaction.mempool` — records `lockup_tx_id` only, never changes status.
+/// - `invoice.settled` / `transaction.claimed` and the terminal events — gated
+///   by their own on-chain re-checks / short-circuits, not by stage ordering.
+/// - unknown statuses — handled by the catch-all arm.
+///
+/// Only the events that unconditionally *set* a forward status are mapped, so a
+/// stale/replayed one cannot regress an already-advanced swap.
+fn ws_progress_stage(ws_status: &str) -> Option<BoltzSwapStatus> {
+    match ws_status {
+        "swap.created" | "invoice.set" | "invoice.pending" => Some(BoltzSwapStatus::Created),
+        "invoice.paid" => Some(BoltzSwapStatus::InvoicePaid),
+        _ => None,
+    }
+}
+
 fn post_claim_status(swap: &BoltzSwap) -> BoltzSwapStatus {
     match swap.bridge_kind {
         BridgeKind::Direct => BoltzSwapStatus::Completed,
@@ -1109,6 +1153,39 @@ mod tests {
     fn direct_completes_immediately() {
         let swap = swap_with(BridgeKind::Direct, None);
         assert_eq!(post_claim_status(&swap), BoltzSwapStatus::Completed);
+    }
+
+    #[macros::test_all]
+    fn ws_progress_stage_maps_only_pure_progress_events() {
+        use BoltzSwapStatus::{Created, InvoicePaid};
+        assert_eq!(ws_progress_stage("swap.created"), Some(Created));
+        assert_eq!(ws_progress_stage("invoice.set"), Some(Created));
+        assert_eq!(ws_progress_stage("invoice.pending"), Some(Created));
+        assert_eq!(ws_progress_stage("invoice.paid"), Some(InvoicePaid));
+
+        // Status-aware / self-gated / metadata-only events are NOT gated by
+        // stage ordering — they must reach the match.
+        assert_eq!(ws_progress_stage("transaction.confirmed"), None);
+        assert_eq!(ws_progress_stage("transaction.mempool"), None);
+        assert_eq!(ws_progress_stage("invoice.settled"), None);
+        assert_eq!(ws_progress_stage("swap.expired"), None);
+        assert_eq!(ws_progress_stage("transaction.refunded"), None);
+        assert_eq!(ws_progress_stage("garbage"), None);
+    }
+
+    #[macros::test_all]
+    fn monotonicity_guard_drops_stale_invoice_paid_but_keeps_forward() {
+        // The guard ignores the event iff its mapped stage is strictly below the
+        // swap's current status. This is the BC-02 fix: a replayed `invoice.paid`
+        // must not regress a `TbtcLocked`/`Claiming` swap.
+        // The guard ignores the event iff `stage < swap.status`.
+        let stage = ws_progress_stage("invoice.paid").unwrap();
+        assert!(stage < BoltzSwapStatus::TbtcLocked); // -> ignored
+        assert!(stage < BoltzSwapStatus::Claiming); //   -> ignored
+        // Legitimate forward transition Created -> InvoicePaid is NOT ignored.
+        assert!(stage >= BoltzSwapStatus::Created);
+        // A swap already at InvoicePaid: equal, not below -> falls through (no-op).
+        assert!(stage >= BoltzSwapStatus::InvoicePaid);
     }
 
     #[macros::test_all]

@@ -81,7 +81,18 @@ pub struct BoltzSwap {
     pub updated_at: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// Lifecycle status of a reverse swap.
+///
+/// **Variant order is load-bearing.** The derived `PartialOrd`/`Ord` follow
+/// declaration order, and the swap manager's WS monotonicity guard
+/// (`handle_ws_update` -> `ws_progress_stage`) relies on the non-terminal
+/// progression `Created < InvoicePaid < TbtcLocked < Claiming < Settling` to
+/// reject a stale/replayed forward-progress event that would regress an
+/// already-advanced swap. Do NOT reorder these variants without updating that
+/// guard; the ordering is pinned by `status_order_is_monotonic`. (Terminal
+/// variants are never compared by the guard — they short-circuit earlier — so
+/// their relative order is irrelevant.)
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BoltzSwapStatus {
     /// Swap created on Boltz, invoice ready to pay.
     Created,
@@ -525,6 +536,19 @@ mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
     use super::*;
+
+    #[macros::test_all]
+    fn status_order_is_monotonic() {
+        // Pins the non-terminal lifecycle progression the WS monotonicity guard
+        // relies on (see `BoltzSwapStatus` doc + `ws_progress_stage`). If a
+        // refactor reorders the variants, this fails loudly instead of silently
+        // letting a stale `invoice.paid` regress an advanced swap.
+        use BoltzSwapStatus::{Claiming, Created, InvoicePaid, Settling, TbtcLocked};
+        assert!(Created < InvoicePaid);
+        assert!(InvoicePaid < TbtcLocked);
+        assert!(TbtcLocked < Claiming);
+        assert!(Claiming < Settling);
+    }
 
     #[macros::test_all]
     fn test_swap_status_terminal() {
