@@ -443,6 +443,18 @@ impl ReverseSwapExecutor {
         if current_unix_timestamp() >= prepared.expires_at {
             return Err(BoltzError::QuoteExpired);
         }
+
+        // Re-validate the caller-supplied `PreparedSwap` against the registry
+        // and bounds. `prepare()` validated these, but `PreparedSwap` is public
+        // and its fields are too, so a hand-built or stale value could carry a
+        // destination not in the registry, an address the per-transport encoder
+        // rejects, or out-of-range slippage. Fail fast here — before the Boltz
+        // create call issues an invoice — rather than surfacing only at claim
+        // time (after the LN HTLC may already be funded).
+        let dest = self.resolve_destination(&prepared.destination_chain, prepared.asset)?;
+        self.validate_destination(dest, &prepared.destination_address)?;
+        resolve_slippage_bps(Some(prepared.slippage_bps), self.config.slippage_bps)?;
+
         let chain_id_u32 = to_chain_id_u32(self.config.chain_id)?;
         let gas_signer = self.key_manager.derive_gas_signer(chain_id_u32)?;
 
