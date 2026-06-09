@@ -30,6 +30,7 @@ use evm::oft::fetch_chain_registry;
 use evm::provider::EvmProvider;
 use evm::signing::EvmSigner;
 use solana::rpc::SolanaRpcClient;
+use swap::locks::SwapLocks;
 use swap::manager::SwapManager;
 use swap::reverse::{ReverseSwapExecutor, current_unix_timestamp, resolve_slippage_bps};
 
@@ -53,6 +54,11 @@ pub struct BoltzService {
     event_emitter: Arc<EventEmitter>,
     ws_subscriber: Arc<SwapStatusSubscriber>,
     chain_registry: Arc<DestinationRegistry>,
+    /// Per-swap serialization, shared with the background [`SwapManager`] loop.
+    /// The caller-facing mutators (`accept_degraded_quote`,
+    /// `update_swap_slippage`, `refresh_pending_deliveries`) acquire the swap's
+    /// lock so they never race the loop's handler for the same swap.
+    swap_locks: Arc<SwapLocks>,
 }
 
 impl BoltzService {
@@ -156,12 +162,14 @@ impl BoltzService {
         ));
 
         let event_emitter = Arc::new(EventEmitter::new());
+        let swap_locks = Arc::new(SwapLocks::new());
 
         let swap_manager = SwapManager::start(
             executor.clone(),
             store.clone(),
             event_emitter.clone(),
             ws_subscriber.clone(),
+            swap_locks.clone(),
             ws_rx,
             delivery_poll_interval_secs,
         );
@@ -173,6 +181,7 @@ impl BoltzService {
             event_emitter,
             ws_subscriber,
             chain_registry,
+            swap_locks,
         })
     }
 
@@ -208,7 +217,13 @@ impl BoltzService {
     /// drive confirmation when background polling is disabled (`None`), or to
     /// force an immediate check.
     pub async fn refresh_pending_deliveries(&self) -> Result<(), BoltzError> {
-        swap::manager::poll_settling_swaps(&self.executor, &self.store, &self.event_emitter).await;
+        swap::manager::poll_settling_swaps(
+            &self.executor,
+            &self.store,
+            &self.event_emitter,
+            &self.swap_locks,
+        )
+        .await;
         Ok(())
     }
 
@@ -357,6 +372,13 @@ impl BoltzService {
     /// proceed with the current DEX quote (with on-chain slippage protection
     /// still applied).
     pub async fn accept_degraded_quote(&self, swap_id: &str) -> Result<BoltzSwap, BoltzError> {
+        // Serialize against the manager loop's claim handler for this swap: the
+        // guard is held across the read, the claim, and the persist, so this
+        // forced claim cannot run concurrently with an in-flight `do_claim` and
+        // submit a second, competing gas-sponsored claim tx (or clobber the
+        // persisted `claim_tx_hash`).
+        let _guard = self.swap_locks.lock(swap_id).await;
+
         let mut swap = self
             .store
             .get_swap(swap_id)
@@ -415,6 +437,10 @@ impl BoltzService {
         slippage_bps: u32,
     ) -> Result<BoltzSwap, BoltzError> {
         let bps = resolve_slippage_bps(Some(slippage_bps), self.executor.config.slippage_bps)?;
+
+        // Serialize the read-modify-write against the manager loop so this
+        // whole-record update can't clobber a status the loop wrote in between.
+        let _guard = self.swap_locks.lock(swap_id).await;
 
         let mut swap = self
             .store

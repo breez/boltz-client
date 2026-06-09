@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use platform_utils::tokio;
 use tokio::sync::{Mutex, mpsc, watch};
+use tokio::task::JoinSet;
 
 use crate::api::ws::{SwapStatusSubscriber, SwapStatusUpdate};
 use crate::config::CCTP_MESSAGE_TRANSMITTER_V2;
@@ -15,7 +16,13 @@ use crate::evm::lockup::is_swap_still_locked_by_swap;
 use crate::evm::provider::TxReceipt;
 use crate::models::{BoltzSwap, BoltzSwapStatus, Bridge, BridgeKind};
 use crate::store::BoltzStorage;
+use crate::swap::locks::SwapLocks;
 use crate::swap::reverse::{ReverseSwapExecutor, current_unix_timestamp};
+
+/// Shared WS-subscription set: the event loop inserts on track, and the spawned
+/// per-swap handlers remove on terminal cleanup. Guarded by an async mutex held
+/// only for the brief set operation, never across an `.await`.
+type TrackedIds = Arc<Mutex<HashSet<String>>>;
 
 /// Maximum number of receipt-poll attempts for a `Claiming` swap (5s * 60 = 5min).
 /// If the receipt is still not found after this, the loop iteration exits and
@@ -27,17 +34,20 @@ const RECEIPT_POLL_INTERVAL_SECS: u64 = 5;
 
 /// Background swap manager.
 ///
-/// Owns a single event loop that:
-/// - Receives WebSocket status updates for all tracked swaps.
-/// - Progresses each swap through its state machine.
-/// - Runs claim/receipt-poll operations inline (blocking the loop).
+/// Owns a single event loop that acts as a **dispatcher**: it receives
+/// WebSocket status updates and the delivery-poll tick, and spawns the actual
+/// per-swap work (claim, receipt poll, on-chain checks, delivery confirmation)
+/// into a `JoinSet` so different swaps progress in parallel and one swap's slow
+/// operation never blocks another's update.
 ///
-/// NOTE: All reactions (claiming, receipt polling, on-chain checks) run inline
-/// in the event loop. This keeps the code simple and race-free but means a slow
-/// operation blocks processing of other swap updates. If this is ever used as a
-/// backend relay serving many concurrent swaps, consider spawning these
-/// operations into a `JoinSet` so they run in parallel while still being owned
-/// by the loop for proper cancellation and error propagation.
+/// Concurrency model: **serialize per swap, parallelize across swaps.** Every
+/// spawned handler — and the caller-facing `accept_degraded_quote` /
+/// `update_swap_slippage` / `refresh_pending_deliveries` paths — holds the
+/// swap's [`SwapLocks`] entry across its `get → mutate → persist` sequence, so
+/// concurrent work on one swap is serialized (the load-bearing guard against
+/// the whole-record `update_swap` clobbering a field, and against two competing
+/// claim txs) while distinct swaps never block each other. See the 2026-06-09
+/// decision-log entry.
 pub(crate) struct SwapManager {
     store: Arc<dyn BoltzStorage>,
     /// Channel for sending swap IDs to track.
@@ -59,6 +69,7 @@ impl SwapManager {
         store: Arc<dyn BoltzStorage>,
         event_emitter: Arc<EventEmitter>,
         ws_subscriber: Arc<SwapStatusSubscriber>,
+        swap_locks: Arc<SwapLocks>,
         ws_rx: mpsc::Receiver<SwapStatusUpdate>,
         delivery_poll_interval_secs: Option<u64>,
     ) -> Self {
@@ -70,6 +81,7 @@ impl SwapManager {
             store.clone(),
             event_emitter,
             ws_subscriber,
+            swap_locks,
             ws_rx,
             cmd_rx,
             shutdown_rx,
@@ -129,13 +141,29 @@ impl SwapManager {
         store: Arc<dyn BoltzStorage>,
         event_emitter: Arc<EventEmitter>,
         ws_subscriber: Arc<SwapStatusSubscriber>,
+        swap_locks: Arc<SwapLocks>,
         mut ws_rx: mpsc::Receiver<SwapStatusUpdate>,
         mut cmd_rx: mpsc::Receiver<String>,
         mut shutdown_rx: watch::Receiver<()>,
         delivery_poll_interval_secs: Option<u64>,
     ) {
-        // Swap IDs currently being tracked (for WS dispatch filtering).
-        let mut tracked_ids: HashSet<String> = HashSet::new();
+        // One unit of dispatched work, produced by the `select!` and acted on
+        // afterwards so no spawned task borrows `tasks` across the select.
+        enum Step {
+            Stop,
+            DeliveryTick,
+            Ws(SwapStatusUpdate),
+            Track(String),
+        }
+
+        // Swap IDs currently tracked (for WS dispatch filtering). Shared with
+        // the spawned handlers, which remove their swap on terminal cleanup.
+        let tracked_ids: TrackedIds = Arc::new(Mutex::new(HashSet::new()));
+
+        // In-flight per-swap work. The loop only dispatches; each WS handler and
+        // delivery poll runs here under its swap's lock, so one swap's slow
+        // operation (e.g. a multi-minute receipt poll) never blocks another.
+        let mut tasks: JoinSet<()> = JoinSet::new();
 
         // Background delivery-confirmation ticker. `None` disables it (callers
         // drive confirmation via `refresh_pending_deliveries`). The first tick
@@ -148,50 +176,80 @@ impl SwapManager {
         });
 
         loop {
-            tokio::select! {
-                _ = shutdown_rx.changed() => break,
+            // Reap finished handlers so the JoinSet stays bounded by in-flight
+            // work rather than total work ever dispatched.
+            while tasks.try_join_next().is_some() {}
+
+            let step = tokio::select! {
+                _ = shutdown_rx.changed() => Step::Stop,
                 () = async {
                     match delivery_ticker.as_mut() {
                         Some(t) => { t.tick().await; }
                         None => std::future::pending::<()>().await,
                     }
-                } => {
-                    poll_settling_swaps(&executor, &store, &event_emitter).await;
+                } => Step::DeliveryTick,
+                update = ws_rx.recv() => match update {
+                    Some(u) => Step::Ws(u),
+                    None => Step::Stop,
+                },
+                cmd = cmd_rx.recv() => match cmd {
+                    Some(id) => Step::Track(id),
+                    None => Step::Stop,
+                },
+            };
+
+            match step {
+                Step::Stop => break,
+                Step::DeliveryTick => {
+                    let executor = executor.clone();
+                    let store = store.clone();
+                    let event_emitter = event_emitter.clone();
+                    let swap_locks = swap_locks.clone();
+                    tasks.spawn(async move {
+                        poll_settling_swaps(&executor, &store, &event_emitter, &swap_locks).await;
+                    });
                 }
-                should_break = async {
-                    let Some(update) = ws_rx.recv().await else { return true };
-                    if !tracked_ids.contains(&update.swap_id) {
+                Step::Ws(update) => {
+                    if !tracked_ids.lock().await.contains(&update.swap_id) {
                         tracing::warn!(boltz_id = update.swap_id, "WS update for untracked swap");
-                        return false;
+                        continue;
                     }
-                    Self::handle_ws_update(
-                        &executor,
-                        &store,
-                        &event_emitter,
-                        &ws_subscriber,
-                        &mut tracked_ids,
-                        &update,
-                    ).await;
-                    false
-                } => {
-                    if should_break { break; }
+                    let executor = executor.clone();
+                    let store = store.clone();
+                    let event_emitter = event_emitter.clone();
+                    let ws_subscriber = ws_subscriber.clone();
+                    let swap_locks = swap_locks.clone();
+                    let tracked_ids = tracked_ids.clone();
+                    tasks.spawn(async move {
+                        // Hold the swap's lock across the whole handler so a
+                        // second event for the same swap — or a caller-driven
+                        // claim — runs strictly after this one, on re-read state.
+                        let _guard = swap_locks.lock(&update.swap_id).await;
+                        Self::handle_ws_update(
+                            &executor,
+                            &store,
+                            &event_emitter,
+                            &ws_subscriber,
+                            &tracked_ids,
+                            &update,
+                        )
+                        .await;
+                    });
                 }
-                cmd = cmd_rx.recv() => {
-                    match cmd {
-                        Some(swap_id) => {
-                            if let Err(e) = Self::start_tracking(
-                                &ws_subscriber,
-                                &mut tracked_ids,
-                                &swap_id,
-                            ).await {
-                                tracing::error!(swap_id, error = %e, "Failed to start tracking swap");
-                            }
-                        }
-                        None => break,
+                Step::Track(swap_id) => {
+                    if let Err(e) =
+                        Self::start_tracking(&ws_subscriber, &tracked_ids, &swap_id).await
+                    {
+                        tracing::error!(swap_id, error = %e, "Failed to start tracking swap");
                     }
                 }
             }
         }
+
+        // Graceful shutdown: let in-flight per-swap work finish. This matches
+        // the old inline loop, where a running handler could not be interrupted
+        // by the shutdown signal anyway. `Drop` aborts as the hard backstop.
+        while tasks.join_next().await.is_some() {}
 
         tracing::info!("SwapManager event loop exiting");
     }
@@ -202,10 +260,10 @@ impl SwapManager {
     /// here because another instance may have progressed the swap.
     async fn start_tracking(
         ws_subscriber: &Arc<SwapStatusSubscriber>,
-        tracked_ids: &mut HashSet<String>,
+        tracked_ids: &TrackedIds,
         swap_id: &str,
     ) -> Result<(), BoltzError> {
-        tracked_ids.insert(swap_id.to_string());
+        tracked_ids.lock().await.insert(swap_id.to_string());
         ws_subscriber.subscribe(swap_id).await?;
         Ok(())
     }
@@ -217,7 +275,7 @@ impl SwapManager {
         store: &Arc<dyn BoltzStorage>,
         event_emitter: &Arc<EventEmitter>,
         ws_subscriber: &Arc<SwapStatusSubscriber>,
-        tracked_ids: &mut HashSet<String>,
+        tracked_ids: &TrackedIds,
         update: &SwapStatusUpdate,
     ) {
         let swap_id = &update.swap_id;
@@ -526,7 +584,7 @@ impl SwapManager {
         store: &Arc<dyn BoltzStorage>,
         event_emitter: &EventEmitter,
         ws_subscriber: &SwapStatusSubscriber,
-        tracked_ids: &mut HashSet<String>,
+        tracked_ids: &TrackedIds,
         swap: &mut BoltzSwap,
         terminal_status: BoltzSwapStatus,
     ) {
@@ -846,11 +904,11 @@ impl SwapManager {
     /// reaches a terminal state.
     async fn cleanup_terminal(
         ws_subscriber: &SwapStatusSubscriber,
-        tracked_ids: &mut HashSet<String>,
+        tracked_ids: &TrackedIds,
         swap_id: &str,
     ) {
         ws_subscriber.unsubscribe(swap_id).await;
-        tracked_ids.remove(swap_id);
+        tracked_ids.lock().await.remove(swap_id);
     }
 }
 
@@ -996,6 +1054,7 @@ pub(crate) async fn poll_settling_swaps(
     executor: &ReverseSwapExecutor,
     store: &Arc<dyn BoltzStorage>,
     event_emitter: &EventEmitter,
+    swap_locks: &SwapLocks,
 ) {
     let swaps = match store.list_active_swaps().await {
         Ok(s) => s,
@@ -1008,6 +1067,12 @@ pub(crate) async fn poll_settling_swaps(
         .into_iter()
         .filter(|s| s.status == BoltzSwapStatus::Settling)
     {
+        // Serialize against any other work on this swap (a concurrent delivery
+        // poll from `refresh_pending_deliveries`, or a claim handler). The
+        // snapshot's bridge_ref/bridge_kind are fixed post-claim, so querying
+        // delivery off it is safe; the eventual status write re-reads under the
+        // lock in `finalize_completed`.
+        let _guard = swap_locks.lock(&swap.id).await;
         confirm_delivery(executor, store, event_emitter, &swap).await;
     }
 }
