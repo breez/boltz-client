@@ -125,17 +125,19 @@ impl AlchemyGasClient {
 
     /// Step 2: Sign the prepared calls and send via `wallet_sendPreparedCalls`.
     async fn sign_and_send(&self, prepared: serde_json::Value) -> Result<String, BoltzError> {
+        // Log only the response shape, never the payload: the prepared/signed
+        // blobs embed the claim UserOp callData, whose leading ABI argument is
+        // the HTLC preimage — a live settlement secret that must not reach logs
+        // (this runs before the claim is even broadcast).
         tracing::debug!(
-            prepared = %serde_json::to_string_pretty(&prepared).unwrap_or_default(),
+            response_type = prepared
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("unknown"),
             "wallet_prepareCalls response"
         );
 
         let signed = self.sign_prepared_response(&prepared)?;
-
-        tracing::debug!(
-            signed = %serde_json::to_string_pretty(&signed).unwrap_or_default(),
-            "Signed payload for wallet_sendPreparedCalls"
-        );
 
         let result: SendPreparedCallsResponse = self
             .rpc_call("wallet_sendPreparedCalls", serde_json::json!([signed]))
