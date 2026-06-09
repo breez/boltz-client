@@ -696,12 +696,12 @@ impl SwapManager {
         }
     }
 
-    /// Poll `eth_get_transaction_receipt` for a known tx hash. On success, set
-    /// the post-claim status. On revert, re-check the on-chain lock before
-    /// finalizing: a reverted tx with a still-claimable lockup is retried (the
-    /// preimage was never revealed), not failed, so recoverable tBTC isn't
-    /// stranded; only a provably-spent lockup finalizes `Failed`.
-    /// Returns `true` if a terminal state was reached.
+    /// Poll `eth_get_transaction_receipt` for a known tx hash until it resolves
+    /// to a success or revert, or the attempt budget is exhausted. A
+    /// mined-but-ambiguous (absent/unknown status) or transient-error result
+    /// keeps polling — only an explicit success/revert is acted on. Returns
+    /// `true` if a terminal state was reached. See `apply_successful_receipt`
+    /// and `recover_from_reverted_receipt` for the per-outcome handling.
     async fn poll_receipt(
         executor: &ReverseSwapExecutor,
         store: &Arc<dyn BoltzStorage>,
@@ -716,113 +716,37 @@ impl SwapManager {
                 .await
             {
                 Ok(Some(receipt)) if receipt.is_success() => {
-                    if let Ok(Some(mut swap)) = store.get_swap(swap_id).await {
-                        apply_delivered_amount(executor, &mut swap, &receipt, tx_hash);
-                        // A Direct swap completes only with positive in-receipt
-                        // evidence that the output token was delivered to the
-                        // destination (the decoded ERC20 transfer, surfaced as
-                        // `delivered_amount`). `claim_tx_hash` comes from the gas
-                        // sponsor; a successful-but-unrelated tx (compromised
-                        // sponsor) lacks that log and must not drive a false
-                        // `Completed`. Without evidence we don't finalize — the
-                        // swap stays in `Claiming`; if the real claim never ran
-                        // the preimage was never revealed and the LN HTLC
-                        // refunds. Bridged swaps gate on confirmed delivery
-                        // downstream (`post_claim_status` -> `confirm_delivery`).
-                        if !direct_completion_has_evidence(&swap) {
-                            tracing::error!(
-                                swap_id,
-                                tx_hash,
-                                "Direct claim receipt missing delivery evidence; not completing"
-                            );
-                            return false;
-                        }
-                        tracing::info!(swap_id, tx_hash, "Claim receipt confirmed");
-                        let next = post_claim_status(&swap);
-                        update_swap_status(&**store, event_emitter, &mut swap, next).await;
-                    }
-                    return true;
-                }
-                Ok(Some(receipt)) if receipt.is_reverted() => {
-                    tracing::error!(swap_id, tx_hash, "Claim tx reverted");
-                    let Ok(Some(mut swap)) = store.get_swap(swap_id).await else {
-                        // Can't load the swap to re-check the lock; don't finalize
-                        // on the reverted receipt alone — keep it tracked for retry.
-                        return false;
-                    };
-                    // A reverted claim tx does NOT by itself mean the swap failed:
-                    // the lockup may still be claimable (this tx never revealed the
-                    // preimage — a slippage revert, or a stale/wrong persisted
-                    // hash). Marking `Failed` then drops the swap and strands
-                    // recoverable tBTC until it refunds to Boltz. Re-check the
-                    // on-chain lock first, mirroring `handle_terminal_ws_event` and
-                    // the no-hash `invoice.settled` path.
-                    match is_swap_still_locked_by_swap(
-                        &executor.evm_provider,
-                        &swap,
-                        &executor.key_manager,
+                    return Self::apply_successful_receipt(
+                        executor,
+                        store,
+                        event_emitter,
+                        swap_id,
+                        tx_hash,
+                        &receipt,
                     )
-                    .await
-                    {
-                        Ok(true) => {
-                            // Still claimable: the preimage was never revealed.
-                            // Drop the dead hash and retry the claim rather than
-                            // failing. Runs under this swap's lock, so it cannot
-                            // race a competing claim.
-                            tracing::warn!(
-                                swap_id,
-                                tx_hash,
-                                "Claim tx reverted but lockup still claimable; retrying claim"
-                            );
-                            swap.claim_tx_hash = None;
-                            Self::do_claim(executor, store, event_emitter, &mut swap, false).await;
-                            return false;
-                        }
-                        Ok(false) => {
-                            // Lockup no longer claimable while *our* tx reverted —
-                            // it was spent elsewhere (timeout refund to Boltz), so
-                            // no recoverable funds remain. Finalize `Failed`.
-                            update_swap_status(
-                                &**store,
-                                event_emitter,
-                                &mut swap,
-                                BoltzSwapStatus::Failed {
-                                    reason: "Claim transaction reverted".to_string(),
-                                },
-                            )
-                            .await;
-                            return true;
-                        }
-                        Err(e) => {
-                            // Couldn't read the lock — don't finalize blindly. Keep
-                            // tracking; the next WS event or `resume_all` retries.
-                            tracing::warn!(
-                                swap_id,
-                                error = %e,
-                                "Claim reverted and lock check failed; leaving swap for retry"
-                            );
-                            return false;
-                        }
-                    }
-                }
-                // Mined but status neither success nor revert (absent/unknown):
-                // never infer a terminal state from an ambiguous receipt — keep
-                // polling, same as not-yet-mined.
-                Ok(_) => {
-                    if attempt < RECEIPT_POLL_MAX_ATTEMPTS.saturating_sub(1) {
-                        platform_utils::tokio::time::sleep(
-                            platform_utils::time::Duration::from_secs(RECEIPT_POLL_INTERVAL_SECS),
-                        )
-                        .await;
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(swap_id, attempt, error = %e, "Receipt poll failed");
-                    platform_utils::tokio::time::sleep(platform_utils::time::Duration::from_secs(
-                        RECEIPT_POLL_INTERVAL_SECS,
-                    ))
                     .await;
                 }
+                Ok(Some(receipt)) if receipt.is_reverted() => {
+                    return Self::recover_from_reverted_receipt(
+                        executor,
+                        store,
+                        event_emitter,
+                        swap_id,
+                        tx_hash,
+                    )
+                    .await;
+                }
+                // Not yet mined, or mined with an absent/unknown status: never
+                // infer a terminal state from an ambiguous receipt — keep polling.
+                Ok(_) => {}
+                Err(e) => tracing::warn!(swap_id, attempt, error = %e, "Receipt poll failed"),
+            }
+
+            if attempt < RECEIPT_POLL_MAX_ATTEMPTS.saturating_sub(1) {
+                platform_utils::tokio::time::sleep(platform_utils::time::Duration::from_secs(
+                    RECEIPT_POLL_INTERVAL_SECS,
+                ))
+                .await;
             }
         }
 
@@ -830,6 +754,108 @@ impl SwapManager {
         // On process restart, `resume_all` re-triggers the poll.
         tracing::warn!(swap_id, tx_hash, "Receipt poll timed out, waiting for WS");
         false
+    }
+
+    /// Handle a confirmed-success claim receipt: record the delivered amount and
+    /// advance to the post-claim status. Returns `true` once the swap reached
+    /// its post-claim state; `false` if a `Direct` receipt lacked delivery
+    /// evidence, leaving the swap in `Claiming` (see below).
+    async fn apply_successful_receipt(
+        executor: &ReverseSwapExecutor,
+        store: &Arc<dyn BoltzStorage>,
+        event_emitter: &EventEmitter,
+        swap_id: &str,
+        tx_hash: &str,
+        receipt: &TxReceipt,
+    ) -> bool {
+        let Ok(Some(mut swap)) = store.get_swap(swap_id).await else {
+            return true;
+        };
+        apply_delivered_amount(executor, &mut swap, receipt, tx_hash);
+        // A Direct swap completes only with positive in-receipt evidence that the
+        // output token was delivered to the destination (the decoded ERC20
+        // transfer, surfaced as `delivered_amount`). `claim_tx_hash` comes from
+        // the gas sponsor; a successful-but-unrelated tx (compromised sponsor)
+        // lacks that log and must not drive a false `Completed`. Without evidence
+        // we don't finalize — the swap stays in `Claiming`; if the real claim
+        // never ran the preimage was never revealed and the LN HTLC refunds.
+        // Bridged swaps gate on confirmed delivery downstream
+        // (`post_claim_status` -> `confirm_delivery`).
+        if !direct_completion_has_evidence(&swap) {
+            tracing::error!(
+                swap_id,
+                tx_hash,
+                "Direct claim receipt missing delivery evidence; not completing"
+            );
+            return false;
+        }
+        tracing::info!(swap_id, tx_hash, "Claim receipt confirmed");
+        let next = post_claim_status(&swap);
+        update_swap_status(&**store, event_emitter, &mut swap, next).await;
+        true
+    }
+
+    /// Handle a reverted claim receipt without stranding recoverable funds.
+    ///
+    /// A revert does NOT by itself mean the swap failed: the lockup may still be
+    /// claimable (this tx never revealed the preimage — a slippage revert, or a
+    /// stale/wrong persisted hash), in which case marking `Failed` would drop the
+    /// swap and strand recoverable tBTC until it refunds to Boltz. So re-check
+    /// the on-chain lock first, mirroring `handle_terminal_ws_event` and the
+    /// no-hash `invoice.settled` path:
+    /// - **still locked** → drop the dead hash and retry the claim (runs under
+    ///   this swap's lock, so it cannot race a competing claim);
+    /// - **spent** → it was spent elsewhere (timeout refund to Boltz), so no
+    ///   recoverable funds remain — finalize `Failed`;
+    /// - **lock unreadable** → don't finalize blindly; keep the swap tracked for
+    ///   the next WS event / `resume_all`.
+    ///
+    /// Returns `true` if a terminal state was reached.
+    async fn recover_from_reverted_receipt(
+        executor: &ReverseSwapExecutor,
+        store: &Arc<dyn BoltzStorage>,
+        event_emitter: &EventEmitter,
+        swap_id: &str,
+        tx_hash: &str,
+    ) -> bool {
+        tracing::error!(swap_id, tx_hash, "Claim tx reverted");
+        let Ok(Some(mut swap)) = store.get_swap(swap_id).await else {
+            return false;
+        };
+        match is_swap_still_locked_by_swap(&executor.evm_provider, &swap, &executor.key_manager)
+            .await
+        {
+            Ok(true) => {
+                tracing::warn!(
+                    swap_id,
+                    tx_hash,
+                    "Claim tx reverted but lockup still claimable; retrying claim"
+                );
+                swap.claim_tx_hash = None;
+                Self::do_claim(executor, store, event_emitter, &mut swap, false).await;
+                false
+            }
+            Ok(false) => {
+                update_swap_status(
+                    &**store,
+                    event_emitter,
+                    &mut swap,
+                    BoltzSwapStatus::Failed {
+                        reason: "Claim transaction reverted".to_string(),
+                    },
+                )
+                .await;
+                true
+            }
+            Err(e) => {
+                tracing::warn!(
+                    swap_id,
+                    error = %e,
+                    "Claim reverted and lock check failed; leaving swap for retry"
+                );
+                false
+            }
+        }
     }
 
     /// Check on-chain whether the preimage was already revealed. If still
