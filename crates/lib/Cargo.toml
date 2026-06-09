@@ -62,6 +62,8 @@ lightning-invoice = { version = "0.34", default-features = false }
 
 # WebSocket (native: tokio-tungstenite; WASM: web-sys WebSocket)
 tokio-tungstenite-wasm = { version = "0.8", features = ["rustls-tls-webpki-roots"] }
+# Synchronous ws_url validation at construction (already in the tree via the WS lib).
+url = "2"
 
 # Async
 futures.workspace = true

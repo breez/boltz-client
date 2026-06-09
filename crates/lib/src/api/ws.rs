@@ -20,6 +20,27 @@ const RECONNECT_DELAY: platform_utils::time::Duration =
 /// JSON-encoded ping message for the Boltz WS protocol.
 const PING_JSON: &str = r#"{"op":"ping"}"#;
 
+/// Reject a `ws_url` that can't possibly connect — an unparseable URL, a
+/// non-`ws`/`wss` scheme (e.g. an `http://` typo), or one with no host. Catches
+/// the common misconfigurations at construction; a valid-but-unreachable host is
+/// left to the reconnect loop (indistinguishable from a transient outage here).
+fn validate_ws_url(ws_url: &str) -> Result<(), BoltzError> {
+    let url = url::Url::parse(ws_url)
+        .map_err(|e| BoltzError::WebSocket(format!("Invalid ws_url '{ws_url}': {e}")))?;
+    if !matches!(url.scheme(), "ws" | "wss") {
+        return Err(BoltzError::WebSocket(format!(
+            "ws_url must use a ws:// or wss:// scheme, got '{}://'",
+            url.scheme()
+        )));
+    }
+    if url.host_str().is_none_or(str::is_empty) {
+        return Err(BoltzError::WebSocket(format!(
+            "ws_url '{ws_url}' has no host"
+        )));
+    }
+    Ok(())
+}
+
 /// Swap status update dispatched from the WebSocket.
 #[derive(Debug, Clone)]
 pub struct SwapStatusUpdate {
@@ -55,6 +76,13 @@ impl SwapStatusSubscriber {
         ws_url: &str,
         global_tx: mpsc::Sender<SwapStatusUpdate>,
     ) -> Result<Self, BoltzError> {
+        // The reader loop reconnects resiliently, so we don't dial here — but
+        // that means a misconfigured `ws_url` would otherwise degrade silently
+        // into an endless reconnect loop. Validate the URL up front so a bad
+        // value is surfaced at construction instead. (Reachability is left to
+        // the loop, as it can't be told apart from a transient outage.)
+        validate_ws_url(ws_url)?;
+
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
 
         let reader_handle = tokio::spawn(Self::reader_loop(ws_url.to_string(), global_tx, cmd_rx));
@@ -298,6 +326,27 @@ mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
     use super::*;
+
+    #[macros::test_all]
+    fn validate_ws_url_accepts_ws_and_wss() {
+        assert!(validate_ws_url("wss://api.boltz.exchange/v2/ws").is_ok());
+        assert!(validate_ws_url("ws://localhost:9001").is_ok());
+        // Scheme is case-insensitive per the URL spec — must not false-reject.
+        assert!(validate_ws_url("WSS://api.boltz.exchange/ws").is_ok());
+    }
+
+    #[macros::test_all]
+    fn validate_ws_url_rejects_bad_scheme_and_malformed() {
+        // Wrong scheme (the classic http/ws mix-up).
+        assert!(validate_ws_url("https://api.boltz.exchange").is_err());
+        assert!(validate_ws_url("http://api.boltz.exchange").is_err());
+        // Unparseable / no scheme / empty.
+        assert!(validate_ws_url("not a url").is_err());
+        assert!(validate_ws_url("api.boltz.exchange/ws").is_err());
+        assert!(validate_ws_url("").is_err());
+        // Right scheme but no host.
+        assert!(validate_ws_url("wss://").is_err());
+    }
 
     #[macros::test_all]
     fn test_swap_status_update_clone() {
