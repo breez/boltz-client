@@ -247,13 +247,12 @@ impl AlchemyGasClient {
     /// Poll `wallet_getCallsStatus` until confirmed or timeout. Also used on
     /// resume to recover the tx hash for a previously persisted `call_id`.
     ///
-    /// A transient RPC error on a single iteration does not abort the poll
-    /// — it is stashed as `last_err` and only returned if every subsequent
-    /// attempt also fails. Success requires an explicit `0x1` receipt status;
-    /// `0x0` is a terminal revert. Any other value (absent/unknown) is treated
-    /// as not-yet-final and keeps polling — mirroring the strictness of
-    /// [`crate::evm::provider::TxReceipt::is_success`], so a lenient/odd
-    /// response can never be mistaken for a confirmed claim.
+    /// A transient RPC error on a single iteration does not abort the poll — it
+    /// is stashed as `last_err` and only returned if every subsequent attempt
+    /// also fails. Confirmation is decided by [`classify_calls_status`], which
+    /// gates on the authoritative top-level EIP-5792 status code rather than the
+    /// per-receipt status (the latter mirrors the raw bundler `handleOps` receipt
+    /// and stays `0x1` even when the inner `UserOp` reverts).
     pub(crate) async fn poll_call_status(
         &self,
         call_id: &str,
@@ -262,46 +261,21 @@ impl AlchemyGasClient {
 
         for attempt in 0..MAX_POLL_ATTEMPTS {
             match self
-                .rpc_call::<CallsStatusResponse>(
+                .rpc_call::<serde_json::Value>(
                     "wallet_getCallsStatus",
                     serde_json::json!([call_id]),
                 )
                 .await
             {
-                Ok(status) => {
+                Ok(raw) => {
                     last_err = None;
-
-                    if let Some(receipts) = &status.receipts
-                        && !receipts.is_empty()
-                    {
-                        let receipt = &receipts[0];
-
-                        match receipt.status.as_deref() {
-                            Some("0x1") => {
-                                let tx_hash =
-                                    receipt.transaction_hash.clone().ok_or_else(|| {
-                                        BoltzError::Evm {
-                                            reason: "Receipt missing transactionHash".to_string(),
-                                            tx_hash: None,
-                                        }
-                                    })?;
-                                return Ok(AlchemyResult { tx_hash });
-                            }
-                            Some("0x0") => {
-                                return Err(BoltzError::Evm {
-                                    reason: "Transaction reverted".to_string(),
-                                    tx_hash: receipt.transaction_hash.clone(),
-                                });
-                            }
-                            // Absent/unknown status: not final. Keep polling
-                            // rather than treating it as success.
-                            other => {
-                                tracing::debug!(
-                                    attempt,
-                                    status = ?other,
-                                    "Receipt present but status not final, continuing poll"
-                                );
-                            }
+                    match classify_calls_status(&raw) {
+                        CallStatus::Confirmed(tx_hash) => return Ok(AlchemyResult { tx_hash }),
+                        CallStatus::Failed { reason, tx_hash } => {
+                            return Err(BoltzError::Evm { reason, tx_hash });
+                        }
+                        CallStatus::Pending => {
+                            tracing::debug!(attempt, "wallet_getCallsStatus not final, polling");
                         }
                     }
                 }
@@ -475,19 +449,82 @@ struct SendPreparedCallsResponse {
     prepared_call_ids: Vec<String>,
 }
 
-#[derive(Deserialize)]
-struct CallsStatusResponse {
-    #[serde(default)]
-    receipts: Option<Vec<CallsStatusReceipt>>,
+/// Classified outcome of a `wallet_getCallsStatus` poll.
+enum CallStatus {
+    /// Included on-chain without reverts; carries the claim tx hash.
+    Confirmed(String),
+    /// Terminally failed (reverted or not included) — won't succeed on retry.
+    Failed {
+        reason: String,
+        tx_hash: Option<String>,
+    },
+    /// Not yet final — keep polling.
+    Pending,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CallsStatusReceipt {
-    #[serde(default)]
-    transaction_hash: Option<String>,
-    #[serde(default)]
-    status: Option<String>,
+/// Classify a `wallet_getCallsStatus` result.
+///
+/// A reverted inner `UserOp` leaves the raw bundler `handleOps` receipt — and
+/// thus the per-receipt `status` hex — at `0x1` (the ERC-4337 `EntryPoint`
+/// catches inner reverts), so the per-receipt status alone cannot tell a reverted
+/// from a successful one. The authoritative revert signal is the EIP-5792
+/// top-level numeric `status` code (100–199 pending, 200–299 success, ≥300
+/// reverted/not-included), matching viem's decoder. So a top-level code ≥300 is
+/// treated as a hard failure first, and otherwise confirmation falls to the
+/// per-receipt status exactly as the original client did — see the 2026-06-09
+/// decision-log entry.
+fn classify_calls_status(raw: &serde_json::Value) -> CallStatus {
+    let first_receipt = raw
+        .get("receipts")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|a| a.first());
+    let tx_hash = first_receipt
+        .and_then(|r| r.get("transactionHash"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+
+    // Authoritative revert override: gate failure on the top-level EIP-5792 code,
+    // the only signal that reflects an inner-UserOp revert. Checked first so a
+    // reverted claim can never be confirmed via its `0x1` receipt below.
+    if let Some(code) = raw.get("status").and_then(serde_json::Value::as_u64)
+        && code >= 300
+    {
+        return CallStatus::Failed {
+            reason: format!("Sponsored call failed (EIP-5792 status {code})"),
+            tx_hash,
+        };
+    }
+
+    // Not a top-level revert (success, pending, or no code present): confirm on
+    // the per-receipt status as the original client did. Reverts are already
+    // filtered out above, so a `0x1` here is a genuine success.
+    classify_receipt_status(first_receipt, tx_hash)
+}
+
+/// Confirm/fail/pending from the per-receipt `status` hex. Only reached after the
+/// authoritative top-level revert check in [`classify_calls_status`], so a `0x1`
+/// here is a genuine success, not a revert hidden behind the raw bundler receipt.
+/// A per-receipt `0x0` means the whole bundler `handleOps` tx reverted.
+fn classify_receipt_status(
+    first_receipt: Option<&serde_json::Value>,
+    tx_hash: Option<String>,
+) -> CallStatus {
+    match first_receipt
+        .and_then(|r| r.get("status"))
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("0x1") => match tx_hash {
+            Some(h) => CallStatus::Confirmed(h),
+            // Confirmed without a tx hash is anomalous — keep polling.
+            None => CallStatus::Pending,
+        },
+        Some("0x0") => CallStatus::Failed {
+            reason: "Transaction reverted".to_string(),
+            tx_hash,
+        },
+        // Absent/unknown per-receipt status: not final.
+        _ => CallStatus::Pending,
+    }
 }
 
 #[cfg(test)]
@@ -750,9 +787,9 @@ mod tests {
             alchemy_rpc_success(&serde_json::json!({
                 "preparedCallIds": ["call_123"]
             })),
-            // 3. wallet_getCallsStatus (confirmed)
+            // 3. wallet_getCallsStatus (confirmed: EIP-5792 status 200)
             alchemy_rpc_success(&serde_json::json!({
-                "status": 1,
+                "status": 200,
                 "receipts": [{
                     "transactionHash": "0xabc123",
                     "status": "0x1",
@@ -803,11 +840,15 @@ mod tests {
             alchemy_rpc_success(&serde_json::json!({
                 "preparedCallIds": ["call_456"]
             })),
+            // wallet_getCallsStatus (reverted: EIP-5792 status 500). The
+            // per-receipt status is 0x1 — the raw bundler `handleOps` receipt,
+            // which succeeds even though the inner UserOp reverted — so the
+            // top-level code is the only correct revert signal.
             alchemy_rpc_success(&serde_json::json!({
-                "status": 1,
+                "status": 500,
                 "receipts": [{
                     "transactionHash": "0xfailed",
-                    "status": "0x0",
+                    "status": "0x1",
                     "blockHash": "0xblock",
                     "blockNumber": "0x100",
                     "gasUsed": "0x5208"
@@ -834,7 +875,7 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.to_string().contains("reverted"));
+        assert!(err.to_string().contains("500"), "got: {err}");
     }
 
     #[macros::async_test_all]
@@ -863,7 +904,7 @@ mod tests {
             },
             // Second poll: confirmed.
             alchemy_rpc_success(&serde_json::json!({
-                "status": 1,
+                "status": 200,
                 "receipts": [{
                     "transactionHash": "0xrecovered",
                     "status": "0x1",
@@ -896,21 +937,19 @@ mod tests {
     }
 
     #[macros::async_test_all]
-    async fn test_poll_status_absent_status_is_not_success() {
+    async fn test_poll_status_pending_then_confirmed() {
         let config = AlchemyConfig {
             gas_sponsor_url: "https://sponsor.test/".to_string(),
         };
-        // First poll returns a receipt with NO status field (and a tx hash that
-        // must not be accepted). Under the old logic "not 0x0 => success" this
-        // would return "0xpending". The strict logic keeps polling until the
-        // explicit 0x1 receipt, returning "0xfinal".
+        // First poll: EIP-5792 pending (100-range) — keep polling. Second poll:
+        // confirmed (200) — return the tx hash.
         let responses = vec![
             alchemy_rpc_success(&serde_json::json!({
-                "status": 1,
-                "receipts": [{ "transactionHash": "0xpending" }]
+                "status": 100,
+                "receipts": []
             })),
             alchemy_rpc_success(&serde_json::json!({
-                "status": 1,
+                "status": 200,
                 "receipts": [{ "transactionHash": "0xfinal", "status": "0x1" }]
             })),
         ];
@@ -923,6 +962,71 @@ mod tests {
 
         let result = client.poll_call_status("call_x").await.unwrap();
         assert_eq!(result.tx_hash, "0xfinal");
+    }
+
+    #[macros::test_all]
+    fn test_classify_calls_status() {
+        // 200-range with a tx hash → confirmed.
+        let confirmed = serde_json::json!({
+            "status": 200,
+            "receipts": [{ "transactionHash": "0xok", "status": "0x1" }]
+        });
+        assert!(matches!(
+            classify_calls_status(&confirmed),
+            CallStatus::Confirmed(h) if h == "0xok"
+        ));
+
+        // 200-range but no tx hash yet → keep polling.
+        let confirmed_no_hash = serde_json::json!({ "status": 200, "receipts": [] });
+        assert!(matches!(
+            classify_calls_status(&confirmed_no_hash),
+            CallStatus::Pending
+        ));
+
+        // >=300 → failed, even though the per-receipt status reads 0x1 (the raw
+        // bundler receipt succeeds while the inner UserOp reverted).
+        let reverted = serde_json::json!({
+            "status": 500,
+            "receipts": [{ "transactionHash": "0xrev", "status": "0x1" }]
+        });
+        assert!(matches!(
+            classify_calls_status(&reverted),
+            CallStatus::Failed { tx_hash: Some(h), .. } if h == "0xrev"
+        ));
+
+        // 100-range → pending.
+        let pending = serde_json::json!({ "status": 100, "receipts": [] });
+        assert!(matches!(
+            classify_calls_status(&pending),
+            CallStatus::Pending
+        ));
+
+        // No top-level code present: confirm via the per-receipt 0x1.
+        let receipt_ok = serde_json::json!({
+            "receipts": [{ "transactionHash": "0xreceipt", "status": "0x1" }]
+        });
+        assert!(matches!(
+            classify_calls_status(&receipt_ok),
+            CallStatus::Confirmed(h) if h == "0xreceipt"
+        ));
+
+        // No top-level code, per-receipt 0x0 (whole bundler tx reverted) → failed.
+        let receipt_revert = serde_json::json!({
+            "receipts": [{ "transactionHash": "0xrrev", "status": "0x0" }]
+        });
+        assert!(matches!(
+            classify_calls_status(&receipt_revert),
+            CallStatus::Failed { .. }
+        ));
+
+        // No top-level code, no per-receipt status → pending.
+        let no_status = serde_json::json!({
+            "receipts": [{ "transactionHash": "0xpend" }]
+        });
+        assert!(matches!(
+            classify_calls_status(&no_status),
+            CallStatus::Pending
+        ));
     }
 
     #[macros::test_all]
