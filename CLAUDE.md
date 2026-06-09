@@ -50,6 +50,12 @@ in the same change that alters the design; append a dated entry to
 `decisions.md` whenever you make a notable or divergent decision. Record *why*,
 not *what* — the code and `architecture.md` own the "what".
 
+**Keep entries as short as possible while making the point.** A decision entry
+is the `Diverges` line plus, ideally, a single tight paragraph: the problem, the
+choice, and the load-bearing trade-off — nothing more. Leave out mechanics,
+step-by-step behaviour, and rejected-alternative detail the code/comments
+already carry. If an entry runs to multiple long paragraphs, it's too long.
+
 Only document decisions that are **high-impact or non-obvious**: a divergence
 from `boltz-web-app`, a security boundary, a money-critical invariant, or a
 trade-off a future reader would otherwise re-litigate. Do **not** log routine,
