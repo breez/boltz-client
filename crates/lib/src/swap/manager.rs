@@ -165,9 +165,12 @@ impl SwapManager {
         // operation (e.g. a multi-minute receipt poll) never blocks another.
         let mut tasks: JoinSet<()> = JoinSet::new();
 
-        // Background delivery-confirmation ticker. `None` disables it (callers
-        // drive confirmation via `refresh_pending_deliveries`). The first tick
-        // fires immediately, re-arming any swaps resumed as `Settling`. Missed
+        // Background ticker driving both delivery confirmation (`Settling`) and
+        // autonomous recovery of stuck `Claiming` swaps. `None` disables it
+        // (callers drive delivery confirmation via `refresh_pending_deliveries`;
+        // `Claiming` recovery then only runs on WS events / `resume_all`). The
+        // first tick fires immediately, re-arming any swaps resumed as
+        // `Settling` or `Claiming`. Missed
         // ticks (if a branch handler ran long) just coalesce into idempotent
         // catch-up polls, so the default missed-tick behavior is fine — and
         // `set_missed_tick_behavior` isn't available on the WASM tokio shim.
@@ -206,7 +209,7 @@ impl SwapManager {
                     let event_emitter = event_emitter.clone();
                     let swap_locks = swap_locks.clone();
                     tasks.spawn(async move {
-                        poll_settling_swaps(&executor, &store, &event_emitter, &swap_locks).await;
+                        poll_pending_swaps(&executor, &store, &event_emitter, &swap_locks).await;
                     });
                 }
                 Step::Ws(update) => {
@@ -710,23 +713,12 @@ impl SwapManager {
         tx_hash: &str,
     ) -> bool {
         for attempt in 0..RECEIPT_POLL_MAX_ATTEMPTS {
-            match executor
-                .evm_provider
-                .eth_get_transaction_receipt(tx_hash)
-                .await
-            {
-                Ok(Some(receipt)) if receipt.is_success() => {
-                    return Self::apply_successful_receipt(
-                        executor,
-                        store,
-                        event_emitter,
-                        swap_id,
-                        tx_hash,
-                        &receipt,
-                    )
-                    .await;
-                }
-                Ok(Some(receipt)) if receipt.is_reverted() => {
+            match Self::check_receipt_once(executor, store, event_emitter, swap_id, tx_hash).await {
+                ReceiptOutcome::Advanced(reached_terminal) => return reached_terminal,
+                // A reverted-but-recoverable claim is re-claimed here, on the
+                // WS/resume-driven poll (NOT on the background tick — see
+                // `recover_claiming_swap`).
+                ReceiptOutcome::Reverted => {
                     return Self::recover_from_reverted_receipt(
                         executor,
                         store,
@@ -736,10 +728,7 @@ impl SwapManager {
                     )
                     .await;
                 }
-                // Not yet mined, or mined with an absent/unknown status: never
-                // infer a terminal state from an ambiguous receipt — keep polling.
-                Ok(_) => {}
-                Err(e) => tracing::warn!(swap_id, attempt, error = %e, "Receipt poll failed"),
+                ReceiptOutcome::NotMined => {}
             }
 
             if attempt < RECEIPT_POLL_MAX_ATTEMPTS.saturating_sub(1) {
@@ -754,6 +743,45 @@ impl SwapManager {
         // On process restart, `resume_all` re-triggers the poll.
         tracing::warn!(swap_id, tx_hash, "Receipt poll timed out, waiting for WS");
         false
+    }
+
+    /// One receipt check for a known claim tx hash. A confirmed success is
+    /// applied here ([`Self::apply_successful_receipt`]); a revert is reported as
+    /// [`ReceiptOutcome::Reverted`] for the caller to handle, because the right
+    /// reaction differs by caller (`poll_receipt` re-claims a reverted-but-
+    /// recoverable claim; the background tick must not). Never infers a terminal
+    /// state from an ambiguous
+    /// (absent/unknown-status) or transiently-failed receipt.
+    async fn check_receipt_once(
+        executor: &ReverseSwapExecutor,
+        store: &Arc<dyn BoltzStorage>,
+        event_emitter: &EventEmitter,
+        swap_id: &str,
+        tx_hash: &str,
+    ) -> ReceiptOutcome {
+        match executor
+            .evm_provider
+            .eth_get_transaction_receipt(tx_hash)
+            .await
+        {
+            Ok(Some(receipt)) if receipt.is_success() => ReceiptOutcome::Advanced(
+                Self::apply_successful_receipt(
+                    executor,
+                    store,
+                    event_emitter,
+                    swap_id,
+                    tx_hash,
+                    &receipt,
+                )
+                .await,
+            ),
+            Ok(Some(receipt)) if receipt.is_reverted() => ReceiptOutcome::Reverted,
+            Ok(_) => ReceiptOutcome::NotMined,
+            Err(e) => {
+                tracing::warn!(swap_id, error = %e, "Receipt poll failed");
+                ReceiptOutcome::NotMined
+            }
+        }
     }
 
     /// Handle a confirmed-success claim receipt: record the delivered amount and
@@ -854,6 +882,92 @@ impl SwapManager {
                     "Claim reverted and lock check failed; leaving swap for retry"
                 );
                 false
+            }
+        }
+    }
+
+    /// Recover a single `Claiming` swap with a known `claim_tx_hash`, one shot
+    /// (no inner poll loop — the background tick re-runs it):
+    /// - **receipt success** → advance (so a mined claim progresses without
+    ///   waiting on the WS);
+    /// - **receipt reverted** → do **not** re-claim here. The reverted-claim
+    ///   re-claim is driven by the WS/resume `poll_receipt`, not this 30s tick — auto-claiming
+    ///   on every tick could re-submit a persistently-reverting claim in a loop,
+    ///   draining sponsor gas. Fall through to the timeout-gated path instead, so
+    ///   a stuck reverted claim ends up `Failed` once its lockup refunds;
+    /// - **receipt not mined, before the lockup timeout** → leave it `Claiming`
+    ///   and wait. The claim either hasn't mined yet or was dropped; either way
+    ///   there is nothing to finalize (a refund is impossible before the timeout)
+    ///   and per require-receipt we never complete without a receipt, so we skip
+    ///   the on-chain lock check entirely. This keeps the steady-state cost to one
+    ///   cheap receipt read per tick over the (up to ~24h) wait;
+    /// - **receipt not mined, past the timeout** → the lockup may have refunded,
+    ///   so probe the lock once: spent → the claim never mined and the lockup
+    ///   refunded to Boltz, so the swap failed (`Failed`; the LN hold invoice
+    ///   expires and the user's sats refund — no funds lost); still locked → the
+    ///   refund hasn't landed yet, wait; lock unreadable → leave for retry.
+    ///
+    /// We deliberately do NOT re-submit a dropped claim — a merely-slow tx would
+    /// draw a wasteful competing claim, and a dropped one stays loss-free.
+    /// `current_l1` is the shared once-per-pass L1 height; `None` (read failed)
+    /// runs only the receipt check and defers the refund decision to a later pass.
+    async fn recover_claiming_swap(
+        executor: &ReverseSwapExecutor,
+        store: &Arc<dyn BoltzStorage>,
+        event_emitter: &EventEmitter,
+        swap: &BoltzSwap,
+        tx_hash: &str,
+        current_l1: Option<u64>,
+    ) {
+        let swap_id = &swap.id;
+
+        match Self::check_receipt_once(executor, store, event_emitter, swap_id, tx_hash).await {
+            // Mined successfully → advanced (or stays Claiming pending Direct
+            // evidence). Either way nothing more to do on this tick.
+            ReceiptOutcome::Advanced(_) => return,
+            // Reverted or not-yet-mined: deliberately do NOT re-claim here; let the
+            // timeout gate below finalize a genuinely stuck swap.
+            ReceiptOutcome::Reverted | ReceiptOutcome::NotMined => {}
+        }
+
+        // Gate the (2-call) lock probe on the timeout: before it there is nothing
+        // actionable, so a stuck swap costs only the receipt read above per tick.
+        let Some(current_l1) = current_l1 else {
+            return;
+        };
+        if !claiming_eligible_for_refund_check(current_l1, swap.timeout_block_height) {
+            tracing::debug!(
+                swap_id,
+                "Claim tx not yet mined and lockup not past timeout; waiting"
+            );
+            return;
+        }
+
+        match is_swap_still_locked_by_swap(&executor.evm_provider, swap, &executor.key_manager)
+            .await
+        {
+            Ok(true) => {
+                tracing::debug!(swap_id, "Past timeout but lockup not yet refunded; waiting");
+            }
+            Ok(false) => {
+                tracing::warn!(
+                    swap_id,
+                    claim_tx_hash = ?swap.claim_tx_hash,
+                    "Claim tx never mined and lockup refunded past timeout; finalizing Failed"
+                );
+                let mut s = swap.clone();
+                update_swap_status(
+                    &**store,
+                    event_emitter,
+                    &mut s,
+                    BoltzSwapStatus::Failed {
+                        reason: "Claim transaction never mined; lockup refunded".to_string(),
+                    },
+                )
+                .await;
+            }
+            Err(e) => {
+                tracing::warn!(swap_id, error = %e, "Claiming-poll lock check failed; leaving for retry");
             }
         }
     }
@@ -1107,6 +1221,28 @@ fn direct_completion_has_evidence(swap: &BoltzSwap) -> bool {
     swap.bridge_kind != BridgeKind::Direct || swap.delivered_amount.is_some()
 }
 
+/// Outcome of one claim-receipt check ([`SwapManager::check_receipt_once`]).
+enum ReceiptOutcome {
+    /// Receipt confirmed success and was applied; the bool is whether the swap
+    /// reached its post-claim state (`false` = a `Direct` receipt lacked delivery
+    /// evidence, so it stays `Claiming`).
+    Advanced(bool),
+    /// Receipt is on-chain but reverted. The caller decides how to react.
+    Reverted,
+    /// Not yet mined, or a transient RPC error — the caller keeps waiting.
+    NotMined,
+}
+
+/// Whether a `Claiming` swap whose claim tx has not produced a success receipt
+/// is eligible to be finalized `Failed` — i.e. its lockup is past timeout, the
+/// point after which a refund to Boltz becomes possible. Both arguments are
+/// **L1** heights. Before the timeout there is nothing to finalize (no refund
+/// can have happened), so the caller skips the on-chain lock probe entirely. See
+/// [`SwapManager::recover_claiming_swap`].
+fn claiming_eligible_for_refund_check(current_l1: u64, timeout_block_height: u64) -> bool {
+    current_l1 > timeout_block_height
+}
+
 fn post_claim_status(swap: &BoltzSwap) -> BoltzSwapStatus {
     match swap.bridge_kind {
         BridgeKind::Direct => BoltzSwapStatus::Completed,
@@ -1122,11 +1258,25 @@ fn post_claim_status(swap: &BoltzSwap) -> BoltzSwapStatus {
     }
 }
 
-/// Poll every `Settling` swap once and finalize any whose cross-chain delivery
-/// has confirmed. Store-driven (not tied to WS tracking), so it covers swaps
-/// resumed after a restart. Used by both the background tick and the on-demand
-/// [`crate::BoltzService::refresh_pending_deliveries`].
-pub(crate) async fn poll_settling_swaps(
+/// Advance every in-flight swap one step in a single store-driven pass (not tied
+/// to WS tracking, so it covers swaps resumed after a restart). Used by both the
+/// background tick and the on-demand [`crate::BoltzService::refresh_pending_deliveries`].
+///
+/// Per swap, under its lock:
+/// - **`Settling`** → confirm cross-chain delivery and finalize if delivered
+///   ([`confirm_delivery`]).
+/// - **`Claiming`** (with a persisted `claim_tx_hash`) → autonomously recover so
+///   progress doesn't depend solely on a Boltz WS event
+///   ([`SwapManager::recover_claiming_swap`]). `do_claim` persists the hash and
+///   returns *without* polling the receipt, so a `Claiming` swap is otherwise
+///   only re-examined on a WS `invoice.settled` / re-`confirmed`, or a restart.
+///   That leaves two observability gaps (neither is fund loss — the atomic claim
+///   either mined and delivered, or never mined and both legs unwind): the claim
+///   **mined but the WS event never arrives**, or one **dropped/replaced that
+///   never mines** (which no WS event or restart ever resolves, since the re-poll
+///   just re-checks the dead hash). No-hash crash-recovery cases stay
+///   with the WS / `resume_all` paths.
+pub(crate) async fn poll_pending_swaps(
     executor: &ReverseSwapExecutor,
     store: &Arc<dyn BoltzStorage>,
     event_emitter: &EventEmitter,
@@ -1135,21 +1285,73 @@ pub(crate) async fn poll_settling_swaps(
     let swaps = match store.list_active_swaps().await {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!(error = %e, "Failed to list active swaps for delivery poll");
+            tracing::warn!(error = %e, "Failed to list active swaps for pending-swap poll");
             return;
         }
     };
-    for swap in swaps
-        .into_iter()
-        .filter(|s| s.status == BoltzSwapStatus::Settling)
+
+    // One shared L1 height read per pass, used only to gate the (2-call) lock
+    // probe in `recover_claiming_swap` behind the lockup timeout — so a stuck
+    // `Claiming` swap costs just one cheap receipt read per tick until then.
+    // Fetched only when a recoverable `Claiming` swap exists; a read failure
+    // leaves it `None` (receipt re-check still runs; refund decision deferred).
+    let current_l1 = if swaps
+        .iter()
+        .any(|s| s.status == BoltzSwapStatus::Claiming && s.claim_tx_hash.is_some())
     {
-        // Serialize against any other work on this swap (a concurrent delivery
-        // poll from `refresh_pending_deliveries`, or a claim handler). The
-        // snapshot's bridge_ref/bridge_kind are fixed post-claim, so querying
-        // delivery off it is safe; the eventual status write re-reads under the
-        // lock in `finalize_completed`.
-        let _guard = swap_locks.lock(&swap.id).await;
-        confirm_delivery(executor, store, event_emitter, &swap).await;
+        match executor.evm_provider.eth_l1_block_number().await {
+            Ok(h) => Some(h),
+            Err(e) => {
+                tracing::warn!(error = %e, "L1 height read failed; deferring claiming refund check");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    for swap in swaps {
+        match swap.status {
+            BoltzSwapStatus::Settling => {
+                // Serialize against any other work on this swap (a concurrent
+                // delivery poll from `refresh_pending_deliveries`, or a claim
+                // handler). The snapshot's bridge_ref/bridge_kind are fixed
+                // post-claim, so querying delivery off it is safe; the eventual
+                // status write re-reads under the lock in `finalize_completed`.
+                let _guard = swap_locks.lock(&swap.id).await;
+                confirm_delivery(executor, store, event_emitter, &swap).await;
+            }
+            BoltzSwapStatus::Claiming if swap.claim_tx_hash.is_some() => {
+                let _guard = swap_locks.lock(&swap.id).await;
+                // Re-read under the lock: the snapshot predates the lock, so a
+                // concurrent handler may already have advanced the swap. Only act
+                // if it is still `Claiming` with a hash.
+                let swap = match store.get_swap(&swap.id).await {
+                    Ok(Some(s)) => s,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::warn!(swap_id = swap.id, error = %e, "Failed to re-read claiming swap");
+                        continue;
+                    }
+                };
+                if swap.status != BoltzSwapStatus::Claiming {
+                    continue;
+                }
+                let Some(tx_hash) = swap.claim_tx_hash.clone() else {
+                    continue;
+                };
+                SwapManager::recover_claiming_swap(
+                    executor,
+                    store,
+                    event_emitter,
+                    &swap,
+                    &tx_hash,
+                    current_l1,
+                )
+                .await;
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1202,9 +1404,9 @@ async fn confirm_delivery(
 
 /// Mark a `Settling` swap `Completed`, idempotently.
 ///
-/// `poll_settling_swaps` runs on two tasks — the background delivery ticker
-/// (event loop) and the on-demand [`crate::BoltzService::refresh_pending_deliveries`]
-/// (caller task) — each operating on its own snapshot. Re-reading here and
+/// `poll_pending_swaps` runs on two tasks — the background ticker (event loop)
+/// and the on-demand [`crate::BoltzService::refresh_pending_deliveries`] (caller
+/// task) — each operating on its own snapshot. Re-reading here and
 /// bailing unless the swap is still `Settling` prevents a double `Completed`
 /// emission (and a redundant store write) when both observe the same swap as
 /// delivered. The delivered amount is identical on either path, so the only
@@ -1364,7 +1566,7 @@ mod tests {
     #[macros::test_all]
     fn monotonicity_guard_drops_stale_invoice_paid_but_keeps_forward() {
         // The guard ignores the event iff its mapped stage is strictly below the
-        // swap's current status. This is the BC-02 fix: a replayed `invoice.paid`
+        // swap's current status, so a replayed `invoice.paid`
         // must not regress a `TbtcLocked`/`Claiming` swap.
         // The guard ignores the event iff `stage < swap.status`.
         let stage = ws_progress_stage("invoice.paid").unwrap();
@@ -1393,6 +1595,18 @@ mod tests {
         assert_eq!(post_claim_status(&oft), BoltzSwapStatus::Settling);
         let cctp = swap_with(BridgeKind::Cctp, None);
         assert_eq!(post_claim_status(&cctp), BoltzSwapStatus::Settling);
+    }
+
+    // ─── claiming_eligible_for_refund_check: timeout-gated lock probe ───
+
+    #[macros::test_all]
+    fn refund_check_only_past_timeout() {
+        // Strictly past the timeout: a refund is possible, so probe the lock.
+        assert!(claiming_eligible_for_refund_check(1_001, 1_000));
+        // At or before the timeout: no refund possible yet → skip the lock probe
+        // (the gate that keeps a stuck swap at one cheap receipt read per tick).
+        assert!(!claiming_eligible_for_refund_check(1_000, 1_000));
+        assert!(!claiming_eligible_for_refund_check(999, 1_000));
     }
 
     // ─── delivered_and_ref: per-bridge field mapping at claim time ──────

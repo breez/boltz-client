@@ -206,18 +206,20 @@ impl BoltzService {
         self.store.get_swap(swap_id).await
     }
 
-    /// Confirm cross-chain delivery for every swap currently `Settling`, and
-    /// finalize any whose bridge has delivered (CCTP via Circle Iris, OFT via
-    /// `LayerZero` Scan). For CCTP this also persists the authoritative
-    /// `feeExecuted`-adjusted delivered amount; completions emit a
+    /// Advance every in-flight swap one step: confirm cross-chain delivery for
+    /// swaps currently `Settling` and finalize any whose bridge has delivered
+    /// (CCTP via Circle Iris, OFT via `LayerZero` Scan; CCTP also persists the
+    /// authoritative `feeExecuted`-adjusted amount), and recover any stuck in
+    /// `Claiming` (re-check the claim receipt; finalize a dropped claim once its
+    /// lockup refunds). Completions/finalizations emit a
     /// [`BoltzSwapEvent::SwapUpdated`].
     ///
     /// This runs automatically on the background poll cadence
     /// ([`BoltzConfig::delivery_poll_interval_secs`]); call it directly only to
-    /// drive confirmation when background polling is disabled (`None`), or to
-    /// force an immediate check.
+    /// drive it when background polling is disabled (`None`), or to force an
+    /// immediate check.
     pub async fn refresh_pending_deliveries(&self) -> Result<(), BoltzError> {
-        swap::manager::poll_settling_swaps(
+        swap::manager::poll_pending_swaps(
             &self.executor,
             &self.store,
             &self.event_emitter,
