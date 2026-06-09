@@ -509,20 +509,6 @@ pub struct CreatedSwap {
     pub timeout_block_height: u64,
 }
 
-/// Result of a successfully completed swap.
-#[derive(Clone, Debug, Serialize)]
-pub struct CompletedSwap {
-    pub swap_id: String,
-    pub claim_tx_hash: String,
-    /// Actual stablecoin amount delivered (6 decimals).
-    pub output_delivered: u64,
-    pub destination_address: String,
-    /// Destination chain label.
-    pub destination_chain: String,
-    /// Stablecoin delivered on the destination chain.
-    pub asset: Asset,
-}
-
 /// Min/max swap limits from the Boltz pairs endpoint.
 #[derive(Clone, Debug, Serialize)]
 pub struct SwapLimits {
