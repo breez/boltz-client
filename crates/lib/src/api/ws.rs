@@ -186,7 +186,14 @@ impl SwapStatusSubscriber {
                 }
             }
 
-            // Re-subscribe all tracked IDs after (re)connect.
+            // Re-subscribe all tracked IDs after (re)connect. We only
+            // resubscribe — we do NOT re-fetch status — so a `swap.update`
+            // emitted during the disconnect window is seen again only if Boltz
+            // re-pushes the current status on resubscribe. A money-critical
+            // transition missed that way is still recovered by the store-driven
+            // `poll_pending_swaps` (Settling/Claiming) or a restart's
+            // `resume_all`; accepted as a deliberate trade-off over polling every
+            // tracked swap's status on each reconnect.
             if !local_ids.is_empty() {
                 let ids: Vec<String> = local_ids.iter().cloned().collect();
                 let msg = WsSubscribeMessage::subscribe(ids);
