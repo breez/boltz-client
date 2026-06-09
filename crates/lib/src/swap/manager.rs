@@ -168,15 +168,29 @@ impl SwapManager {
         // Background ticker driving both delivery confirmation (`Settling`) and
         // autonomous recovery of stuck `Claiming` swaps. `None` disables it
         // (callers drive delivery confirmation via `refresh_pending_deliveries`;
-        // `Claiming` recovery then only runs on WS events / `resume_all`). The
-        // first tick fires immediately, re-arming any swaps resumed as
-        // `Settling` or `Claiming`. Missed
+        // `Claiming` recovery then only runs on WS events / `resume_all`). Missed
         // ticks (if a branch handler ran long) just coalesce into idempotent
         // catch-up polls, so the default missed-tick behavior is fine — and
         // `set_missed_tick_behavior` isn't available on the WASM tokio shim.
         let mut delivery_ticker = delivery_poll_interval_secs.map(|secs| {
             tokio::time::interval(platform_utils::time::Duration::from_secs(secs.max(1)))
         });
+
+        // Native `interval` fires its first tick immediately, so a swap resumed
+        // as `Settling`/`Claiming` is serviced right away. The WASM tokio shim
+        // fires the first tick only after one full period, so poll once up front
+        // there — otherwise a resumed swap's first check is delayed by up to
+        // `delivery_poll_interval_secs` after every page reload.
+        #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+        if delivery_poll_interval_secs.is_some() {
+            let executor = executor.clone();
+            let store = store.clone();
+            let event_emitter = event_emitter.clone();
+            let swap_locks = swap_locks.clone();
+            tasks.spawn(async move {
+                poll_pending_swaps(&executor, &store, &event_emitter, &swap_locks).await;
+            });
+        }
 
         loop {
             // Reap finished handlers so the JoinSet stays bounded by in-flight
