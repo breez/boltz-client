@@ -745,13 +745,10 @@ impl SwapManager {
         false
     }
 
-    /// One receipt check for a known claim tx hash. A confirmed success is
-    /// applied here ([`Self::apply_successful_receipt`]); a revert is reported as
-    /// [`ReceiptOutcome::Reverted`] for the caller to handle, because the right
-    /// reaction differs by caller (`poll_receipt` re-claims a reverted-but-
-    /// recoverable claim; the background tick must not). Never infers a terminal
-    /// state from an ambiguous
-    /// (absent/unknown-status) or transiently-failed receipt.
+    /// One receipt check for a known claim tx hash. A success is applied here;
+    /// a revert is returned as [`ReceiptOutcome::Reverted`] for the caller to
+    /// handle, since the right reaction differs (`poll_receipt` re-claims, the
+    /// tick must not). An ambiguous or transiently-failed receipt is `NotMined`.
     async fn check_receipt_once(
         executor: &ReverseSwapExecutor,
         store: &Arc<dyn BoltzStorage>,
@@ -886,31 +883,14 @@ impl SwapManager {
         }
     }
 
-    /// Recover a single `Claiming` swap with a known `claim_tx_hash`, one shot
-    /// (no inner poll loop — the background tick re-runs it):
-    /// - **receipt success** → advance (so a mined claim progresses without
-    ///   waiting on the WS);
-    /// - **receipt reverted** → do **not** re-claim here. The reverted-claim
-    ///   re-claim is driven by the WS/resume `poll_receipt`, not this 30s tick — auto-claiming
-    ///   on every tick could re-submit a persistently-reverting claim in a loop,
-    ///   draining sponsor gas. Fall through to the timeout-gated path instead, so
-    ///   a stuck reverted claim ends up `Failed` once its lockup refunds;
-    /// - **receipt not mined, before the lockup timeout** → leave it `Claiming`
-    ///   and wait. The claim either hasn't mined yet or was dropped; either way
-    ///   there is nothing to finalize (a refund is impossible before the timeout)
-    ///   and per require-receipt we never complete without a receipt, so we skip
-    ///   the on-chain lock check entirely. This keeps the steady-state cost to one
-    ///   cheap receipt read per tick over the (up to ~24h) wait;
-    /// - **receipt not mined, past the timeout** → the lockup may have refunded,
-    ///   so probe the lock once: spent → the claim never mined and the lockup
-    ///   refunded to Boltz, so the swap failed (`Failed`; the LN hold invoice
-    ///   expires and the user's sats refund — no funds lost); still locked → the
-    ///   refund hasn't landed yet, wait; lock unreadable → leave for retry.
-    ///
-    /// We deliberately do NOT re-submit a dropped claim — a merely-slow tx would
-    /// draw a wasteful competing claim, and a dropped one stays loss-free.
-    /// `current_l1` is the shared once-per-pass L1 height; `None` (read failed)
-    /// runs only the receipt check and defers the refund decision to a later pass.
+    /// One-shot recovery of a `Claiming` swap with a known `claim_tx_hash` (the
+    /// background tick re-runs it). Advances a mined claim; once the lockup is
+    /// past its timeout, finalizes `Failed` if it refunded. Deliberately never
+    /// re-claims here — re-submitting a dropped or reverted claim each tick would
+    /// compete with a slow tx or loop on a persistent revert, draining sponsor gas
+    /// (reverted-claim re-claim lives in `poll_receipt`). The lock probe is gated
+    /// behind the timeout (`current_l1`, shared per pass; `None` = read failed,
+    /// defer) so a stuck swap costs one receipt read per tick.
     async fn recover_claiming_swap(
         executor: &ReverseSwapExecutor,
         store: &Arc<dyn BoltzStorage>,
@@ -1233,12 +1213,9 @@ enum ReceiptOutcome {
     NotMined,
 }
 
-/// Whether a `Claiming` swap whose claim tx has not produced a success receipt
-/// is eligible to be finalized `Failed` — i.e. its lockup is past timeout, the
-/// point after which a refund to Boltz becomes possible. Both arguments are
-/// **L1** heights. Before the timeout there is nothing to finalize (no refund
-/// can have happened), so the caller skips the on-chain lock probe entirely. See
-/// [`SwapManager::recover_claiming_swap`].
+/// Whether a stuck `Claiming` swap is past its lockup timeout — the point after
+/// which a refund to Boltz (hence finalizing `Failed`) becomes possible. Both are
+/// **L1** heights. Before it, the caller skips the on-chain lock probe.
 fn claiming_eligible_for_refund_check(current_l1: u64, timeout_block_height: u64) -> bool {
     current_l1 > timeout_block_height
 }
@@ -1267,14 +1244,7 @@ fn post_claim_status(swap: &BoltzSwap) -> BoltzSwapStatus {
 ///   ([`confirm_delivery`]).
 /// - **`Claiming`** (with a persisted `claim_tx_hash`) → autonomously recover so
 ///   progress doesn't depend solely on a Boltz WS event
-///   ([`SwapManager::recover_claiming_swap`]). `do_claim` persists the hash and
-///   returns *without* polling the receipt, so a `Claiming` swap is otherwise
-///   only re-examined on a WS `invoice.settled` / re-`confirmed`, or a restart.
-///   That leaves two observability gaps (neither is fund loss — the atomic claim
-///   either mined and delivered, or never mined and both legs unwind): the claim
-///   **mined but the WS event never arrives**, or one **dropped/replaced that
-///   never mines** (which no WS event or restart ever resolves, since the re-poll
-///   just re-checks the dead hash). No-hash crash-recovery cases stay
+///   ([`SwapManager::recover_claiming_swap`]). No-hash crash-recovery cases stay
 ///   with the WS / `resume_all` paths.
 pub(crate) async fn poll_pending_swaps(
     executor: &ReverseSwapExecutor,
