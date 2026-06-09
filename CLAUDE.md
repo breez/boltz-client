@@ -66,6 +66,14 @@ finding; the code and its comments already carry that. The same bar applies to
 invariants, not low-level mechanics obvious from reading the function. When in
 doubt, leave it out: a thorough code comment at the site usually suffices.
 
+## Code Comments
+
+Same bar for rustdoc and inline comments: short and to the point. State the
+load-bearing *why* — the contract, invariant, or non-obvious trade-off — not a
+play-by-play the signature and body already show. Prefer a sentence or two over
+a paragraph; if a doc comment runs long, cut the mechanics and keep the
+rationale. When in doubt, leave it out.
+
 ## Test Conventions
 
 - Use `#[macros::test_all]` for sync tests (runs on both native and WASM)
