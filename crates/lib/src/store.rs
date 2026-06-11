@@ -16,6 +16,11 @@ use crate::models::BoltzSwap;
 /// before the method returns. This is the sole defense against preimage
 /// reuse — if the counter regresses after a crash, a previously-used
 /// preimage hash could be sent to Boltz, enabling fund theft.
+///
+/// In-process concurrency is handled for you — the library serializes issuance
+/// (`issue_key_index`), so a single-process embedder needs only durability, not
+/// an atomic counter. Atomicity across *separate processes* sharing one store is
+/// still the impl's responsibility.
 #[macros::async_trait]
 pub trait BoltzStorage: Send + Sync {
     async fn insert_swap(&self, swap: &BoltzSwap) -> Result<(), BoltzError>;

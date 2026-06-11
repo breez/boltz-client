@@ -12,7 +12,7 @@ pub mod swap;
 use std::sync::Arc;
 
 use platform_utils::DefaultHttpClient;
-use platform_utils::tokio::sync::mpsc;
+use platform_utils::tokio::sync::{Mutex, mpsc};
 
 pub use config::*;
 pub use error::BoltzError;
@@ -59,6 +59,21 @@ pub struct BoltzService {
     /// `update_swap_slippage`, `refresh_pending_deliveries`) acquire the swap's
     /// lock so they never race the loop's handler for the same swap.
     swap_locks: Arc<SwapLocks>,
+    /// Serializes HD key-index issuance in-process so concurrent
+    /// `create_reverse_swap` calls can't draw the same index from a
+    /// non-transactional store (which would reuse a preimage). See
+    /// [`issue_key_index`].
+    key_index_lock: Mutex<()>,
+}
+
+/// Issue the next HD key index, serialized in-process by `lock`. Concurrent
+/// `create_reverse_swap` calls would otherwise both draw the same index from a
+/// non-transactional store and reuse a preimage (fund-theft risk). The lock is
+/// per-process: durability and cross-process atomicity remain the store's
+/// contract (see [`BoltzStorage::increment_key_index`]).
+async fn issue_key_index(lock: &Mutex<()>, store: &dyn BoltzStorage) -> Result<u32, BoltzError> {
+    let _guard = lock.lock().await;
+    store.increment_key_index().await
 }
 
 impl BoltzService {
@@ -182,6 +197,7 @@ impl BoltzService {
             ws_subscriber,
             chain_registry,
             swap_locks,
+            key_index_lock: Mutex::new(()),
         })
     }
 
@@ -285,16 +301,18 @@ impl BoltzService {
     ///
     /// # Key index safety
     ///
-    /// The caller's `BoltzStorage` implementation must ensure that
-    /// `increment_key_index` is durable (persisted before returning).
-    /// This is the sole defense against preimage reuse — Boltz's
-    /// duplicate-preimage detection (HTTP 409) must NOT be relied upon,
-    /// as a malicious API could lie and accept a reused hash.
+    /// A duplicate HD index reuses a preimage (fund-theft risk), so issuance is
+    /// serialized in-process here ([`issue_key_index`]). The caller's
+    /// `BoltzStorage` must still guarantee `increment_key_index` is **durable**
+    /// (persisted before returning) and **atomic across processes** if multiple
+    /// instances share one store — neither is enforceable in-crate. This is the
+    /// sole defense against preimage reuse: Boltz's duplicate-preimage detection
+    /// (HTTP 409) must NOT be relied upon, as a malicious API could lie.
     pub async fn create_reverse_swap(
         &self,
         prepared: &PreparedSwap,
     ) -> Result<CreatedSwap, BoltzError> {
-        let key_index = self.store.increment_key_index().await?;
+        let key_index = issue_key_index(&self.key_index_lock, &*self.store).await?;
 
         let swap = self.executor.create(prepared, key_index).await?;
         let created = CreatedSwap {
@@ -461,5 +479,79 @@ impl BoltzService {
         swap.updated_at = current_unix_timestamp();
         self.store.update_swap(&swap).await?;
         Ok(swap)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "browser-tests")]
+    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    use super::*;
+    use std::collections::HashSet;
+    use std::sync::Mutex as StdMutex;
+
+    /// A deliberately non-transactional store: `increment_key_index` reads the
+    /// counter, yields, then writes — so two concurrent calls collide unless the
+    /// caller serializes them. Only `increment_key_index` is meaningful.
+    #[derive(Default)]
+    struct RacyStore {
+        counter: StdMutex<u32>,
+    }
+
+    #[macros::async_trait]
+    impl BoltzStorage for RacyStore {
+        async fn insert_swap(&self, _swap: &BoltzSwap) -> Result<(), BoltzError> {
+            Ok(())
+        }
+        async fn update_swap(&self, _swap: &BoltzSwap) -> Result<(), BoltzError> {
+            Ok(())
+        }
+        async fn get_swap(&self, _id: &str) -> Result<Option<BoltzSwap>, BoltzError> {
+            Ok(None)
+        }
+        async fn list_active_swaps(&self) -> Result<Vec<BoltzSwap>, BoltzError> {
+            Ok(vec![])
+        }
+        async fn increment_key_index(&self) -> Result<u32, BoltzError> {
+            let current = *self.counter.lock().unwrap();
+            platform_utils::tokio::task::yield_now().await;
+            *self.counter.lock().unwrap() = current.saturating_add(1);
+            Ok(current)
+        }
+    }
+
+    #[macros::async_test_all]
+    async fn issue_key_index_serializes_concurrent_calls() {
+        use futures::future::join_all;
+        const N: usize = 8;
+
+        // Sanity: unguarded, the racy store really does hand out duplicates, so
+        // the serialized assertion below is meaningful.
+        let store = RacyStore::default();
+        let racy: Vec<u32> = join_all((0..N).map(|_| store.increment_key_index()))
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            racy.iter().collect::<HashSet<_>>().len() < N,
+            "unguarded racy store should collide: {racy:?}"
+        );
+
+        // With in-process serialization every issued index is distinct, even
+        // though the underlying store is non-atomic.
+        let store = RacyStore::default();
+        let lock = Mutex::new(());
+        let issued: Vec<u32> = join_all((0..N).map(|_| issue_key_index(&lock, &store)))
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            issued.iter().collect::<HashSet<_>>().len(),
+            N,
+            "serialized issuance must be unique: {issued:?}"
+        );
     }
 }
