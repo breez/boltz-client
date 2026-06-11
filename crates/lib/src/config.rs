@@ -247,10 +247,11 @@ pub const CCTP_FEE_BPS_DENOMINATOR: u128 = 10_000 * CCTP_FEE_SCALE;
 pub const SOLANA_USDT0_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
 
 /// Default Solana JSON-RPC endpoint used when the destination is Solana.
-/// Public mainnet endpoint — fine for casual use but rate-limited, so
-/// callers with non-trivial throughput should override with a dedicated
-/// provider.
-pub const DEFAULT_SOLANA_RPC_URL: &str = "https://api.mainnet.solana.com";
+/// Public mainnet endpoint, CORS-enabled so it works from the browser (the
+/// official `api.mainnet-beta.solana.com` returns 403 on any browser-origin
+/// request). Rate-limited, so callers with non-trivial throughput should
+/// override with a dedicated provider.
+pub const DEFAULT_SOLANA_RPC_URL: &str = "https://solana-rpc.publicnode.com";
 
 /// tBTC has 18 decimals on EVM. Sats have 8 decimals. Conversion factor = 10^10.
 pub const SATS_TO_TBTC_FACTOR: u64 = 10_000_000_000;
