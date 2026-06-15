@@ -171,7 +171,7 @@ All paths are under `crates/lib/src/` unless noted.
 
 | Crate / file | Responsibility | Key types |
 |---|---|---|
-| `platform-utils` (`http/`, `auth.rs`, `lib.rs`) | reqwest-based `HttpClient` (one backend for native and WASM; native adds HTTP/2 + TCP keepalives), unified `HttpError` with `.status()`, and target-correct `tokio`/`time` re-exports. WASM gate is `all(target_family="wasm", target_os="unknown")`. | `HttpClient`, `HttpError`, `HttpResponse`, `DefaultHttpClient`, `create_http_client`, `ContentType` |
+| `platform-utils` (`http/`, `auth.rs`, `lib.rs`) | reqwest-based `HttpClient` (one backend for native and WASM; native adds HTTP/2 + TCP keepalives, WASM omits the User-Agent), unified `HttpError` with `.status()`, and target-correct `tokio`/`time` re-exports. WASM gate is `all(target_family="wasm", target_os="unknown")`. | `HttpClient`, `HttpError`, `HttpResponse`, `DefaultHttpClient`, `create_http_client`, `ContentType` |
 | `macros` (`src/lib.rs`) | Proc-macros for target-conditional async traits/tests and Rust→TS type mirroring. | `#[async_trait]`, `#[extern_wasm_bindgen]`, `derive_from`/`derive_into`, `test_all`/`async_test_all` (+ not_wasm/wasm variants) |
 | `cli` (`src/main.rs`) | Native REPL harness around `BoltzService`: clap args, mnemonic load-or-generate, file-backed `BoltzStorage`, rustyline command loop (`info`/`limits`/`prepare`/`swap`/`accept`/`refresh-deliveries`/`exit`). `FileBoltzStorage` is non-atomic and unfit for production. | `Cli`, `Command`, `PrintingEventListener`, `FileBoltzStorage` |
 

@@ -17,19 +17,37 @@ impl ReqwestHttpClient {
     /// defaults so a long-lived shared client survives intermediaries that
     /// reap idle HTTP/2 flows. On WASM the browser owns connection management
     /// and these knobs aren't exposed.
+    ///
+    /// The `user_agent` is applied on native only. In the browser a
+    /// script-set `User-Agent` is honored by Firefox/Safari but dropped by
+    /// Chrome; because it is not CORS-safelisted, setting it turns otherwise
+    /// simple requests into preflighted ones, and some third-party endpoints
+    /// (e.g. the USDT0 deployments API) reject the preflight. Browsers send
+    /// their own `User-Agent` regardless, so omitting it loses nothing. This
+    /// is a deliberate divergence from the upstream `spark-sdk` client, which
+    /// only talks to servers it controls and so can keep the override.
+    // `user_agent` is unused on WASM by design (see above); the signature is
+    // kept uniform across targets and to match the upstream client.
+    #[cfg_attr(
+        all(target_family = "wasm", target_os = "unknown"),
+        expect(clippy::needless_pass_by_value, unused_variables)
+    )]
     pub fn new(user_agent: Option<String>) -> Self {
-        let mut builder = reqwest::Client::builder();
-        if let Some(ua) = user_agent {
-            builder = builder.user_agent(ua);
-        }
+        let builder = reqwest::Client::builder();
+
         #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-        {
-            builder = builder
+        let builder = {
+            let mut builder = builder;
+            if let Some(ua) = user_agent {
+                builder = builder.user_agent(ua);
+            }
+            builder
                 .tcp_keepalive(Some(Duration::from_mins(1)))
                 .http2_keep_alive_interval(Duration::from_secs(30))
                 .http2_keep_alive_timeout(Duration::from_secs(10))
-                .http2_keep_alive_while_idle(true);
-        }
+                .http2_keep_alive_while_idle(true)
+        };
+
         let client = match builder.build() {
             Ok(client) => client,
             Err(e) => {

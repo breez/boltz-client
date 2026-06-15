@@ -96,7 +96,8 @@ impl BoltzService {
         // Each component gets its own DefaultHttpClient. They mostly hit
         // distinct hosts, so a shared reqwest connection pool would rarely be
         // reused; giving each its own keeps ownership simple (Box, not a
-        // cloned Arc). All carry USER_AGENT — some upstreams 403 without it.
+        // cloned Arc). All carry USER_AGENT — some upstreams 403 without it
+        // (native only; the WASM client omits it, see ReqwestHttpClient::new).
         let api_client = BoltzApiClient::new(
             &config,
             Box::new(DefaultHttpClient::new(Some(USER_AGENT.to_string()))),
