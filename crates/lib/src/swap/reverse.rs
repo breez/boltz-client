@@ -1706,7 +1706,7 @@ impl ReverseSwapExecutor {
             Ok(Some(mut s)) => {
                 s.pending_call_id = Some(call_id.to_string());
                 s.updated_at = current_unix_timestamp();
-                if let Err(e) = self.store.update_swap(&s).await {
+                if let Err(e) = self.store.upsert_swap(&s).await {
                     tracing::warn!(swap_id, error = %e, "Failed to persist pending call_id");
                 }
             }

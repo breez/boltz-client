@@ -623,14 +623,7 @@ impl FileBoltzStorage {
 
 #[macros::async_trait]
 impl BoltzStorage for FileBoltzStorage {
-    async fn insert_swap(&self, swap: &boltz_client::BoltzSwap) -> Result<(), BoltzError> {
-        self.write_swap(swap)
-    }
-
-    async fn update_swap(&self, swap: &boltz_client::BoltzSwap) -> Result<(), BoltzError> {
-        if !self.swap_path(&swap.id).exists() {
-            return Err(BoltzError::Store(format!("Swap not found: {}", swap.id)));
-        }
+    async fn upsert_swap(&self, swap: &boltz_client::BoltzSwap) -> Result<(), BoltzError> {
         self.write_swap(swap)
     }
 

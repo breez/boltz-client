@@ -164,7 +164,7 @@ All paths are under `crates/lib/src/` unless noted.
 | File | Responsibility | Key types |
 |---|---|---|
 | `keys.rs` | BIP-32 EVM key derivation (gas signer at `m/44/{chainId}/1/0`, preimage keys at `m/44/{chainId}/0/0/{index}`) and **deterministic preimage = SHA256(privkey)**, hash = SHA256(SHA256(privkey)). EIP-55 helpers. All levels non-hardened (restore compatibility). | `EvmKeyManager`, `EvmKeyPair`, `keccak256` |
-| `store.rs` | The persistence boundary callers implement: insert/update/get swap, list active (non-terminal), and atomically reserve the next HD key index. `increment_key_index` durability is the sole defense against preimage reuse. | `BoltzStorage` (trait); a volatile `MemoryBoltzStorage` exists only under `#[cfg(test)]` for the crate's own unit tests — never compiled when the crate is a dependency, so it can't back a production service |
+| `store.rs` | The persistence boundary callers implement: upsert/get swap, list active (non-terminal), and atomically reserve the next HD key index. `increment_key_index` durability is the sole defense against preimage reuse. | `BoltzStorage` (trait); a volatile `MemoryBoltzStorage` exists only under `#[cfg(test)]` for the crate's own unit tests — never compiled when the crate is a dependency, so it can't back a production service |
 | `events.rs` | In-process event broadcast to the embedding app. | `BoltzSwapEvent` (`SwapUpdated`/`QuoteDegraded`), `BoltzEventListener`, `EventEmitter` |
 
 ### Cross-platform infra

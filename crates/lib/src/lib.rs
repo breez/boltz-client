@@ -323,7 +323,7 @@ impl BoltzService {
             invoice_amount_sats: swap.invoice_amount_sats,
             timeout_block_height: swap.timeout_block_height,
         };
-        self.store.insert_swap(&swap).await?;
+        self.store.upsert_swap(&swap).await?;
         self.swap_manager.track_swap(&created.swap_id).await;
         Ok(created)
     }
@@ -344,7 +344,7 @@ impl BoltzService {
     ///
     /// Unlike [`create_reverse_swap`](Self::create_reverse_swap), this:
     /// - does not consume an HD key index (no `increment_key_index`),
-    /// - does not write to local storage (no `insert_swap`),
+    /// - does not write to local storage (no `upsert_swap`),
     /// - does not subscribe to swap WebSocket events,
     /// - sets a short `invoiceExpiry` so Boltz's server-side state
     ///   self-clears as quickly as the API allows.
@@ -429,7 +429,7 @@ impl BoltzService {
             Ok(tx_hash) => {
                 swap.claim_tx_hash = Some(tx_hash);
                 swap.updated_at = current_unix_timestamp();
-                self.store.update_swap(&swap).await?;
+                self.store.upsert_swap(&swap).await?;
                 Ok(swap)
             }
             Err(e) => {
@@ -479,7 +479,7 @@ impl BoltzService {
 
         swap.slippage_bps = bps;
         swap.updated_at = current_unix_timestamp();
-        self.store.update_swap(&swap).await?;
+        self.store.upsert_swap(&swap).await?;
         Ok(swap)
     }
 }
@@ -503,10 +503,7 @@ mod tests {
 
     #[macros::async_trait]
     impl BoltzStorage for RacyStore {
-        async fn insert_swap(&self, _swap: &BoltzSwap) -> Result<(), BoltzError> {
-            Ok(())
-        }
-        async fn update_swap(&self, _swap: &BoltzSwap) -> Result<(), BoltzError> {
+        async fn upsert_swap(&self, _swap: &BoltzSwap) -> Result<(), BoltzError> {
             Ok(())
         }
         async fn get_swap(&self, _id: &str) -> Result<Option<BoltzSwap>, BoltzError> {

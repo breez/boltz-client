@@ -45,7 +45,7 @@ const RECEIPT_POLL_INTERVAL_SECS: u64 = 5;
 /// `update_swap_slippage` / `refresh_pending_deliveries` paths — holds the
 /// swap's [`SwapLocks`] entry across its `get → mutate → persist` sequence, so
 /// concurrent work on one swap is serialized (the load-bearing guard against
-/// the whole-record `update_swap` clobbering a field, and against two competing
+/// the whole-record `upsert_swap` clobbering a field, and against two competing
 /// claim txs) while distinct swaps never block each other. See the 2026-06-09
 /// decision-log entry.
 pub(crate) struct SwapManager {
@@ -375,7 +375,7 @@ impl SwapManager {
                     let mut s = swap;
                     s.lockup_tx_id = Some(tx.id.clone());
                     s.updated_at = current_unix_timestamp();
-                    if let Err(e) = store.update_swap(&s).await {
+                    if let Err(e) = store.upsert_swap(&s).await {
                         tracing::error!(swap_id, error = %e, "Failed to persist lockup_tx_id");
                     }
                     event_emitter
@@ -394,7 +394,7 @@ impl SwapManager {
                     }
                     s.status = BoltzSwapStatus::TbtcLocked;
                     s.updated_at = current_unix_timestamp();
-                    if let Err(e) = store.update_swap(&s).await {
+                    if let Err(e) = store.upsert_swap(&s).await {
                         tracing::error!(swap_id, error = %e, "Failed to persist TbtcLocked status");
                     }
                     event_emitter
@@ -539,7 +539,7 @@ impl SwapManager {
             Ok(tx_hash) => {
                 swap.claim_tx_hash = Some(tx_hash);
                 swap.updated_at = current_unix_timestamp();
-                if let Err(e) = store.update_swap(swap).await {
+                if let Err(e) = store.upsert_swap(swap).await {
                     tracing::error!(swap_id, error = %e, "Failed to persist claim tx hash");
                 }
             }
@@ -562,7 +562,7 @@ impl SwapManager {
                 // (which also tolerates `Claiming`) and the next claim retries.
                 swap.status = BoltzSwapStatus::TbtcLocked;
                 swap.updated_at = current_unix_timestamp();
-                if let Err(e) = store.update_swap(swap).await {
+                if let Err(e) = store.upsert_swap(swap).await {
                     tracing::error!(swap_id, error = %e, "Failed to persist TbtcLocked after degraded quote");
                 }
                 event_emitter
@@ -695,7 +695,7 @@ impl SwapManager {
                     s.claim_tx_hash = Some(tx_hash.clone());
                     s.pending_call_id = None;
                     s.updated_at = current_unix_timestamp();
-                    if let Err(e) = store.update_swap(&s).await {
+                    if let Err(e) = store.upsert_swap(&s).await {
                         tracing::error!(swap_id, error = %e, "Failed to persist recovered tx hash");
                     }
                 }
@@ -986,7 +986,7 @@ impl SwapManager {
                 let mut s = swap.clone();
                 s.status = BoltzSwapStatus::TbtcLocked;
                 s.updated_at = current_unix_timestamp();
-                if let Err(e) = store.update_swap(&s).await {
+                if let Err(e) = store.upsert_swap(&s).await {
                     tracing::error!(swap_id, error = %e, "Failed to persist TbtcLocked reset");
                 }
                 Self::do_claim(executor, store, event_emitter, &mut s, false).await;
@@ -1052,7 +1052,7 @@ impl SwapManager {
                         s.claim_tx_hash = Some(tx_hash.clone());
                         s.pending_call_id = None;
                         s.updated_at = current_unix_timestamp();
-                        if let Err(e) = store.update_swap(&s).await {
+                        if let Err(e) = store.upsert_swap(&s).await {
                             tracing::error!(swap_id, error = %e, "Failed to persist recovered tx hash");
                         }
                     }
@@ -1104,7 +1104,7 @@ pub(crate) async fn update_swap_status(
 ) {
     swap.status = new_status;
     swap.updated_at = current_unix_timestamp();
-    if let Err(e) = store.update_swap(swap).await {
+    if let Err(e) = store.upsert_swap(swap).await {
         tracing::error!(swap_id = swap.id, error = %e, "Failed to update swap status");
     }
     emitter

@@ -23,8 +23,13 @@ use crate::models::BoltzSwap;
 /// still the impl's responsibility.
 #[macros::async_trait]
 pub trait BoltzStorage: Send + Sync {
-    async fn insert_swap(&self, swap: &BoltzSwap) -> Result<(), BoltzError>;
-    async fn update_swap(&self, swap: &BoltzSwap) -> Result<(), BoltzError>;
+    /// Insert a new swap or overwrite an existing one, keyed by `swap.id`.
+    ///
+    /// Idempotent by contract: swap progression replays the same row through
+    /// this method repeatedly. A store must accept both a first write and any
+    /// later overwrite, and must never reject one because the row does (or does
+    /// not) already exist.
+    async fn upsert_swap(&self, swap: &BoltzSwap) -> Result<(), BoltzError>;
     async fn get_swap(&self, id: &str) -> Result<Option<BoltzSwap>, BoltzError>;
     /// Return all swaps with non-terminal status.
     async fn list_active_swaps(&self) -> Result<Vec<BoltzSwap>, BoltzError>;
@@ -57,22 +62,12 @@ impl MemoryBoltzStorage {
 #[cfg(test)]
 #[macros::async_trait]
 impl BoltzStorage for MemoryBoltzStorage {
-    async fn insert_swap(&self, swap: &BoltzSwap) -> Result<(), BoltzError> {
+    async fn upsert_swap(&self, swap: &BoltzSwap) -> Result<(), BoltzError> {
         self.swaps
             .lock()
             .await
             .insert(swap.id.clone(), swap.clone());
         Ok(())
-    }
-
-    async fn update_swap(&self, swap: &BoltzSwap) -> Result<(), BoltzError> {
-        let mut swaps = self.swaps.lock().await;
-        if swaps.contains_key(&swap.id) {
-            swaps.insert(swap.id.clone(), swap.clone());
-            Ok(())
-        } else {
-            Err(BoltzError::Store(format!("Swap not found: {}", swap.id)))
-        }
     }
 
     async fn get_swap(&self, id: &str) -> Result<Option<BoltzSwap>, BoltzError> {
@@ -142,45 +137,48 @@ mod tests {
     async fn test_insert_and_get() {
         let store = MemoryBoltzStorage::new();
         let swap = test_swap("1", BoltzSwapStatus::Created);
-        store.insert_swap(&swap).await.unwrap();
+        store.upsert_swap(&swap).await.unwrap();
 
         let retrieved = store.get_swap("1").await.unwrap().unwrap();
         assert_eq!(retrieved.id, "1");
     }
 
     #[macros::async_test_all]
-    async fn test_update_swap() {
+    async fn test_upsert_swap() {
         let store = MemoryBoltzStorage::new();
         let mut swap = test_swap("1", BoltzSwapStatus::Created);
-        store.insert_swap(&swap).await.unwrap();
+        store.upsert_swap(&swap).await.unwrap();
 
         swap.status = BoltzSwapStatus::TbtcLocked;
-        store.update_swap(&swap).await.unwrap();
+        store.upsert_swap(&swap).await.unwrap();
 
         let retrieved = store.get_swap("1").await.unwrap().unwrap();
         assert_eq!(retrieved.status, BoltzSwapStatus::TbtcLocked);
     }
 
     #[macros::async_test_all]
-    async fn test_update_nonexistent_fails() {
+    async fn test_upsert_creates_missing_row() {
+        // upsert is idempotent: a write for an id never seen before creates it
+        // rather than erroring, so crash/retry paths can replay the same row.
         let store = MemoryBoltzStorage::new();
         let swap = test_swap("1", BoltzSwapStatus::Created);
-        assert!(store.update_swap(&swap).await.is_err());
+        store.upsert_swap(&swap).await.unwrap();
+        assert_eq!(store.get_swap("1").await.unwrap().unwrap().id, "1");
     }
 
     #[macros::async_test_all]
     async fn test_list_active_swaps() {
         let store = MemoryBoltzStorage::new();
         store
-            .insert_swap(&test_swap("1", BoltzSwapStatus::Created))
+            .upsert_swap(&test_swap("1", BoltzSwapStatus::Created))
             .await
             .unwrap();
         store
-            .insert_swap(&test_swap("2", BoltzSwapStatus::Completed))
+            .upsert_swap(&test_swap("2", BoltzSwapStatus::Completed))
             .await
             .unwrap();
         store
-            .insert_swap(&test_swap("3", BoltzSwapStatus::TbtcLocked))
+            .upsert_swap(&test_swap("3", BoltzSwapStatus::TbtcLocked))
             .await
             .unwrap();
 
@@ -210,11 +208,11 @@ mod tests {
         let store = MemoryBoltzStorage::new();
         let mut swap = test_swap("1", BoltzSwapStatus::Claiming);
         assert!(swap.pending_call_id.is_none());
-        store.insert_swap(&swap).await.unwrap();
+        store.upsert_swap(&swap).await.unwrap();
 
         // Mid-claim: record the in-flight call_id.
         swap.pending_call_id = Some("call_abc".to_string());
-        store.update_swap(&swap).await.unwrap();
+        store.upsert_swap(&swap).await.unwrap();
         assert_eq!(
             store.get_swap("1").await.unwrap().unwrap().pending_call_id,
             Some("call_abc".to_string())
@@ -223,7 +221,7 @@ mod tests {
         // Confirmed: tx hash recorded, pending marker cleared.
         swap.claim_tx_hash = Some("0xdeadbeef".to_string());
         swap.pending_call_id = None;
-        store.update_swap(&swap).await.unwrap();
+        store.upsert_swap(&swap).await.unwrap();
         let final_swap = store.get_swap("1").await.unwrap().unwrap();
         assert_eq!(final_swap.claim_tx_hash, Some("0xdeadbeef".to_string()));
         assert!(final_swap.pending_call_id.is_none());

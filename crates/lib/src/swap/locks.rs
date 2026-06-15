@@ -5,7 +5,7 @@
 //! the delivery poll, and the caller-facing `accept_degraded_quote` /
 //! `update_swap_slippage`) holds that swap's lock across its whole
 //! `get → mutate → persist` sequence. This is what keeps the whole-record,
-//! last-write-wins `BoltzStorage::update_swap` safe under concurrency: without
+//! last-write-wins `BoltzStorage::upsert_swap` safe under concurrency: without
 //! it, two writers racing on one swap clobber each other's fields, and two claim
 //! paths could submit competing gas-sponsored claim txs for the same swap.
 //!
