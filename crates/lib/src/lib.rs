@@ -93,9 +93,10 @@ impl BoltzService {
         let gas_key_pair = key_manager.derive_gas_signer(chain_id_u32)?;
         let gas_signer = EvmSigner::new(&gas_key_pair, config.chain_id);
 
-        // Each component gets its own DefaultHttpClient. Instances are cheap
-        // (no shared connection pool), so sharing via Arc is not worth the
-        // signature churn. All carry USER_AGENT — some upstreams 403 without it.
+        // Each component gets its own DefaultHttpClient. They mostly hit
+        // distinct hosts, so a shared reqwest connection pool would rarely be
+        // reused; giving each its own keeps ownership simple (Box, not a
+        // cloned Arc). All carry USER_AGENT — some upstreams 403 without it.
         let api_client = BoltzApiClient::new(
             &config,
             Box::new(DefaultHttpClient::new(Some(USER_AGENT.to_string()))),

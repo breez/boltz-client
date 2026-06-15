@@ -76,8 +76,7 @@ syn = "2.0.105"
 
 # HTTP (platform-utils deps)
 base64 = "0.22.1"
-bitreq = { version = "0.3.4" }
-reqwest = { version = "0.12.23", default-features = false, features = ["json", "http2", "charset", "system-proxy"] }
+reqwest = { version = "0.12.23", default-features = false, features = ["json", "http2", "charset", "system-proxy", "rustls-tls"] }
 
 # WASM test
 wasm-bindgen-test = "0.3.50"

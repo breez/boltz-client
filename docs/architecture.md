@@ -41,7 +41,7 @@ counterpart, treat it as orientation, not a guarantee of file-for-file parity.
 | `crates/lib` | `boltz-client` | Core library: Boltz API client, EVM/Solana contracts, swap orchestration, key management, background state machine. The public surface is `BoltzService`. |
 | `crates/cli` | `boltz-cli` | Interactive native REPL (rustyline) around `BoltzService` for manually exercising swaps. Developer/testing harness with file-backed storage — not a production interface. |
 | `crates/macros` | (proc-macros) | Target-conditional `#[async_trait]` (Send vs ?Send), dual-target test macros (`test_all` / `async_test_all`), and Rust→TypeScript type mirroring (`extern_wasm_bindgen`, `derive_from`/`derive_into`). |
-| `crates/platform-utils` | `platform-utils` | Cross-platform `HttpClient` (bitreq native / reqwest WASM), unified `HttpError`, and target-correct `tokio`/`time` re-exports. The native↔WASM seam. |
+| `crates/platform-utils` | `platform-utils` | Cross-platform `HttpClient` (reqwest on native and WASM), unified `HttpError`, and target-correct `tokio`/`time` re-exports. The native↔WASM seam. |
 
 ## 3. The swap flow
 
@@ -171,7 +171,7 @@ All paths are under `crates/lib/src/` unless noted.
 
 | Crate / file | Responsibility | Key types |
 |---|---|---|
-| `platform-utils` (`http/`, `auth.rs`, `lib.rs`) | Backend-swapping `HttpClient` (bitreq native / reqwest WASM), unified `HttpError` with `.status()`, and target-correct `tokio`/`time` re-exports. WASM gate is `all(target_family="wasm", target_os="unknown")`. | `HttpClient`, `HttpError`, `HttpResponse`, `DefaultHttpClient`, `create_http_client`, `ContentType` |
+| `platform-utils` (`http/`, `auth.rs`, `lib.rs`) | reqwest-based `HttpClient` (one backend for native and WASM; native adds HTTP/2 + TCP keepalives), unified `HttpError` with `.status()`, and target-correct `tokio`/`time` re-exports. WASM gate is `all(target_family="wasm", target_os="unknown")`. | `HttpClient`, `HttpError`, `HttpResponse`, `DefaultHttpClient`, `create_http_client`, `ContentType` |
 | `macros` (`src/lib.rs`) | Proc-macros for target-conditional async traits/tests and Rust→TS type mirroring. | `#[async_trait]`, `#[extern_wasm_bindgen]`, `derive_from`/`derive_into`, `test_all`/`async_test_all` (+ not_wasm/wasm variants) |
 | `cli` (`src/main.rs`) | Native REPL harness around `BoltzService`: clap args, mnemonic load-or-generate, file-backed `BoltzStorage`, rustyline command loop (`info`/`limits`/`prepare`/`swap`/`accept`/`refresh-deliveries`/`exit`). `FileBoltzStorage` is non-atomic and unfit for production. | `Cli`, `Command`, `PrintingEventListener`, `FileBoltzStorage` |
 
@@ -180,7 +180,7 @@ All paths are under `crates/lib/src/` unless noted.
 These are invariants the whole codebase upholds. For the reasoning behind each,
 see [`docs/decisions.md`](./decisions.md).
 
-- **No panics in production code.** Always `Result`, never `expect`/`unwrap`. (One deliberate exception: `ReqwestHttpClient::new` on WASM, where browser reqwest cannot realistically fail to build.)
+- **No panics in production code.** Always `Result`, never `expect`/`unwrap`. (One deliberate exception: `ReqwestHttpClient::new` panics if the reqwest client fails to build, treated as unrecoverable misconfiguration rather than a per-request error.)
 - **WASM-compatible throughout.** alloy-rs primitives, `platform_utils` abstractions, no filesystem deps in the lib. Use `platform_utils::{time,tokio}`, never `std::time` / `tokio` directly. Annotate async traits with `#[macros::async_trait]`, never `async_trait::async_trait`.
 - **Deterministic preimage derivation.** `preimage = SHA256(private_key)`; preimages are never stored. Correctness depends entirely on stable seed + chainId + index — changing the derivation path or hashing scheme silently invalidates recovery of all existing swaps.
 - **Gas abstraction.** EIP-7702 via a configurable gas-sponsor URL (wraps Alchemy server-side; no hardcoded API key/policy) so users never need ETH on Arbitrum.
