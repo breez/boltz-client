@@ -14,8 +14,8 @@ use crate::evm::contracts::{
     refund_event_topic0,
 };
 use crate::evm::provider::EvmProvider;
-use crate::keys::EvmKeyManager;
 use crate::models::BoltzSwap;
+use crate::secrets::SecretProvider;
 
 /// Check whether a swap is still locked on-chain (not yet claimed/refunded).
 pub async fn is_swap_still_locked(
@@ -46,16 +46,12 @@ pub async fn is_swap_still_locked(
 /// Convenience wrapper: check whether a persisted swap's funds are still
 /// locked on the `ERC20Swap` contract. Returns `true` if claimable, `false`
 /// if already claimed or refunded.
-pub async fn is_swap_still_locked_by_swap(
+pub(crate) async fn is_swap_still_locked_by_swap(
     evm_provider: &EvmProvider,
     swap: &BoltzSwap,
-    key_manager: &EvmKeyManager,
+    secrets: &dyn SecretProvider,
 ) -> Result<bool, BoltzError> {
-    let chain_id_u32: u32 = swap
-        .chain_id
-        .try_into()
-        .map_err(|_| BoltzError::Generic("Chain ID overflow".into()))?;
-    let preimage_hash = key_manager.derive_preimage_hash(chain_id_u32, swap.claim_key_index)?;
+    let preimage_hash = secrets.preimage_hash(swap)?;
     let tbtc_evm_amount = U256::from(swap.onchain_amount)
         .checked_mul(U256::from(SATS_TO_TBTC_FACTOR))
         .ok_or_else(|| BoltzError::Generic("tBTC EVM amount overflow".into()))?;
@@ -103,16 +99,12 @@ pub enum SpentClassification {
 /// [`SpentClassification::Unknown`] rather than guess. A `Claim` log for our
 /// indexed `preimageHash` on our own `ERC20Swap` is conclusive proof of a claim,
 /// so no preimage re-check is needed.
-pub async fn classify_spent_lockup(
+pub(crate) async fn classify_spent_lockup(
     evm_provider: &EvmProvider,
     swap: &BoltzSwap,
-    key_manager: &EvmKeyManager,
+    secrets: &dyn SecretProvider,
 ) -> Result<SpentClassification, BoltzError> {
-    let chain_id_u32: u32 = swap
-        .chain_id
-        .try_into()
-        .map_err(|_| BoltzError::Generic("Chain ID overflow".into()))?;
-    let preimage_hash = key_manager.derive_preimage_hash(chain_id_u32, swap.claim_key_index)?;
+    let preimage_hash = secrets.preimage_hash(swap)?;
     let preimage_topic = bytes32_to_topic(&preimage_hash);
 
     let Some((from_block, to_block)) = resolve_lockup_block_range(evm_provider, swap).await? else {
@@ -198,7 +190,9 @@ mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
     use super::*;
-    use crate::models::{Asset, BoltzSwapStatus, BridgeKind};
+    use crate::models::{Asset, BoltzSwapStatus, BridgeKind, SwapKeySource};
+    use crate::secrets::DerivedSecretProvider;
+    use crate::store::MemoryBoltzStorage;
     use platform_utils::http::{HttpClient, HttpError, HttpResponse};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -296,7 +290,7 @@ mod tests {
             id: "swap-1".to_string(),
             status: BoltzSwapStatus::Claiming,
             bridge_kind: BridgeKind::Oft,
-            claim_key_index: 0,
+            key_source: SwapKeySource::Derived { claim_key_index: 0 },
             chain_id: 42161,
             claim_address: "0xabc".to_string(),
             destination_address: "0xdef".to_string(),
@@ -321,8 +315,11 @@ mod tests {
         }
     }
 
-    fn key_manager() -> EvmKeyManager {
-        EvmKeyManager::from_seed(&[7u8; 32]).unwrap()
+    fn secret_provider() -> DerivedSecretProvider {
+        DerivedSecretProvider::new(
+            crate::keys::EvmKeyManager::from_seed(&[7u8; 32]).unwrap(),
+            Arc::new(MemoryBoltzStorage::new()),
+        )
     }
 
     #[macros::async_test_all]
@@ -334,7 +331,7 @@ mod tests {
             rpc_ok(&serde_json::json!("0x20")),
             rpc_ok(&serde_json::json!([log_with_tx("0xwinner")])),
         ]);
-        let result = classify_spent_lockup(&evm, &test_swap(Some("0xlockup")), &key_manager())
+        let result = classify_spent_lockup(&evm, &test_swap(Some("0xlockup")), &secret_provider())
             .await
             .unwrap();
         assert_eq!(
@@ -354,7 +351,7 @@ mod tests {
             rpc_ok(&serde_json::json!([])),
             rpc_ok(&serde_json::json!([log_with_tx("0xrefund")])),
         ]);
-        let result = classify_spent_lockup(&evm, &test_swap(Some("0xlockup")), &key_manager())
+        let result = classify_spent_lockup(&evm, &test_swap(Some("0xlockup")), &secret_provider())
             .await
             .unwrap();
         assert_eq!(result, SpentClassification::Refunded);
@@ -370,7 +367,7 @@ mod tests {
             rpc_ok(&serde_json::json!([])),
             rpc_ok(&serde_json::json!([])),
         ]);
-        let result = classify_spent_lockup(&evm, &test_swap(Some("0xlockup")), &key_manager())
+        let result = classify_spent_lockup(&evm, &test_swap(Some("0xlockup")), &secret_provider())
             .await
             .unwrap();
         assert_eq!(result, SpentClassification::Unknown);
@@ -380,7 +377,7 @@ mod tests {
     async fn classify_unknown_when_lockup_tx_id_missing() {
         // No block anchor → Unknown without issuing any RPC (empty mock).
         let evm = provider(vec![]);
-        let result = classify_spent_lockup(&evm, &test_swap(None), &key_manager())
+        let result = classify_spent_lockup(&evm, &test_swap(None), &secret_provider())
             .await
             .unwrap();
         assert_eq!(result, SpentClassification::Unknown);
@@ -390,7 +387,7 @@ mod tests {
     async fn classify_unknown_when_receipt_not_found() {
         // Lockup tx hash known but its receipt isn't resolvable (null) → Unknown.
         let evm = provider(vec![rpc_ok(&serde_json::Value::Null)]);
-        let result = classify_spent_lockup(&evm, &test_swap(Some("0xlockup")), &key_manager())
+        let result = classify_spent_lockup(&evm, &test_swap(Some("0xlockup")), &secret_provider())
             .await
             .unwrap();
         assert_eq!(result, SpentClassification::Unknown);

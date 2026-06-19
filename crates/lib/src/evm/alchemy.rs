@@ -43,19 +43,13 @@ pub(crate) struct AlchemyResult {
 pub(crate) struct AlchemyGasClient {
     rpc_url: String,
     http_client: Box<dyn HttpClient>,
-    gas_signer: EvmSigner,
 }
 
 impl AlchemyGasClient {
-    pub fn new(
-        config: &AlchemyConfig,
-        http_client: Box<dyn HttpClient>,
-        gas_signer: EvmSigner,
-    ) -> Self {
+    pub fn new(config: &AlchemyConfig, http_client: Box<dyn HttpClient>) -> Self {
         Self {
             rpc_url: config.gas_sponsor_url.clone(),
             http_client,
-            gas_signer,
         }
     }
 
@@ -68,8 +62,9 @@ impl AlchemyGasClient {
         &self,
         calls: Vec<EvmCall>,
         chain_id: u64,
+        gas_signer: &EvmSigner,
     ) -> Result<AlchemyResult, BoltzError> {
-        let call_id = self.submit_calls(calls, chain_id).await?;
+        let call_id = self.submit_calls(calls, chain_id, gas_signer).await?;
         self.poll_call_status(&call_id).await
     }
 
@@ -83,12 +78,13 @@ impl AlchemyGasClient {
         &self,
         calls: Vec<EvmCall>,
         chain_id: u64,
+        gas_signer: &EvmSigner,
     ) -> Result<String, BoltzError> {
         // Step 1: wallet_prepareCalls
-        let prepared = self.prepare_calls(&calls, chain_id).await?;
+        let prepared = self.prepare_calls(&calls, chain_id, gas_signer).await?;
 
         // Step 2: Sign and send via wallet_sendPreparedCalls
-        self.sign_and_send(prepared).await
+        self.sign_and_send(prepared, gas_signer).await
     }
 
     /// Step 1: `wallet_prepareCalls` — prepare calls for gas abstraction.
@@ -96,6 +92,7 @@ impl AlchemyGasClient {
         &self,
         calls: &[EvmCall],
         chain_id: u64,
+        gas_signer: &EvmSigner,
     ) -> Result<serde_json::Value, BoltzError> {
         let json_calls: Vec<serde_json::Value> = calls
             .iter()
@@ -116,7 +113,7 @@ impl AlchemyGasClient {
         // the sponsorship policy server-side, so the client holds no policy id.
         let params = serde_json::json!([{
             "calls": json_calls,
-            "from": self.gas_signer.address_hex(),
+            "from": gas_signer.address_hex(),
             "chainId": format!("0x{:x}", chain_id)
         }]);
 
@@ -124,7 +121,11 @@ impl AlchemyGasClient {
     }
 
     /// Step 2: Sign the prepared calls and send via `wallet_sendPreparedCalls`.
-    async fn sign_and_send(&self, prepared: serde_json::Value) -> Result<String, BoltzError> {
+    async fn sign_and_send(
+        &self,
+        prepared: serde_json::Value,
+        gas_signer: &EvmSigner,
+    ) -> Result<String, BoltzError> {
         // Log only the response shape, never the payload: the prepared/signed
         // blobs embed the claim UserOp callData, whose leading ABI argument is
         // the HTLC preimage — a live settlement secret that must not reach logs
@@ -137,7 +138,7 @@ impl AlchemyGasClient {
             "wallet_prepareCalls response"
         );
 
-        let signed = self.sign_prepared_response(&prepared)?;
+        let signed = Self::sign_prepared_response(&prepared, gas_signer)?;
 
         let result: SendPreparedCallsResponse = self
             .rpc_call("wallet_sendPreparedCalls", serde_json::json!([signed]))
@@ -159,8 +160,8 @@ impl AlchemyGasClient {
     /// - **First-time** (`type: "array"`): Two entries — authorization (raw sign) + `UserOp` (EIP-191)
     /// - **Subsequent** (`type: "user-operation-v070"`): Single `UserOp` (EIP-191)
     fn sign_prepared_response(
-        &self,
         prepared: &serde_json::Value,
+        gas_signer: &EvmSigner,
     ) -> Result<serde_json::Value, BoltzError> {
         let resp_type = prepared["type"].as_str().ok_or_else(|| BoltzError::Evm {
             reason: "prepareCalls response missing 'type' field".to_string(),
@@ -168,8 +169,8 @@ impl AlchemyGasClient {
         })?;
 
         match resp_type {
-            "array" => self.sign_first_time_response(prepared),
-            "user-operation-v070" => self.sign_subsequent_response(prepared),
+            "array" => Self::sign_first_time_response(prepared, gas_signer),
+            "user-operation-v070" => Self::sign_subsequent_response(prepared, gas_signer),
             other => Err(BoltzError::Evm {
                 reason: format!("Unknown prepareCalls response type: {other}"),
                 tx_hash: None,
@@ -181,8 +182,8 @@ impl AlchemyGasClient {
     /// Authorization: sign `signatureRequest.rawPayload` with raw ECDSA (no prefix).
     /// `UserOp`: sign `signatureRequest.data.raw` with EIP-191.
     fn sign_first_time_response(
-        &self,
         prepared: &serde_json::Value,
+        gas_signer: &EvmSigner,
     ) -> Result<serde_json::Value, BoltzError> {
         let data = prepared["data"].as_array().ok_or_else(|| BoltzError::Evm {
             reason: "First-time response 'data' is not an array".to_string(),
@@ -215,13 +216,13 @@ impl AlchemyGasClient {
         let auth_entry = &data[0];
         let auth_payload = extract_raw_payload(auth_entry)?;
         let auth_digest = parse_payload_to_digest(&auth_payload)?;
-        let auth_sig = self.gas_signer.sign_raw_digest(&auth_digest)?;
+        let auth_sig = gas_signer.sign_raw_digest(&auth_digest)?;
 
         // Entry 1: user-operation — EIP-191 sign of signatureRequest.data.raw
         let uo_entry = &data[1];
         let uo_payload = extract_data_raw(uo_entry)?;
         let uo_bytes = parse_payload_to_bytes(&uo_payload)?;
-        let uo_sig = self.gas_signer.sign_message(&uo_bytes)?;
+        let uo_sig = gas_signer.sign_message(&uo_bytes)?;
 
         Ok(serde_json::json!({
             "type": "array",
@@ -236,12 +237,12 @@ impl AlchemyGasClient {
     /// Sign `signatureRequest.data.raw` with EIP-191.
     /// See trust note in `sign_first_time_response`.
     fn sign_subsequent_response(
-        &self,
         prepared: &serde_json::Value,
+        gas_signer: &EvmSigner,
     ) -> Result<serde_json::Value, BoltzError> {
         let payload = extract_data_raw(prepared)?;
         let bytes = parse_payload_to_bytes(&payload)?;
-        let sig = self.gas_signer.sign_message(&bytes)?;
+        let sig = gas_signer.sign_message(&bytes)?;
 
         Ok(attach_signature(prepared, &sig))
     }
@@ -688,15 +689,7 @@ mod tests {
     #[macros::test_all]
     #[allow(clippy::similar_names)]
     fn test_sign_subsequent_response() {
-        let config = AlchemyConfig {
-            gas_sponsor_url: "https://sponsor.test/".to_string(),
-        };
         let signer = test_signer();
-        let client = AlchemyGasClient::new(
-            &config,
-            Box::new(MockAlchemyHttpClient::new(vec![])),
-            signer,
-        );
 
         // Subsequent response: single UserOp
         let prepared = serde_json::json!({
@@ -708,7 +701,7 @@ mod tests {
             "chainId": "0xa4b1"
         });
 
-        let signed = client.sign_prepared_response(&prepared).unwrap();
+        let signed = AlchemyGasClient::sign_prepared_response(&prepared, &signer).unwrap();
         assert!(signed["signature"]["type"].as_str() == Some("secp256k1"));
         assert!(
             signed["signature"]["data"]
@@ -721,15 +714,7 @@ mod tests {
     #[macros::test_all]
     #[allow(clippy::similar_names)]
     fn test_sign_first_time_response() {
-        let config = AlchemyConfig {
-            gas_sponsor_url: "https://sponsor.test/".to_string(),
-        };
         let signer = test_signer();
-        let client = AlchemyGasClient::new(
-            &config,
-            Box::new(MockAlchemyHttpClient::new(vec![])),
-            signer,
-        );
 
         // First-time response: array with authorization + UserOp
         let prepared = serde_json::json!({
@@ -755,7 +740,7 @@ mod tests {
             ]
         });
 
-        let signed = client.sign_prepared_response(&prepared).unwrap();
+        let signed = AlchemyGasClient::sign_prepared_response(&prepared, &signer).unwrap();
         assert_eq!(signed["type"], "array");
 
         let data = signed["data"].as_array().unwrap();
@@ -802,11 +787,8 @@ mod tests {
             })),
         ];
 
-        let client = AlchemyGasClient::new(
-            &config,
-            Box::new(MockAlchemyHttpClient::new(responses)),
-            signer,
-        );
+        let client =
+            AlchemyGasClient::new(&config, Box::new(MockAlchemyHttpClient::new(responses)));
 
         let result = client
             .send_sponsored_calls(
@@ -816,6 +798,7 @@ mod tests {
                     data: Some("0xdeadbeef".to_string()),
                 }],
                 42161,
+                &signer,
             )
             .await
             .unwrap();
@@ -858,11 +841,8 @@ mod tests {
             })),
         ];
 
-        let client = AlchemyGasClient::new(
-            &config,
-            Box::new(MockAlchemyHttpClient::new(responses)),
-            signer,
-        );
+        let client =
+            AlchemyGasClient::new(&config, Box::new(MockAlchemyHttpClient::new(responses)));
 
         let result = client
             .send_sponsored_calls(
@@ -872,6 +852,7 @@ mod tests {
                     data: Some("0xdeadbeef".to_string()),
                 }],
                 42161,
+                &signer,
             )
             .await;
 
@@ -917,11 +898,8 @@ mod tests {
             })),
         ];
 
-        let client = AlchemyGasClient::new(
-            &config,
-            Box::new(MockAlchemyHttpClient::new(responses)),
-            signer,
-        );
+        let client =
+            AlchemyGasClient::new(&config, Box::new(MockAlchemyHttpClient::new(responses)));
 
         let result = client
             .send_sponsored_calls(
@@ -931,6 +909,7 @@ mod tests {
                     data: Some("0xdeadbeef".to_string()),
                 }],
                 42161,
+                &signer,
             )
             .await
             .unwrap();
@@ -956,11 +935,8 @@ mod tests {
             })),
         ];
 
-        let client = AlchemyGasClient::new(
-            &config,
-            Box::new(MockAlchemyHttpClient::new(responses)),
-            test_signer(),
-        );
+        let client =
+            AlchemyGasClient::new(&config, Box::new(MockAlchemyHttpClient::new(responses)));
 
         let result = client.poll_call_status("call_x").await.unwrap();
         assert_eq!(result.tx_hash, "0xfinal");
@@ -1094,15 +1070,7 @@ mod tests {
     #[macros::test_all]
     fn test_first_time_flow_matches_ethers() {
         // Vector 3: full signPreparedCalls first-time flow
-        let config = AlchemyConfig {
-            gas_sponsor_url: "https://sponsor.test/".to_string(),
-        };
         let signer = test_signer();
-        let client = AlchemyGasClient::new(
-            &config,
-            Box::new(MockAlchemyHttpClient::new(vec![])),
-            signer,
-        );
 
         // Mirrors real Alchemy response: UserOp entry has BOTH rawPayload and data.raw
         // with different values. We must use data.raw for UserOp, rawPayload for auth.
@@ -1131,7 +1099,7 @@ mod tests {
             ]
         });
 
-        let sign_result = client.sign_prepared_response(&prepared).unwrap();
+        let sign_result = AlchemyGasClient::sign_prepared_response(&prepared, &signer).unwrap();
         let data = sign_result["data"].as_array().unwrap();
 
         // Auth entry signature must match ethers
@@ -1162,15 +1130,7 @@ mod tests {
     #[macros::test_all]
     fn test_subsequent_flow_matches_ethers() {
         // Vector 4: full signPreparedCalls subsequent flow
-        let config = AlchemyConfig {
-            gas_sponsor_url: "https://sponsor.test/".to_string(),
-        };
         let signer = test_signer();
-        let client = AlchemyGasClient::new(
-            &config,
-            Box::new(MockAlchemyHttpClient::new(vec![])),
-            signer,
-        );
 
         let prepared = serde_json::json!({
             "type": "user-operation-v070",
@@ -1183,7 +1143,7 @@ mod tests {
             "chainId": "0xa4b1"
         });
 
-        let sign_result = client.sign_prepared_response(&prepared).unwrap();
+        let sign_result = AlchemyGasClient::sign_prepared_response(&prepared, &signer).unwrap();
 
         assert_eq!(
             sign_result["signature"]["data"].as_str().unwrap(),

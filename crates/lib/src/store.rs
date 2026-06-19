@@ -10,17 +10,9 @@ use crate::models::BoltzSwap;
 /// (A volatile `MemoryBoltzStorage` exists for the crate's own unit tests only,
 /// gated behind `#[cfg(test)]`, so it is never reachable by an embedder.)
 ///
-/// # Key index durability
-///
-/// `increment_key_index` must be durable: the new index must be persisted
-/// before the method returns. This is the sole defense against preimage
-/// reuse — if the counter regresses after a crash, a previously-used
-/// preimage hash could be sent to Boltz, enabling fund theft.
-///
-/// In-process concurrency is handled for you — the library serializes issuance
-/// (`issue_key_index`), so a single-process embedder needs only durability, not
-/// an atomic counter. Atomicity across *separate processes* sharing one store is
-/// still the impl's responsibility.
+/// This is all a seedless service needs — random per-swap secrets are persisted
+/// inline on the swap row, so there is no key-index counter to maintain. Seeded
+/// services additionally require [`DerivedKeyStore`].
 #[macros::async_trait]
 pub trait BoltzStorage: Send + Sync {
     /// Insert a new swap or overwrite an existing one, keyed by `swap.id`.
@@ -29,10 +21,29 @@ pub trait BoltzStorage: Send + Sync {
     /// this method repeatedly. A store must accept both a first write and any
     /// later overwrite, and must never reject one because the row does (or does
     /// not) already exist.
+    ///
+    /// In seedless mode the row carries the swap's only copy of its preimage and
+    /// claim key, so this write must be durable before it returns — a swap whose
+    /// secrets aren't persisted before its invoice is paid is unclaimable.
     async fn upsert_swap(&self, swap: &BoltzSwap) -> Result<(), BoltzError>;
     async fn get_swap(&self, id: &str) -> Result<Option<BoltzSwap>, BoltzError>;
     /// Return all swaps with non-terminal status.
     async fn list_active_swaps(&self) -> Result<Vec<BoltzSwap>, BoltzError>;
+}
+
+/// Extra persistence required only when preimages are seed-derived.
+///
+/// `increment_key_index` must be durable: the new index must be persisted
+/// before the method returns. This is the sole defense against preimage
+/// reuse — if the counter regresses after a crash, a previously-used
+/// preimage hash could be sent to Boltz, enabling fund theft.
+///
+/// In-process concurrency is handled for you — the library serializes issuance,
+/// so a single-process embedder needs only durability, not an atomic counter.
+/// Atomicity across *separate processes* sharing one store is still the impl's
+/// responsibility. Seedless services do not implement this trait.
+#[macros::async_trait]
+pub trait DerivedKeyStore: BoltzStorage {
     /// Atomically reserve the next key index and return it.
     async fn increment_key_index(&self) -> Result<u32, BoltzError>;
 }
@@ -84,7 +95,11 @@ impl BoltzStorage for MemoryBoltzStorage {
             .cloned()
             .collect())
     }
+}
 
+#[cfg(test)]
+#[macros::async_trait]
+impl DerivedKeyStore for MemoryBoltzStorage {
     async fn increment_key_index(&self) -> Result<u32, BoltzError> {
         let mut idx = self.key_index.lock().await;
         let current = *idx;
@@ -101,14 +116,14 @@ mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
     use super::*;
-    use crate::models::{Asset, BoltzSwapStatus, BridgeKind};
+    use crate::models::{Asset, BoltzSwapStatus, BridgeKind, SwapKeySource};
 
     fn test_swap(id: &str, status: BoltzSwapStatus) -> BoltzSwap {
         BoltzSwap {
             id: id.to_string(),
             status,
             bridge_kind: BridgeKind::Oft,
-            claim_key_index: 0,
+            key_source: SwapKeySource::Derived { claim_key_index: 0 },
             chain_id: 42161,
             claim_address: "0xabc".to_string(),
             destination_address: "0xdef".to_string(),

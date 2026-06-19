@@ -21,8 +21,11 @@ and client-executed**.
 The single public entrypoint is `BoltzService` (see `crates/lib/src/lib.rs`),
 which exposes a two-step `prepare` / `create` reverse-swap API plus lifecycle,
 slippage, and delivery-refresh controls. Callers supply persistence (the
-`BoltzStorage` trait) and a seed; the library owns all swap orchestration,
-signing, gas abstraction, and background state machine.
+`BoltzStorage` trait) and choose a **secret mode**: seeded (`new`, preimages and
+the gas signer HD-derived from a seed; the store must also implement
+`DerivedKeyStore`) or seedless (`new_seedless`, a random preimage and per-swap
+gas key generated and stored inline on each swap). The library owns all swap
+orchestration, signing, gas abstraction, and background state machine.
 
 **Reference implementation.** The behavioral reference is
 [`boltz-web-app`](https://github.com/BoltzExchange/boltz-web-app), a SolidJS
@@ -90,8 +93,10 @@ skips straight to `Completed`.
 ```
 
 **Two-step API.** `prepare_reverse_swap[_from_sats]` is a pure quote (no side
-effects); `create_reverse_swap` commits — it reserves the next HD key index,
-inserts the swap, returns the hold invoice, and begins background monitoring.
+effects); `create_reverse_swap` commits — it mints the swap's secrets (reserving
+the next HD key index in seeded mode, or generating a random preimage + gas key
+in seedless mode), inserts the swap, returns the hold invoice, and begins
+background monitoring.
 The background `SwapManager` reacts to Boltz WebSocket status updates, triggers
 the atomic claim on `transaction.confirmed`, polls the EVM receipt, and gates
 bridged-swap completion on confirmed delivery. Recovery after a crash relies on
@@ -123,7 +128,7 @@ All paths are under `crates/lib/src/` unless noted.
 | File | Responsibility | Key types |
 |---|---|---|
 | `config.rs` | Runtime config + a body of protocol-fact `const`s (chain IDs, contract/token addresses, CCTP/OFT params, fee scales, default URLs/cadences). `mainnet(referral_id)` is the canonical Arbitrum preset. | `BoltzConfig`, `AlchemyConfig`; consts `ARBITRUM_*_ADDRESS`, `CCTP_*`, `ARBITRUM_USDT0_NATIVE/LEGACY_OFT`, `SOLANA_*_MINT`, `*_SLIPPAGE_BPS`, `SATS_TO_TBTC_FACTOR`, default endpoint URLs |
-| `models.rs` | The persisted swap record, its lifecycle, and the **unified destination registry** spanning all three bridges. Public API exposes only the coarse `BridgeKind`; claim dispatch resolves the data-carrying internal `Bridge` from the destination. | `BoltzSwap` (preimage/hash are *not* fields — derived; crash-resume fields `pending_call_id`/`claim_tx_hash`), `BoltzSwapStatus`, `DestinationRegistry` (a `Vec<Destination>` looked up by `find(chain, asset)`), `Destination` (identified by its `(chain_label, asset)` pair), `Asset`, `Bridge`/`BridgeKind`, `NetworkTransport`, `Usdt0Kind`, `CCTP_DESTINATIONS`, DTOs `PreparedSwap`/`CreatedSwap`/`SwapLimits`/`DestinationOption` |
+| `models.rs` | The persisted swap record, its lifecycle, and the **unified destination registry** spanning all three bridges. Public API exposes only the coarse `BridgeKind`; claim dispatch resolves the data-carrying internal `Bridge` from the destination. | `BoltzSwap` (its `key_source` is either `Derived{claim_key_index}` — secrets re-derived, not stored — or `Stored(SwapSecrets)` — random preimage + gas key held inline; crash-resume fields `pending_call_id`/`claim_tx_hash`), `SwapKeySource`/`SwapSecrets`/`Secret` (redacting, zeroizing), `BoltzSwapStatus`, `DestinationRegistry` (a `Vec<Destination>` looked up by `find(chain, asset)`), `Destination` (identified by its `(chain_label, asset)` pair), `Asset`, `Bridge`/`BridgeKind`, `NetworkTransport`, `Usdt0Kind`, `CCTP_DESTINATIONS`, DTOs `PreparedSwap`/`CreatedSwap`/`SwapLimits`/`DestinationOption` |
 
 ### Swap orchestration (`swap/`)
 
@@ -163,8 +168,9 @@ All paths are under `crates/lib/src/` unless noted.
 
 | File | Responsibility | Key types |
 |---|---|---|
-| `keys.rs` | BIP-32 EVM key derivation (gas signer at `m/44/{chainId}/1/0`, preimage keys at `m/44/{chainId}/0/0/{index}`) and **deterministic preimage = SHA256(privkey)**, hash = SHA256(SHA256(privkey)). EIP-55 helpers. All levels non-hardened (restore compatibility). | `EvmKeyManager`, `EvmKeyPair`, `keccak256` |
-| `store.rs` | The persistence boundary callers implement: upsert/get swap, list active (non-terminal), and atomically reserve the next HD key index. `increment_key_index` durability is the sole defense against preimage reuse. | `BoltzStorage` (trait); a volatile `MemoryBoltzStorage` exists only under `#[cfg(test)]` for the crate's own unit tests — never compiled when the crate is a dependency, so it can't back a production service |
+| `keys.rs` | BIP-32 EVM key derivation (gas signer at `m/44/{chainId}/1/0`, preimage keys at `m/44/{chainId}/0/0/{index}`) and **deterministic preimage = SHA256(privkey)**, hash = SHA256(SHA256(privkey)). EIP-55 helpers. All levels non-hardened (restore compatibility). Also builds key pairs from raw bytes / random (seedless gas keys, probe throwaways). | `EvmKeyManager`, `EvmKeyPair`, `keccak256` |
+| `secrets.rs` | Abstraction over where a swap's preimage and claim/gas key come from. `issue` mints them at create time; `preimage`/`preimage_hash`/`gas_key_pair` resolve them from a persisted swap. Two impls back the two `SwapKeySource` modes; each rejects the other's swaps. | `SecretProvider` (trait), `DerivedSecretProvider` (HD + in-process index serialization), `RandomSecretProvider` (stateless), `IssuedSecrets` |
+| `store.rs` | The persistence boundary callers implement. `BoltzStorage` (upsert/get swap, list active) is all a seedless service needs — random secrets ride inline on the swap row, so `upsert_swap` must be durable before the invoice is paid. Seeded services additionally implement `DerivedKeyStore` (`increment_key_index`), whose durability is the sole defense against preimage reuse. | `BoltzStorage`/`DerivedKeyStore` (traits); a volatile `MemoryBoltzStorage` exists only under `#[cfg(test)]` for the crate's own unit tests — never compiled when the crate is a dependency, so it can't back a production service |
 | `events.rs` | In-process event broadcast to the embedding app. | `BoltzSwapEvent` (`SwapUpdated`/`QuoteDegraded`), `BoltzEventListener`, `EventEmitter` |
 
 ### Cross-platform infra
@@ -182,17 +188,17 @@ see [`docs/decisions.md`](./decisions.md).
 
 - **No panics in production code.** Always `Result`, never `expect`/`unwrap`. (One deliberate exception: `ReqwestHttpClient::new` panics if the reqwest client fails to build, treated as unrecoverable misconfiguration rather than a per-request error.)
 - **WASM-compatible throughout.** alloy-rs primitives, `platform_utils` abstractions, no filesystem deps in the lib. Use `platform_utils::{time,tokio}`, never `std::time` / `tokio` directly. Annotate async traits with `#[macros::async_trait]`, never `async_trait::async_trait`.
-- **Deterministic preimage derivation.** `preimage = SHA256(private_key)`; preimages are never stored. Correctness depends entirely on stable seed + chainId + index — changing the derivation path or hashing scheme silently invalidates recovery of all existing swaps.
+- **Two secret modes (mutually exclusive per service).** *Seeded* (`new`): `preimage = SHA256(private_key)`, never stored, re-derived from stable seed + chainId + index — changing the derivation path or hashing scheme silently invalidates recovery of all existing swaps; requires a durable `DerivedKeyStore` counter. *Seedless* (`new_seedless`): a random preimage and per-swap gas key are generated at create time and persisted inline on the swap (`SwapKeySource::Stored`); recoverable only from the local store, never re-derivable, so `upsert_swap` must be durable before the invoice is payable. The provider resolves secrets from the swap's `key_source`, so the rest of the pipeline is mode-agnostic.
 - **Gas abstraction.** EIP-7702 via a configurable gas-sponsor URL (wraps Alchemy server-side; no hardcoded API key/policy) so users never need ETH on Arbitrum.
 - **Unified destination registry.** One `Destination` table spans Direct/OFT/CCTP. The public API exposes only the coarse `BridgeKind` (display/UX); actual claim dispatch resolves the data-carrying internal `Bridge` from the destination.
 - **End-to-end slippage.** A single tolerance anchored on expected stablecoin output gates both the claim-time DEX quote drift and the on-chain `minOut` floor; bridge fees (CCTP) are folded in, never charged as a separate per-hop tolerance. The on-chain `minAmountOut`/`minAmount` is the sole floor bounding DEX manipulation — never widen it casually.
 - **Confirmed cross-chain delivery.** Bridged swaps complete only after delivery is confirmed (CCTP via Circle Iris once forwarded **and** attested; OFT via LayerZero Scan `DELIVERED`). CCTP persists the authoritative `feeExecuted`-adjusted delivered amount; the source burn amount is only an estimate.
 - **Recovery via on-chain liveness.** No blockchain scanning. Recovery uses the `ERC20Swap` lockup state check plus the persisted Alchemy `call_id` (the `pending_call_id` field) for resume after a crash. Never finalize a swap on a WebSocket success event alone — always verify via receipt, `call_id` recovery, or lock-state. A *spent* lockup is never read as failure on its own: `swaps()` returns `false` for a claim and a refund alike, so failure is finalized only on a positive `Refund` event (and success only on a `Claim`) — see the 2026-06-19 decision entry.
-- **Convergence under replicated storage.** The local store is treated as a possibly-stale cache: every non-terminal swap is continuously reconciled against Boltz/chain (periodic `reconcile_tracking` re-subscribe + `poll_pending_swaps`) until terminal, and all instances derive the *same* terminal state from the chain. So a multi-instance deployment over eventually-consistent / optimistically-synced stores converges with **no merge logic required of the embedder** — the trade-offs are possibly-stale *reported* state between reconciles (an embedder wanting none may add a causal/version merge in its own sync layer) and duplicate, money-safe on-chain claim attempts. **This covers swap *state* only** — the HD key-index counter still requires strict, durable, collision-free increments (a stale/optimistic store reuses a preimage; see the key-index invariant below), a tension that only disappears once preimages become random/non-derived. See the 2026-06-19 (convergence) decision entry.
+- **Convergence under replicated storage.** The local store is treated as a possibly-stale cache: every non-terminal swap is continuously reconciled against Boltz/chain (periodic `reconcile_tracking` re-subscribe + `poll_pending_swaps`) until terminal, and all instances derive the *same* terminal state from the chain. So a multi-instance deployment over eventually-consistent / optimistically-synced stores converges with **no merge logic required of the embedder** — the trade-offs are possibly-stale *reported* state between reconciles (an embedder wanting none may add a causal/version merge in its own sync layer) and duplicate, money-safe on-chain claim attempts. **This covers swap *state* only** — in seeded mode the HD key-index counter still requires strict, durable, collision-free increments (a stale/optimistic store reuses a preimage; see the key-index invariant below). Seedless mode dissolves that tension: each swap's secrets are random and self-contained, so there is no shared counter to keep consistent. See the 2026-06-19 (convergence) decision entry.
 
 ### Load-bearing invariants worth surfacing
 
-- `create_reverse_swap` MUST persist the incremented key index durably before returning; Boltz's HTTP 409 (`DuplicatePreimage`) must **not** auto-retry with the next index.
+- `create_reverse_swap` MUST durably persist the swap's secrets before returning the invoice: in seeded mode the incremented key index (via `DerivedKeyStore`), in seedless mode the random preimage + gas key (via `upsert_swap`, which runs before the invoice is handed out). Boltz's HTTP 409 (`DuplicatePreimage`) must **not** auto-retry with a new secret.
 - `Settling` is non-terminal and is short-circuited *before* the WS status match in the manager — treating it as terminal, or letting a late `*.expired` past it, would strand or wrongly fail an already-claimed bridged swap. The same protection extends one state earlier: a swap in `Claiming` whose lockup is already spent on-chain must not be finalized `Expired`/`Failed` by a late/spoofed terminal WS event — the manager re-checks the lock and advances it through the post-claim path instead (`handle_terminal_ws_event`).
 - The lockup `timeout_block_height` is denominated in **L1** block height; it is validated (≥ `MIN_TIMEOUT_L1_MARGIN` over the current L1 height via `eth_l1_block_number`, **not** the L2 `eth_block_number`) both as an early abort in `create()` and, fail-safe, immediately before the preimage is revealed in `claim_and_swap` — a too-short timeout would let a malicious server refund and settle the LN HTLC with the leaked preimage.
 - `create_probe_invoice` returns an invoice that must **never** be paid (its random preimage is discarded; payment locks funds unrecoverably).

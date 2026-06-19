@@ -5,6 +5,7 @@ pub mod events;
 pub mod evm;
 pub mod keys;
 pub mod models;
+mod secrets;
 pub mod solana;
 pub mod store;
 pub mod swap;
@@ -12,7 +13,7 @@ pub mod swap;
 use std::sync::Arc;
 
 use platform_utils::DefaultHttpClient;
-use platform_utils::tokio::sync::{Mutex, mpsc};
+use platform_utils::tokio::sync::mpsc;
 
 pub use config::*;
 pub use error::BoltzError;
@@ -21,14 +22,14 @@ pub use evm::cctp::CctpMessageStatus;
 pub use evm::recipient::is_valid_destination_address;
 pub use keys::EvmKeyManager;
 pub use models::*;
-pub use store::BoltzStorage;
+pub use store::{BoltzStorage, DerivedKeyStore};
 
 use api::BoltzApiClient;
 use api::ws::SwapStatusSubscriber;
 use evm::alchemy::AlchemyGasClient;
 use evm::oft::fetch_chain_registry;
 use evm::provider::EvmProvider;
-use evm::signing::EvmSigner;
+use secrets::{DerivedSecretProvider, RandomSecretProvider, SecretProvider};
 use solana::rpc::SolanaRpcClient;
 use swap::locks::SwapLocks;
 use swap::manager::SwapManager;
@@ -59,40 +60,42 @@ pub struct BoltzService {
     /// `update_swap_slippage`, `refresh_pending_deliveries`) acquire the swap's
     /// lock so they never race the loop's handler for the same swap.
     swap_locks: Arc<SwapLocks>,
-    /// Serializes HD key-index issuance in-process so concurrent
-    /// `create_reverse_swap` calls can't draw the same index from a
-    /// non-transactional store (which would reuse a preimage). See
-    /// [`issue_key_index`].
-    key_index_lock: Mutex<()>,
-}
-
-/// Issue the next HD key index, serialized in-process by `lock`. Concurrent
-/// `create_reverse_swap` calls would otherwise both draw the same index from a
-/// non-transactional store and reuse a preimage (fund-theft risk). The lock is
-/// per-process: durability and cross-process atomicity remain the store's
-/// contract (see [`BoltzStorage::increment_key_index`]).
-async fn issue_key_index(lock: &Mutex<()>, store: &dyn BoltzStorage) -> Result<u32, BoltzError> {
-    let _guard = lock.lock().await;
-    store.increment_key_index().await
 }
 
 impl BoltzService {
-    /// Construct from config, seed bytes, and a store implementation.
+    /// Construct a **seeded** service: preimages and the global gas signer are
+    /// HD-derived from `seed`. The store must implement [`DerivedKeyStore`] to
+    /// supply the durable key-index counter that prevents preimage reuse.
     pub async fn new(
         config: BoltzConfig,
         seed: &[u8],
-        store: Arc<dyn BoltzStorage>,
+        store: Arc<dyn DerivedKeyStore>,
     ) -> Result<Self, BoltzError> {
         let key_manager = EvmKeyManager::from_seed(seed)?;
+        let secret_provider = Arc::new(DerivedSecretProvider::new(key_manager, store.clone()));
+        // Upcast the derived store to the base storage trait for the shared
+        // construction path (stable trait upcasting).
+        Self::new_with_provider(config, secret_provider, store).await
+    }
 
-        // Derive gas signer for Alchemy
-        let chain_id_u32: u32 = config
-            .chain_id
-            .try_into()
-            .map_err(|_| BoltzError::Generic("Chain ID overflow".to_string()))?;
-        let gas_key_pair = key_manager.derive_gas_signer(chain_id_u32)?;
-        let gas_signer = EvmSigner::new(&gas_key_pair, config.chain_id);
+    /// Construct a **seedless** service: each swap gets a random preimage and a
+    /// random per-swap gas/claim key, persisted inline on the swap. Recoverable
+    /// only from the local store — there is no mnemonic backup. No key-index
+    /// counter is needed, so a plain [`BoltzStorage`] suffices.
+    pub async fn new_seedless(
+        config: BoltzConfig,
+        store: Arc<dyn BoltzStorage>,
+    ) -> Result<Self, BoltzError> {
+        Self::new_with_provider(config, Arc::new(RandomSecretProvider), store).await
+    }
 
+    /// Shared construction for both modes; differs only in the
+    /// [`SecretProvider`].
+    async fn new_with_provider(
+        config: BoltzConfig,
+        secret_provider: Arc<dyn SecretProvider>,
+        store: Arc<dyn BoltzStorage>,
+    ) -> Result<Self, BoltzError> {
         // Each component gets its own DefaultHttpClient. They mostly hit
         // distinct hosts, so a shared reqwest connection pool would rarely be
         // reused; giving each its own keeps ownership simple (Box, not a
@@ -110,7 +113,6 @@ impl BoltzService {
         let alchemy_client = AlchemyGasClient::new(
             &config.alchemy_config,
             Box::new(DefaultHttpClient::new(Some(USER_AGENT.to_string()))),
-            gas_signer,
         );
 
         let evm_provider = EvmProvider::new(
@@ -166,7 +168,7 @@ impl BoltzService {
 
         let executor = Arc::new(ReverseSwapExecutor::new(
             api_client,
-            key_manager,
+            secret_provider,
             alchemy_client,
             evm_provider,
             chain_registry.clone(),
@@ -199,7 +201,6 @@ impl BoltzService {
             ws_subscriber,
             chain_registry,
             swap_locks,
-            key_index_lock: Mutex::new(()),
         })
     }
 
@@ -307,22 +308,21 @@ impl BoltzService {
     /// Create the swap on Boltz and begin background monitoring.
     /// Returns the hold invoice to pay.
     ///
-    /// # Key index safety
+    /// # Secret safety
     ///
-    /// A duplicate HD index reuses a preimage (fund-theft risk), so issuance is
-    /// serialized in-process here ([`issue_key_index`]). The caller's
-    /// `BoltzStorage` must still guarantee `increment_key_index` is **durable**
-    /// (persisted before returning) and **atomic across processes** if multiple
-    /// instances share one store — neither is enforceable in-crate. This is the
-    /// sole defense against preimage reuse: Boltz's duplicate-preimage detection
-    /// (HTTP 409) must NOT be relied upon, as a malicious API could lie.
+    /// Seeded mode: a duplicate HD index reuses a preimage (fund-theft risk),
+    /// so issuance is serialized in-process and the caller's [`DerivedKeyStore`]
+    /// must guarantee `increment_key_index` is **durable** and **atomic across
+    /// processes** if instances share a store. Seedless mode: the random
+    /// preimage and gas key are persisted by the `upsert_swap` below **before**
+    /// the invoice is returned, so a crash never hands out a payable invoice for
+    /// a swap whose secrets weren't saved. Either way Boltz's duplicate-preimage
+    /// detection (HTTP 409) must NOT be relied upon, as a malicious API could lie.
     pub async fn create_reverse_swap(
         &self,
         prepared: &PreparedSwap,
     ) -> Result<CreatedSwap, BoltzError> {
-        let key_index = issue_key_index(&self.key_index_lock, &*self.store).await?;
-
-        let swap = self.executor.create(prepared, key_index).await?;
+        let swap = self.executor.create(prepared).await?;
         let created = CreatedSwap {
             swap_id: swap.id.clone(),
             invoice: swap.invoice.clone(),
@@ -518,6 +518,10 @@ mod tests {
         async fn list_active_swaps(&self) -> Result<Vec<BoltzSwap>, BoltzError> {
             Ok(vec![])
         }
+    }
+
+    #[macros::async_trait]
+    impl DerivedKeyStore for RacyStore {
         async fn increment_key_index(&self) -> Result<u32, BoltzError> {
             let current = *self.counter.lock().unwrap();
             platform_utils::tokio::task::yield_now().await;
@@ -527,9 +531,10 @@ mod tests {
     }
 
     #[macros::async_test_all]
-    async fn issue_key_index_serializes_concurrent_calls() {
+    async fn derived_issue_serializes_concurrent_calls() {
         use futures::future::join_all;
         const N: usize = 8;
+        const CHAIN_ID: u32 = 42161;
 
         // Sanity: unguarded, the racy store really does hand out duplicates, so
         // the serialized assertion below is meaningful.
@@ -544,14 +549,19 @@ mod tests {
             "unguarded racy store should collide: {racy:?}"
         );
 
-        // With in-process serialization every issued index is distinct, even
-        // though the underlying store is non-atomic.
-        let store = RacyStore::default();
-        let lock = Mutex::new(());
-        let issued: Vec<u32> = join_all((0..N).map(|_| issue_key_index(&lock, &store)))
+        // The provider serializes index issuance in-process, so every swap gets
+        // a distinct index even though the underlying store is non-atomic.
+        let provider = DerivedSecretProvider::new(
+            EvmKeyManager::from_seed(&[7u8; 32]).unwrap(),
+            Arc::new(RacyStore::default()),
+        );
+        let issued: Vec<u32> = join_all((0..N).map(|_| provider.issue(CHAIN_ID)))
             .await
             .into_iter()
-            .map(Result::unwrap)
+            .map(|r| match r.unwrap().key_source {
+                SwapKeySource::Derived { claim_key_index } => claim_key_index,
+                SwapKeySource::Stored(_) => panic!("derived provider must issue a derived source"),
+            })
             .collect();
         assert_eq!(
             issued.iter().collect::<HashSet<_>>().len(),

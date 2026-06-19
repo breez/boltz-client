@@ -14,7 +14,7 @@ use rustyline::{Completer, Helper, Hinter, Validator, highlight::Highlighter};
 
 use boltz_client::{
     Asset, BoltzConfig, BoltzError, BoltzEventListener, BoltzService, BoltzStorage, BoltzSwapEvent,
-    BoltzSwapStatus,
+    BoltzSwapStatus, DerivedKeyStore,
 };
 
 const PHRASE_FILE_NAME: &str = "phrase";
@@ -27,7 +27,13 @@ const HISTORY_FILE_NAME: &str = "history.txt";
     about = "Interactive CLI for the Boltz LN -> stablecoin (USDT/USDC) reverse swap flow"
 )]
 struct Cli {
-    /// BIP-39 mnemonic (12 or 24 words). If not provided, reads from data-dir or generates new.
+    /// Use seed-derived (HD) preimages and a global gas signer instead of the
+    /// default random per-swap secrets. Requires a mnemonic; recoverable from it.
+    #[arg(long, env = "BOLTZ_SEEDED")]
+    seeded: bool,
+
+    /// BIP-39 mnemonic (12 or 24 words). Only used in `--seeded` mode; if not
+    /// provided there, reads from data-dir or generates new.
     #[arg(long, env = "BOLTZ_MNEMONIC")]
     mnemonic: Option<String>,
 
@@ -47,7 +53,7 @@ struct Cli {
 // ─── REPL commands (parsed per-line inside the interactive loop) ───────
 #[derive(Clone, Parser)]
 enum Command {
-    /// Show derived EVM addresses (gas signer, first preimage key).
+    /// Show key info (seeded: derived addresses; seedless: a note) and supported destinations.
     Info,
 
     /// Get current swap limits (min/max sats).
@@ -122,13 +128,21 @@ async fn main() -> Result<()> {
 
     init_logging(&cli.data_dir)?;
 
-    // Resolve mnemonic: CLI arg > phrase file > generate new
-    let mnemonic = if let Some(m) = &cli.mnemonic {
-        Mnemonic::from_str(m).context("Invalid mnemonic")?
+    // Resolve a seed only in seeded mode; seedless swaps need no mnemonic.
+    let seed: Option<[u8; 64]> = if cli.seeded {
+        let mnemonic = if let Some(m) = &cli.mnemonic {
+            Mnemonic::from_str(m).context("Invalid mnemonic")?
+        } else {
+            get_or_create_mnemonic(&cli.data_dir)?
+        };
+        Some(mnemonic.to_seed(""))
     } else {
-        get_or_create_mnemonic(&cli.data_dir)?
+        if cli.mnemonic.is_some() {
+            println!("Note: --mnemonic is ignored in seedless mode (pass --seeded to use it).");
+        }
+        None
     };
-    let seed = mnemonic.to_seed("");
+    let seed = seed.as_ref().map(<[u8; 64]>::as_slice);
 
     let mut config = BoltzConfig::mainnet(cli.referral_id);
     if let Some(slippage_bps) = cli.slippage_bps {
@@ -137,12 +151,15 @@ async fn main() -> Result<()> {
 
     // Initialize the service once — WebSocket + SwapManager stay alive for the
     // entire session, handling ongoing swaps in the background.
-    let svc = init_service(config, &seed, &cli.data_dir).await?;
+    let svc = init_service(config, seed, &cli.data_dir).await?;
 
-    println!("Boltz CLI Interactive Mode");
+    println!(
+        "Boltz CLI Interactive Mode ({} mode)",
+        if cli.seeded { "seeded" } else { "seedless" }
+    );
     println!("Type 'help' for available commands or 'exit' to quit\n");
 
-    run_repl(&svc, &seed, &cli.data_dir).await?;
+    run_repl(&svc, seed, &cli.data_dir).await?;
 
     svc.shutdown().await;
     println!("Goodbye!");
@@ -150,7 +167,7 @@ async fn main() -> Result<()> {
 }
 
 // ─── REPL loop ─────────────────────────────────────────────────────────
-async fn run_repl(svc: &BoltzService, seed: &[u8], data_dir: &Path) -> Result<()> {
+async fn run_repl(svc: &BoltzService, seed: Option<&[u8]>, data_dir: &Path) -> Result<()> {
     let history_file = data_dir.join(HISTORY_FILE_NAME);
 
     let rl = &mut Editor::new()?;
@@ -211,7 +228,11 @@ fn parse_command(input: &str) -> Result<Command> {
 }
 
 /// Returns `Ok(true)` to keep the REPL running, `Ok(false)` to exit.
-async fn execute_command(command: Command, svc: &BoltzService, seed: &[u8]) -> Result<bool> {
+async fn execute_command(
+    command: Command,
+    svc: &BoltzService,
+    seed: Option<&[u8]>,
+) -> Result<bool> {
     match command {
         Command::Exit => Ok(false),
         Command::Info => {
@@ -280,11 +301,17 @@ fn get_or_create_mnemonic(data_dir: &Path) -> Result<Mnemonic> {
     }
 }
 
-async fn init_service(config: BoltzConfig, seed: &[u8], data_dir: &Path) -> Result<BoltzService> {
+async fn init_service(
+    config: BoltzConfig,
+    seed: Option<&[u8]>,
+    data_dir: &Path,
+) -> Result<BoltzService> {
     let store = Arc::new(FileBoltzStorage::new(data_dir));
-    let svc = BoltzService::new(config, seed, store)
-        .await
-        .context("Failed to initialize BoltzService")?;
+    let svc = match seed {
+        Some(seed) => BoltzService::new(config, seed, store).await,
+        None => BoltzService::new_seedless(config, store).await,
+    }
+    .context("Failed to initialize BoltzService")?;
 
     // Register a global listener that prints status updates for all swaps.
     svc.add_event_listener(Box::new(PrintingEventListener))
@@ -311,22 +338,33 @@ async fn init_service(config: BoltzConfig, seed: &[u8], data_dir: &Path) -> Resu
     Ok(svc)
 }
 
-fn cmd_info(svc: &BoltzService, seed: &[u8]) -> Result<()> {
-    let km = boltz_client::EvmKeyManager::from_seed(seed)?;
-    let chain_id = u32::try_from(boltz_client::ARBITRUM_CHAIN_ID).context("Chain ID overflow")?;
-    let gas = km.derive_gas_signer(chain_id)?;
-    let preimage_key = km.derive_preimage_key(chain_id, 0)?;
+fn cmd_info(svc: &BoltzService, seed: Option<&[u8]>) -> Result<()> {
+    match seed {
+        Some(seed) => {
+            let km = boltz_client::EvmKeyManager::from_seed(seed)?;
+            let chain_id =
+                u32::try_from(boltz_client::ARBITRUM_CHAIN_ID).context("Chain ID overflow")?;
+            let gas = km.derive_gas_signer(chain_id)?;
+            let preimage_key = km.derive_preimage_key(chain_id, 0)?;
 
-    println!(
-        "EVM Key Info (Arbitrum, chain_id={}):",
-        boltz_client::ARBITRUM_CHAIN_ID
-    );
-    println!("  Gas signer address:     {}", gas.address_hex());
-    println!(
-        "  Preimage key[0] pubkey: {}",
-        hex::encode(&preimage_key.public_key)
-    );
-    println!("  Preimage key[0] addr:   {}", preimage_key.address_hex());
+            println!(
+                "EVM Key Info (seeded, Arbitrum, chain_id={}):",
+                boltz_client::ARBITRUM_CHAIN_ID
+            );
+            println!("  Gas signer address:     {}", gas.address_hex());
+            println!(
+                "  Preimage key[0] pubkey: {}",
+                hex::encode(&preimage_key.public_key)
+            );
+            println!("  Preimage key[0] addr:   {}", preimage_key.address_hex());
+        }
+        None => {
+            println!(
+                "Seedless mode: each swap uses a random preimage and a per-swap gas key \
+                 (no global derived addresses; secrets live in the local store)."
+            );
+        }
+    }
 
     let mut dests: Vec<String> = svc
         .supported_destinations()
@@ -495,8 +533,29 @@ const OUTPUT_FIELDS: &[&str] = &[
 
 fn print_json(value: &impl serde::Serialize) {
     let mut json = serde_json::to_value(value).unwrap();
+    redact_key_source(&mut json);
     format_output_fields(&mut json);
     println!("{}", serde_json::to_string_pretty(&json).unwrap());
+}
+
+/// Replace a swap's `key_source` with a non-secret summary before printing.
+/// `Secret`'s `Serialize` emits raw bytes (the store needs them), so the
+/// seedless preimage and gas key would otherwise leak into stdout/logs.
+fn redact_key_source(value: &mut serde_json::Value) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    let Some(key_source) = obj.get_mut("key_source") else {
+        return;
+    };
+    let summary = match key_source
+        .get("Derived")
+        .and_then(|d| d.get("claim_key_index"))
+    {
+        Some(index) => format!("Derived (index {index})"),
+        None => "Stored (secrets redacted)".to_string(),
+    };
+    *key_source = serde_json::Value::String(summary);
 }
 
 fn format_output_fields(value: &mut serde_json::Value) {
@@ -655,7 +714,10 @@ impl BoltzStorage for FileBoltzStorage {
         }
         Ok(active)
     }
+}
 
+#[macros::async_trait]
+impl DerivedKeyStore for FileBoltzStorage {
     async fn increment_key_index(&self) -> Result<u32, BoltzError> {
         let current = self.read_index()?;
         let next = current
@@ -707,4 +769,37 @@ fn confirm(prompt: &str) -> Result<bool> {
     io::stdin().read_line(&mut input)?;
     let trimmed = input.trim().to_lowercase();
     Ok(trimmed == "y" || trimmed == "yes")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redact_key_source_hides_seedless_secrets() {
+        // Mimics a serialized seedless swap: Secret serializes as a raw byte array.
+        let mut json = serde_json::json!({
+            "id": "s1",
+            "key_source": { "Stored": { "preimage": [1, 2, 3], "gas_key": [4, 5, 6] } },
+        });
+        redact_key_source(&mut json);
+        let printed = serde_json::to_string(&json).unwrap();
+        assert!(!printed.contains("preimage"), "preimage leaked: {printed}");
+        assert!(!printed.contains("gas_key"), "gas_key leaked: {printed}");
+        assert_eq!(
+            json["key_source"],
+            serde_json::json!("Stored (secrets redacted)")
+        );
+    }
+
+    #[test]
+    fn redact_key_source_keeps_derived_index() {
+        // The HD index is not a secret, so it stays visible.
+        let mut json = serde_json::json!({
+            "id": "s1",
+            "key_source": { "Derived": { "claim_key_index": 7 } },
+        });
+        redact_key_source(&mut json);
+        assert_eq!(json["key_source"], serde_json::json!("Derived (index 7)"));
+    }
 }

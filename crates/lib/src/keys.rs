@@ -103,6 +103,23 @@ pub struct EvmKeyPair {
 }
 
 impl EvmKeyPair {
+    /// Build a key pair from raw private-key bytes (e.g. a stored seedless gas
+    /// key). Errors if the bytes aren't a valid secp256k1 scalar.
+    pub(crate) fn from_private_key_bytes(bytes: &[u8; 32]) -> Result<Self, BoltzError> {
+        let signing_key = SigningKey::from_bytes(bytes.into())
+            .map_err(|e| BoltzError::Signing(format!("Invalid private key: {e}")))?;
+        Ok(Self::from_signing_key(signing_key))
+    }
+
+    /// Generate a fresh random key pair. Used for throwaway keys (e.g. the
+    /// probe invoice's claim address, which is never claimed).
+    pub(crate) fn generate() -> Result<Self, BoltzError> {
+        let mut bytes = Zeroizing::new([0u8; 32]);
+        getrandom::getrandom(&mut *bytes)
+            .map_err(|e| BoltzError::Signing(format!("Failed to generate key: {e}")))?;
+        Self::from_private_key_bytes(&bytes)
+    }
+
     fn from_signing_key(signing_key: SigningKey) -> Self {
         let verifying_key = signing_key.verifying_key();
 

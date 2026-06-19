@@ -93,7 +93,7 @@ mod tests {
                 id: "s1".to_string(),
                 status: BoltzSwapStatus::Created,
                 bridge_kind: BridgeKind::Oft,
-                claim_key_index: 0,
+                key_source: crate::models::SwapKeySource::Derived { claim_key_index: 0 },
                 chain_id: 42161,
                 claim_address: "0xabc".to_string(),
                 destination_address: "0xdef".to_string(),

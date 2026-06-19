@@ -29,11 +29,12 @@ use crate::evm::recipient::{
     encode_oft_recipient, is_valid_destination_address, normalize_token_address,
 };
 use crate::evm::signing::EvmSigner;
-use crate::keys::EvmKeyManager;
+use crate::keys::EvmKeyPair;
 use crate::models::{
     Asset, BoltzSwap, BoltzSwapStatus, Bridge, Destination, DestinationRegistry, NetworkTransport,
     PreparedSwap, SwapLimits, Usdt0Kind,
 };
+use crate::secrets::SecretProvider;
 use crate::solana::ata::derive_ata;
 use crate::solana::rpc::SolanaRpcClient;
 use crate::store::BoltzStorage;
@@ -48,7 +49,7 @@ const LOCKUP_CHECK_MAX_ATTEMPTS: u32 = 10;
 /// Orchestrates the LN -> stablecoin reverse swap flow.
 pub(crate) struct ReverseSwapExecutor {
     api_client: BoltzApiClient,
-    pub(crate) key_manager: EvmKeyManager,
+    pub(crate) secrets: Arc<dyn SecretProvider>,
     alchemy_client: AlchemyGasClient,
     pub(crate) evm_provider: EvmProvider,
     pub(crate) chain_registry: Arc<DestinationRegistry>,
@@ -79,7 +80,7 @@ impl ReverseSwapExecutor {
     #[expect(clippy::too_many_arguments)]
     pub fn new(
         api_client: BoltzApiClient,
-        key_manager: EvmKeyManager,
+        secrets: Arc<dyn SecretProvider>,
         alchemy_client: AlchemyGasClient,
         evm_provider: EvmProvider,
         chain_registry: Arc<DestinationRegistry>,
@@ -92,7 +93,7 @@ impl ReverseSwapExecutor {
     ) -> Self {
         Self {
             api_client,
-            key_manager,
+            secrets,
             alchemy_client,
             evm_provider,
             chain_registry,
@@ -433,13 +434,11 @@ impl ReverseSwapExecutor {
         })
     }
 
-    /// Call the Boltz API to create a reverse swap with the given key index.
-    /// Returns the validated `BoltzSwap`. The caller handles persistence.
-    pub async fn create(
-        &self,
-        prepared: &PreparedSwap,
-        key_index: u32,
-    ) -> Result<BoltzSwap, BoltzError> {
+    /// Call the Boltz API to create a reverse swap. The [`SecretProvider`]
+    /// mints this swap's preimage hash and claim key (reserving an HD index in
+    /// seeded mode, generating random secrets in seedless mode). Returns the
+    /// validated `BoltzSwap`; the caller handles persistence.
+    pub async fn create(&self, prepared: &PreparedSwap) -> Result<BoltzSwap, BoltzError> {
         if current_unix_timestamp() >= prepared.expires_at {
             return Err(BoltzError::QuoteExpired);
         }
@@ -456,24 +455,17 @@ impl ReverseSwapExecutor {
         resolve_slippage_bps(Some(prepared.slippage_bps), self.config.slippage_bps)?;
 
         let chain_id_u32 = to_chain_id_u32(self.config.chain_id)?;
-        let gas_signer = self.key_manager.derive_gas_signer(chain_id_u32)?;
-
-        let preimage_hash = self
-            .key_manager
-            .derive_preimage_hash(chain_id_u32, key_index)?;
-        let preimage_key = self
-            .key_manager
-            .derive_preimage_key(chain_id_u32, key_index)?;
+        let issued = self.secrets.issue(chain_id_u32).await?;
 
         let create_req = crate::api::types::CreateReverseSwapRequest {
             from: "BTC".to_string(),
             to: "TBTC".to_string(),
-            preimage_hash: hex::encode(preimage_hash),
-            claim_address: gas_signer.address_hex(),
+            preimage_hash: hex::encode(issued.preimage_hash),
+            claim_address: issued.claim_address.clone(),
             invoice_amount: prepared.invoice_amount_sats,
             pair_hash: prepared.pair_hash.clone(),
             referral_id: self.config.referral_id.clone(),
-            claim_public_key: hex::encode(&preimage_key.public_key),
+            claim_public_key: hex::encode(&issued.claim_public_key),
             description: None,
             invoice_expiry: None,
         };
@@ -541,9 +533,9 @@ impl ReverseSwapExecutor {
             id: resp.id,
             status: BoltzSwapStatus::Created,
             bridge_kind: prepared.bridge_kind,
-            claim_key_index: key_index,
+            key_source: issued.key_source,
             chain_id: self.config.chain_id,
-            claim_address: gas_signer.address_hex(),
+            claim_address: issued.claim_address,
             destination_address: prepared.destination_address.clone(),
             destination_chain: prepared.destination_chain.clone(),
             asset: prepared.asset,
@@ -586,11 +578,11 @@ impl ReverseSwapExecutor {
     /// unfunded swap's server-side state on Boltz self-clears as quickly
     /// as the API allows.
     ///
-    /// The `claim_address` and `claim_public_key` fields reuse the gas
-    /// signer's keys — Boltz only needs a valid secp256k1 point and EVM
-    /// address there, and since the swap will never be claimed, the
-    /// relationship between those and the (random) preimage hash is
-    /// irrelevant.
+    /// The `claim_address` and `claim_public_key` fields use a throwaway random
+    /// key — Boltz only needs a valid secp256k1 point and EVM address there, and
+    /// since the swap will never be claimed, the relationship between those and
+    /// the (random) preimage hash is irrelevant. This keeps the probe
+    /// independent of the service's secret mode (no seed required).
     pub async fn create_probe_invoice(
         &self,
         prepared: &PreparedSwap,
@@ -598,12 +590,11 @@ impl ReverseSwapExecutor {
         if current_unix_timestamp() >= prepared.expires_at {
             return Err(BoltzError::QuoteExpired);
         }
-        let chain_id_u32 = to_chain_id_u32(self.config.chain_id)?;
-        let gas_signer = self.key_manager.derive_gas_signer(chain_id_u32)?;
+        let throwaway = EvmKeyPair::generate()?;
 
         // 32 random bytes — no derivation, no recoverability needed: the
-        // invoice will never be paid, so a recoverable preimage would only
-        // serve to burn an HD index.
+        // invoice will never be paid, so a recoverable preimage would serve no
+        // purpose.
         let mut preimage_hash = [0u8; 32];
         getrandom::getrandom(&mut preimage_hash).map_err(|e| {
             BoltzError::Generic(format!("Failed to generate random preimage hash: {e}"))
@@ -613,11 +604,11 @@ impl ReverseSwapExecutor {
             from: "BTC".to_string(),
             to: "TBTC".to_string(),
             preimage_hash: hex::encode(preimage_hash),
-            claim_address: gas_signer.address_hex(),
+            claim_address: throwaway.address_hex(),
             invoice_amount: prepared.invoice_amount_sats,
             pair_hash: prepared.pair_hash.clone(),
             referral_id: self.config.referral_id.clone(),
-            claim_public_key: hex::encode(&gas_signer.public_key),
+            claim_public_key: hex::encode(&throwaway.public_key),
             description: None,
             invoice_expiry: Some(PROBE_INVOICE_EXPIRY_SECS),
         };
@@ -753,7 +744,9 @@ impl ReverseSwapExecutor {
         // that triggered the `transaction.confirmed` WS event.
         let mut lockup_verified = false;
         for attempt in 0..LOCKUP_CHECK_MAX_ATTEMPTS {
-            match is_swap_still_locked_by_swap(&self.evm_provider, swap, &self.key_manager).await {
+            match is_swap_still_locked_by_swap(&self.evm_provider, swap, self.secrets.as_ref())
+                .await
+            {
                 Ok(true) => {
                     lockup_verified = true;
                     break;
@@ -795,11 +788,8 @@ impl ReverseSwapExecutor {
         self.ensure_timeout_margin(swap.timeout_block_height)
             .await?;
 
-        let chain_id_u32 = to_chain_id_u32(swap.chain_id)?;
-        let preimage = self
-            .key_manager
-            .derive_preimage(chain_id_u32, swap.claim_key_index)?;
-        let gas_key_pair = self.key_manager.derive_gas_signer(chain_id_u32)?;
+        let preimage = self.secrets.preimage(swap)?;
+        let gas_key_pair = self.secrets.gas_key_pair(swap)?;
         let gas_signer = EvmSigner::new(&gas_key_pair, swap.chain_id);
         let erc20swap_version = self
             .fetch_erc20swap_version(&swap.erc20swap_address)
@@ -868,8 +858,12 @@ impl ReverseSwapExecutor {
                     // retrying — the swap was either claimed by another instance
                     // or refunded by Boltz. Don't mark success or failure here;
                     // the WS update will determine the final state.
-                    match is_swap_still_locked_by_swap(&self.evm_provider, swap, &self.key_manager)
-                        .await
+                    match is_swap_still_locked_by_swap(
+                        &self.evm_provider,
+                        swap,
+                        self.secrets.as_ref(),
+                    )
+                    .await
                     {
                         Ok(false) => {
                             tracing::info!(
@@ -1080,7 +1074,7 @@ impl ReverseSwapExecutor {
             router_sig.s,
         );
 
-        self.submit_claim(swap, &swap.router_address.clone(), &calldata)
+        self.submit_claim(swap, &swap.router_address.clone(), &calldata, gas_signer)
             .await
     }
 
@@ -1261,7 +1255,7 @@ impl ReverseSwapExecutor {
             &auth,
         );
 
-        self.submit_claim(swap, &swap.router_address.clone(), &calldata)
+        self.submit_claim(swap, &swap.router_address.clone(), &calldata, gas_signer)
             .await
     }
 
@@ -1644,7 +1638,7 @@ impl ReverseSwapExecutor {
             &auth,
         );
 
-        self.submit_claim(swap, &swap.router_address.clone(), &calldata)
+        self.submit_claim(swap, &swap.router_address.clone(), &calldata, gas_signer)
             .await
     }
 
@@ -1660,6 +1654,7 @@ impl ReverseSwapExecutor {
         swap: &BoltzSwap,
         router_address: &str,
         calldata: &[u8],
+        gas_signer: &EvmSigner,
     ) -> Result<String, BoltzError> {
         let evm_call = EvmCall {
             to: router_address.to_string(),
@@ -1669,7 +1664,7 @@ impl ReverseSwapExecutor {
 
         let call_id = self
             .alchemy_client
-            .submit_calls(vec![evm_call], swap.chain_id)
+            .submit_calls(vec![evm_call], swap.chain_id, gas_signer)
             .await?;
 
         // Durably record the in-flight call_id before polling. Best-effort:

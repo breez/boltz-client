@@ -1,9 +1,74 @@
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
+
+/// A 32-byte secret that redacts its `Debug` output and zeroizes on drop.
+///
+/// Money-critical material (an HTLC preimage or a claim/gas signing key in
+/// seedless mode) lives behind this so it can't leak through the `Debug` that
+/// flows into logs and events, and is wiped from memory when dropped.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Secret([u8; 32]);
+
+impl Secret {
+    pub(crate) fn expose(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl From<[u8; 32]> for Secret {
+    fn from(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret([redacted])")
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+/// Where a swap's preimage and claim/gas signing key come from.
+///
+/// The two modes are mutually exclusive per [`BoltzService`](crate::BoltzService)
+/// instance and persisted with the swap, so the manager loop and recovery paths
+/// resolve secrets without any ambient mode state.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum SwapKeySource {
+    /// Seed-derived (HD). The preimage and the global gas signer are re-derived
+    /// on demand from the master seed + this index; nothing secret is stored.
+    /// Requires a durable, monotonic key-index counter
+    /// (see [`DerivedKeyStore`](crate::store::DerivedKeyStore)).
+    Derived {
+        /// HD derivation index for the per-swap preimage key.
+        claim_key_index: u32,
+    },
+    /// Seedless. The preimage and a per-swap gas/claim key are generated
+    /// randomly at create time and stored inline — recoverable only from the
+    /// local store, never re-derivable.
+    Stored(SwapSecrets),
+}
+
+/// Inline per-swap secrets backing [`SwapKeySource::Stored`]. Both are
+/// money-critical: losing them makes an in-flight swap unclaimable.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SwapSecrets {
+    pub(crate) preimage: Secret,
+    /// Private key (32 bytes) of the per-swap gas/claim signer.
+    pub(crate) gas_key: Secret,
+}
 
 /// Persisted state for a single Boltz reverse swap.
 ///
-/// Preimage and `preimage_hash` are NOT stored — they are deterministically
-/// derived from `seed + claim_key_index + chain_id`.
+/// Whether the preimage and claim key are stored inline depends on
+/// [`key_source`](Self::key_source): in [`SwapKeySource::Derived`] mode nothing
+/// secret is stored (both re-derived from the seed); in
+/// [`SwapKeySource::Stored`] mode they are persisted with the swap.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BoltzSwap {
     /// Swap ID — the Boltz backend ID for normal swaps, or a `recovery-*` ID for recovered swaps.
@@ -11,8 +76,8 @@ pub struct BoltzSwap {
     pub status: BoltzSwapStatus,
     /// Which bridge carries the Arbitrum -> destination leg.
     pub bridge_kind: BridgeKind,
-    /// HD derivation index for the per-swap preimage key.
-    pub claim_key_index: u32,
+    /// Source of this swap's preimage and claim/gas signing key.
+    pub key_source: SwapKeySource,
     /// EVM chain ID (42161 for Arbitrum).
     pub chain_id: u64,
 
@@ -559,7 +624,7 @@ mod tests {
             id: "boltz-1".to_string(),
             status: BoltzSwapStatus::Created,
             bridge_kind: BridgeKind::Oft,
-            claim_key_index: 0,
+            key_source: SwapKeySource::Derived { claim_key_index: 0 },
             chain_id: 42161,
             claim_address: "0xabc".to_string(),
             destination_address: "0xdef".to_string(),
@@ -600,7 +665,7 @@ mod tests {
             id: "s2".to_string(),
             status: BoltzSwapStatus::Settling,
             bridge_kind: BridgeKind::Cctp,
-            claim_key_index: 0,
+            key_source: SwapKeySource::Derived { claim_key_index: 0 },
             chain_id: 42161,
             claim_address: "0xabc".to_string(),
             destination_address: "0xdef".to_string(),

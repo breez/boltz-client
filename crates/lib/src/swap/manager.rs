@@ -538,7 +538,7 @@ impl SwapManager {
                     match is_swap_still_locked_by_swap(
                         &executor.evm_provider,
                         &swap,
-                        &executor.key_manager,
+                        executor.secrets.as_ref(),
                     )
                     .await
                     {
@@ -708,8 +708,12 @@ impl SwapManager {
         let swap_id = swap.id.clone();
 
         if swap.status == BoltzSwapStatus::Claiming {
-            match is_swap_still_locked_by_swap(&executor.evm_provider, swap, &executor.key_manager)
-                .await
+            match is_swap_still_locked_by_swap(
+                &executor.evm_provider,
+                swap,
+                executor.secrets.as_ref(),
+            )
+            .await
             {
                 Ok(true) => {
                     // Claim never happened — the tBTC is still locked and will
@@ -720,8 +724,12 @@ impl SwapManager {
                     // Classify: only a *claim* means this terminal event is
                     // spurious (advance the already-successful swap); a *refund*
                     // makes it legitimate (fall through to finalize).
-                    match classify_spent_lockup(&executor.evm_provider, swap, &executor.key_manager)
-                        .await
+                    match classify_spent_lockup(
+                        &executor.evm_provider,
+                        swap,
+                        executor.secrets.as_ref(),
+                    )
+                    .await
                     {
                         Ok(SpentClassification::Claimed { claim_tx_hash }) => {
                             tracing::warn!(
@@ -994,7 +1002,7 @@ impl SwapManager {
         let Ok(Some(mut swap)) = store.get_swap(swap_id).await else {
             return false;
         };
-        match is_swap_still_locked_by_swap(&executor.evm_provider, &swap, &executor.key_manager)
+        match is_swap_still_locked_by_swap(&executor.evm_provider, &swap, executor.secrets.as_ref())
             .await
         {
             Ok(true) => {
@@ -1013,8 +1021,12 @@ impl SwapManager {
                 // instance sharing these keys). Only a refund is a real failure,
                 // and `swaps()` can't tell the two apart — classify via the
                 // on-chain Claim/Refund events before finalizing anything.
-                match classify_spent_lockup(&executor.evm_provider, &swap, &executor.key_manager)
-                    .await
+                match classify_spent_lockup(
+                    &executor.evm_provider,
+                    &swap,
+                    executor.secrets.as_ref(),
+                )
+                .await
                 {
                     Ok(SpentClassification::Refunded) => {
                         update_swap_status(
@@ -1172,7 +1184,7 @@ impl SwapManager {
             return;
         }
 
-        match is_swap_still_locked_by_swap(&executor.evm_provider, swap, &executor.key_manager)
+        match is_swap_still_locked_by_swap(&executor.evm_provider, swap, executor.secrets.as_ref())
             .await
         {
             Ok(true) => {
@@ -1182,7 +1194,7 @@ impl SwapManager {
                 // Past timeout and spent — but "spent" is claimed OR refunded.
                 // Only finalize Failed on a *refund*; a claim (even one whose tx
                 // we never saw mine, e.g. another instance's) advances instead.
-                match classify_spent_lockup(&executor.evm_provider, swap, &executor.key_manager)
+                match classify_spent_lockup(&executor.evm_provider, swap, executor.secrets.as_ref())
                     .await
                 {
                     Ok(SpentClassification::Refunded) => {
@@ -1246,7 +1258,7 @@ impl SwapManager {
     ) {
         let swap_id = &swap.id;
 
-        match is_swap_still_locked_by_swap(&executor.evm_provider, swap, &executor.key_manager)
+        match is_swap_still_locked_by_swap(&executor.evm_provider, swap, executor.secrets.as_ref())
             .await
         {
             Ok(true) => {
@@ -1264,7 +1276,7 @@ impl SwapManager {
                 // Spent — but claimed or refunded? Only a *claim* should advance
                 // the swap to its post-claim status; a *refund* is a failure.
                 // `swaps()` can't distinguish them, so classify via events.
-                match classify_spent_lockup(&executor.evm_provider, swap, &executor.key_manager)
+                match classify_spent_lockup(&executor.evm_provider, swap, executor.secrets.as_ref())
                     .await
                 {
                     Ok(SpentClassification::Claimed { claim_tx_hash }) => {
@@ -1708,7 +1720,7 @@ mod tests {
             id: "s1".to_string(),
             status: BoltzSwapStatus::Claiming,
             bridge_kind,
-            claim_key_index: 0,
+            key_source: crate::models::SwapKeySource::Derived { claim_key_index: 0 },
             chain_id: 42161,
             claim_address: "0xabc".to_string(),
             destination_address: "0xdef".to_string(),
