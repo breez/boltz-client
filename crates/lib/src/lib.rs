@@ -203,8 +203,14 @@ impl BoltzService {
         })
     }
 
-    /// Load and resume all active (non-terminal) swaps from storage.
-    /// Call once after construction to pick up swaps from previous runs.
+    /// Load and resume all active (non-terminal) swaps from storage, returning
+    /// their ids. Call once after construction to pick up swaps from previous
+    /// runs.
+    ///
+    /// When background polling is enabled this is an optional accelerator —
+    /// the background loop periodically re-tracks any non-terminal swap on its
+    /// own, so this just makes resumption immediate and returns the id list.
+    /// When polling is disabled it is the only mechanism that resumes them.
     pub async fn resume_swaps(&self) -> Result<Vec<String>, BoltzError> {
         self.swap_manager.resume_all().await
     }

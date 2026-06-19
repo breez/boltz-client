@@ -107,7 +107,14 @@ impl SwapManager {
         let _ = self.cmd_tx.send(swap_id.to_string()).await;
     }
 
-    /// Resume all non-terminal swaps from the store.
+    /// Resume all non-terminal swaps from the store, returning their ids.
+    ///
+    /// With background polling enabled this is an **optional accelerator**: the
+    /// periodic [`Self::reconcile_tracking`] pass re-tracks any non-terminal
+    /// swap anyway, so calling this only makes resumption immediate (and yields
+    /// the id list) rather than waiting for the first tick. With polling
+    /// disabled (`delivery_poll_interval_secs == None`) there is no reconcile
+    /// pass, so this is the **only** way previous-run swaps get tracked.
     pub async fn resume_all(&self) -> Result<Vec<String>, BoltzError> {
         let active = self.store.list_active_swaps().await?;
         let mut ids = Vec::with_capacity(active.len());
@@ -185,13 +192,15 @@ impl SwapManager {
         // `delivery_poll_interval_secs` after every page reload.
         #[cfg(all(target_family = "wasm", target_os = "unknown"))]
         if delivery_poll_interval_secs.is_some() {
-            let executor = executor.clone();
-            let store = store.clone();
-            let event_emitter = event_emitter.clone();
-            let swap_locks = swap_locks.clone();
-            tasks.spawn(async move {
-                poll_pending_swaps(&executor, &store, &event_emitter, &swap_locks).await;
-            });
+            Self::spawn_delivery_tick(
+                &mut tasks,
+                &executor,
+                &store,
+                &event_emitter,
+                &ws_subscriber,
+                &swap_locks,
+                &tracked_ids,
+            );
         }
 
         loop {
@@ -219,15 +228,15 @@ impl SwapManager {
 
             match step {
                 Step::Stop => break,
-                Step::DeliveryTick => {
-                    let executor = executor.clone();
-                    let store = store.clone();
-                    let event_emitter = event_emitter.clone();
-                    let swap_locks = swap_locks.clone();
-                    tasks.spawn(async move {
-                        poll_pending_swaps(&executor, &store, &event_emitter, &swap_locks).await;
-                    });
-                }
+                Step::DeliveryTick => Self::spawn_delivery_tick(
+                    &mut tasks,
+                    &executor,
+                    &store,
+                    &event_emitter,
+                    &ws_subscriber,
+                    &swap_locks,
+                    &tracked_ids,
+                ),
                 Step::Ws(update) => {
                     if !tracked_ids.lock().await.contains(&update.swap_id) {
                         tracing::warn!(boltz_id = update.swap_id, "WS update for untracked swap");
@@ -273,6 +282,38 @@ impl SwapManager {
         tracing::info!("SwapManager event loop exiting");
     }
 
+    /// Spawn the per-tick background work: re-track any resurrected/unresumed
+    /// non-terminal swap ([`Self::reconcile_tracking`]) and advance in-flight
+    /// swaps one step ([`poll_pending_swaps`]). Shared by the periodic tick and
+    /// the WASM up-front kick (the WASM ticker doesn't fire immediately).
+    fn spawn_delivery_tick(
+        tasks: &mut JoinSet<()>,
+        executor: &Arc<ReverseSwapExecutor>,
+        store: &Arc<dyn BoltzStorage>,
+        event_emitter: &Arc<EventEmitter>,
+        ws_subscriber: &Arc<SwapStatusSubscriber>,
+        swap_locks: &Arc<SwapLocks>,
+        tracked_ids: &TrackedIds,
+    ) {
+        {
+            let store = store.clone();
+            let ws_subscriber = ws_subscriber.clone();
+            let tracked_ids = tracked_ids.clone();
+            tasks.spawn(async move {
+                Self::reconcile_tracking(&store, &ws_subscriber, &tracked_ids).await;
+            });
+        }
+        {
+            let executor = executor.clone();
+            let store = store.clone();
+            let event_emitter = event_emitter.clone();
+            let swap_locks = swap_locks.clone();
+            tasks.spawn(async move {
+                poll_pending_swaps(&executor, &store, &event_emitter, &swap_locks).await;
+            });
+        }
+    }
+
     /// Begin tracking a specific swap: subscribe to WS and wait for the
     /// backend to send the current status. The WS update will drive any
     /// needed action via `handle_ws_update` — we don't act on local state
@@ -283,8 +324,61 @@ impl SwapManager {
         swap_id: &str,
     ) -> Result<(), BoltzError> {
         tracked_ids.lock().await.insert(swap_id.to_string());
-        ws_subscriber.subscribe(swap_id).await?;
+        // Undo the optimistic insert if the subscribe fails, so `reconcile_tracking`
+        // doesn't treat the swap as tracked forever and skip re-engaging it.
+        if let Err(e) = ws_subscriber.subscribe(swap_id).await {
+            tracked_ids.lock().await.remove(swap_id);
+            return Err(e);
+        }
         Ok(())
+    }
+
+    /// Re-track every non-terminal swap in the store that isn't already tracked.
+    ///
+    /// Runs on the delivery-poll cadence. Its job is convergence under
+    /// optimistic, eventually-consistent replication: when an out-of-order sync
+    /// write from another instance *resurrects* a swap (overwrites a fresher
+    /// local state with a staler non-terminal one), or a swap was simply never
+    /// `resume`d, this re-engages it — re-subscribe to WS (Boltz re-pushes the
+    /// current status) and let the state machine + on-chain checks drive it back
+    /// to the chain-derived state. So the local store is treated as a possibly
+    /// stale cache that the manager continuously reconciles against Boltz/chain,
+    /// which makes convergence robust to *any* sync merge policy with nothing
+    /// required of the embedder.
+    ///
+    /// Idempotent: already-tracked swaps are skipped, and a swap that was
+    /// finalized between the `list` and the re-subscribe is harmless — the
+    /// subscribe-triggered status push drives `handle_ws_update` to clean it up.
+    ///
+    /// `Settling` is excluded: its progression is delivery-poll-driven
+    /// (`poll_pending_swaps` -> `confirm_delivery`, which also re-completes a
+    /// resurrected `Settling` swap), and `handle_ws_update` does nothing for a
+    /// `Settling` swap but immediately untrack it. Re-tracking it would just
+    /// subscribe/unsubscribe every tick for the whole delivery window.
+    async fn reconcile_tracking(
+        store: &Arc<dyn BoltzStorage>,
+        ws_subscriber: &Arc<SwapStatusSubscriber>,
+        tracked_ids: &TrackedIds,
+    ) {
+        let active = match store.list_active_swaps().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to list active swaps for tracking reconcile");
+                return;
+            }
+        };
+        for swap in active {
+            if swap.status == BoltzSwapStatus::Settling {
+                continue;
+            }
+            if tracked_ids.lock().await.contains(&swap.id) {
+                continue;
+            }
+            tracing::info!(swap_id = swap.id, status = ?swap.status, "Re-tracking active swap");
+            if let Err(e) = Self::start_tracking(ws_subscriber, tracked_ids, &swap.id).await {
+                tracing::error!(swap_id = swap.id, error = %e, "Failed to re-track active swap");
+            }
+        }
     }
 
     /// Process a WS status update for a tracked swap.
