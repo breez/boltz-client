@@ -218,6 +218,16 @@ sol! {
         address indexed mintToken,
         uint256 feeCollected
     );
+
+    /// `ERC20Swap` claim. Emitted only on a successful claim — the contract
+    /// verifies `sha256(preimage) == preimageHash` before emitting — so a log
+    /// for our (indexed) `preimageHash` is positive proof the lockup was
+    /// *claimed*, not refunded. `swaps(hash)` alone cannot tell the two apart.
+    event Claim(bytes32 indexed preimageHash, bytes32 preimage);
+
+    /// `ERC20Swap` refund. Emitted when a lockup is refunded (post-timeout).
+    /// The counterpart to `Claim` for distinguishing a refunded lockup.
+    event Refund(bytes32 indexed preimageHash);
 }
 
 /// Convert a Boltz encode API `QuoteCalldata` to a Router `Call`.
@@ -601,6 +611,22 @@ pub fn decode_swaps_check_return(data: &[u8]) -> Result<bool, BoltzError> {
     Ok(decoded.0)
 }
 
+/// `eth_getLogs` topic0 for the `ERC20Swap` `Claim` event.
+pub fn claim_event_topic0() -> String {
+    format!("0x{}", hex::encode(Claim::SIGNATURE_HASH.as_slice()))
+}
+
+/// `eth_getLogs` topic0 for the `ERC20Swap` `Refund` event.
+pub fn refund_event_topic0() -> String {
+    format!("0x{}", hex::encode(Refund::SIGNATURE_HASH.as_slice()))
+}
+
+/// Format a 32-byte value as an indexed-`bytes32` event topic (e.g. a swap's
+/// `preimageHash`, indexed by `Claim`/`Refund`).
+pub fn bytes32_to_topic(value: &[u8; 32]) -> String {
+    format!("0x{}", hex::encode(value))
+}
+
 /// Left-pad a 20-byte address to 32 bytes for use as an indexed event topic filter.
 pub fn address_to_topic(address: &[u8; 20]) -> String {
     let mut padded = [0u8; 32];
@@ -900,6 +926,21 @@ mod tests {
 
     use super::*;
     use alloy_sol_types::SolCall;
+
+    #[macros::test_all]
+    fn claim_refund_event_topics_match_signatures() {
+        use alloy_primitives::keccak256;
+        // Pins the event declarations to Boltz's ERC20Swap ABI: a typo in the
+        // event signature would silently make every Claim/Refund log query miss.
+        assert_eq!(
+            claim_event_topic0(),
+            format!("0x{}", hex::encode(keccak256(b"Claim(bytes32,bytes32)")))
+        );
+        assert_eq!(
+            refund_event_topic0(),
+            format!("0x{}", hex::encode(keccak256(b"Refund(bytes32)")))
+        );
+    }
 
     #[macros::test_all]
     fn test_parse_address() {

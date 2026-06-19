@@ -12,7 +12,9 @@ use crate::events::{BoltzSwapEvent, EventEmitter};
 use crate::evm::contracts::{
     DeliveredAmount, DeliveredAmountSource, decode_delivered_from_logs, parse_address,
 };
-use crate::evm::lockup::is_swap_still_locked_by_swap;
+use crate::evm::lockup::{
+    SpentClassification, classify_spent_lockup, is_swap_still_locked_by_swap,
+};
 use crate::evm::provider::TxReceipt;
 use crate::models::{BoltzSwap, BoltzSwapStatus, Bridge, BridgeKind};
 use crate::store::BoltzStorage;
@@ -590,11 +592,15 @@ impl SwapManager {
     /// strand an already-successful bridged swap (delivery never confirmed,
     /// `delivered_amount` never recorded, dropped from tracking).
     ///
-    /// So when `Claiming`, re-check the on-chain lock first: finalize only if the
-    /// tBTC is provably still locked (the claim never happened); if it is spent,
-    /// advance through the post-claim path instead. A failed lock read leaves the
-    /// swap for a later retry rather than finalizing on the event alone. For all
-    /// pre-claim states (`Created`/`InvoicePaid`/`TbtcLocked`) the event is
+    /// So when `Claiming`, re-check the on-chain lock first: if still locked the
+    /// claim never happened and the terminal event is legitimate. If spent, the
+    /// event alone can't say why — `swaps()` reads `false` for a claim *and* a
+    /// refund — so classify via the `Claim`/`Refund` events: a *claim* advances
+    /// through the post-claim path (a refund event for an already-claimed swap is
+    /// spurious), a *refund* makes the terminal event legitimate, and an
+    /// unresolved/failed read leaves the swap for retry rather than finalizing on
+    /// the event alone. For all pre-claim states
+    /// (`Created`/`InvoicePaid`/`TbtcLocked`) the event is
     /// authoritative and finalizes directly.
     async fn handle_terminal_ws_event(
         executor: &ReverseSwapExecutor,
@@ -616,20 +622,53 @@ impl SwapManager {
                     // refund to Boltz. The terminal event is legitimate.
                 }
                 Ok(false) => {
-                    // Already claimed on-chain. Do NOT finalize on the WS event;
-                    // advance through the post-claim path so a successful bridged
-                    // swap completes/settles instead of being wrongly failed.
-                    tracing::warn!(
-                        swap_id,
-                        ws_terminal = ?terminal_status,
-                        "Terminal WS event for an already-claimed swap; advancing post-claim instead of finalizing"
-                    );
-                    let resolved =
-                        Self::advance_claimed_swap(executor, store, event_emitter, swap).await;
-                    if resolved {
-                        Self::cleanup_terminal(ws_subscriber, tracked_ids, &swap_id).await;
+                    // Spent — but a claim and a refund both clear the lock.
+                    // Classify: only a *claim* means this terminal event is
+                    // spurious (advance the already-successful swap); a *refund*
+                    // makes it legitimate (fall through to finalize).
+                    match classify_spent_lockup(&executor.evm_provider, swap, &executor.key_manager)
+                        .await
+                    {
+                        Ok(SpentClassification::Claimed { claim_tx_hash }) => {
+                            tracing::warn!(
+                                swap_id,
+                                ws_terminal = ?terminal_status,
+                                winning_tx = claim_tx_hash,
+                                "Terminal WS event for an already-claimed swap; advancing post-claim instead of finalizing"
+                            );
+                            let resolved = Self::advance_via_winning_claim(
+                                executor,
+                                store,
+                                event_emitter,
+                                &swap_id,
+                                &claim_tx_hash,
+                            )
+                            .await;
+                            if resolved {
+                                Self::cleanup_terminal(ws_subscriber, tracked_ids, &swap_id).await;
+                            }
+                            return;
+                        }
+                        Ok(SpentClassification::Refunded) => {
+                            // Genuinely refunded — the terminal event is correct.
+                            // Fall through to finalize `terminal_status`.
+                        }
+                        Ok(SpentClassification::Unknown) => {
+                            tracing::warn!(
+                                swap_id,
+                                "Terminal WS event; lockup spent but claim/refund unresolved; leaving for retry"
+                            );
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                swap_id,
+                                error = %e,
+                                "Terminal WS event; spent-lockup classification failed; leaving for retry"
+                            );
+                            return;
+                        }
                     }
-                    return;
                 }
                 Err(e) => {
                     // Couldn't verify the lock — don't finalize blindly. Leave
@@ -875,22 +914,124 @@ impl SwapManager {
                 false
             }
             Ok(false) => {
-                update_swap_status(
-                    &**store,
-                    event_emitter,
-                    &mut swap,
-                    BoltzSwapStatus::Failed {
-                        reason: "Claim transaction reverted".to_string(),
-                    },
-                )
-                .await;
-                true
+                // Spent — but a lockup spent *by a claim* is a SUCCESS, not a
+                // failure: our tx merely lost the race (possibly to another
+                // instance sharing these keys). Only a refund is a real failure,
+                // and `swaps()` can't tell the two apart — classify via the
+                // on-chain Claim/Refund events before finalizing anything.
+                match classify_spent_lockup(&executor.evm_provider, &swap, &executor.key_manager)
+                    .await
+                {
+                    Ok(SpentClassification::Refunded) => {
+                        update_swap_status(
+                            &**store,
+                            event_emitter,
+                            &mut swap,
+                            BoltzSwapStatus::Failed {
+                                reason: "Lockup refunded".to_string(),
+                            },
+                        )
+                        .await;
+                        true
+                    }
+                    Ok(SpentClassification::Claimed { claim_tx_hash }) => {
+                        tracing::warn!(
+                            swap_id,
+                            reverted_tx = tx_hash,
+                            winning_tx = claim_tx_hash,
+                            "Our claim reverted but the lockup was claimed; advancing via the winning claim"
+                        );
+                        Self::advance_via_winning_claim(
+                            executor,
+                            store,
+                            event_emitter,
+                            swap_id,
+                            &claim_tx_hash,
+                        )
+                        .await
+                    }
+                    Ok(SpentClassification::Unknown) => {
+                        tracing::warn!(
+                            swap_id,
+                            tx_hash,
+                            "Claim reverted and lockup spent, but claim/refund unresolved; leaving swap for retry"
+                        );
+                        false
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            swap_id,
+                            error = %e,
+                            "Claim reverted; spent-lockup classification failed; leaving swap for retry"
+                        );
+                        false
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!(
                     swap_id,
                     error = %e,
                     "Claim reverted and lock check failed; leaving swap for retry"
+                );
+                false
+            }
+        }
+    }
+
+    /// Adopt the winning claim tx (located via the on-chain `Claim` event) onto
+    /// the swap and advance through its receipt. Used when our own claim tx
+    /// reverted or never mined but the lockup was provably *claimed* — possibly
+    /// by another instance. Applying the winning tx's receipt records the
+    /// delivered amount / `bridge_ref` from the tx that actually delivered, not
+    /// our dead one. Returns `true` if a post-claim state was reached.
+    ///
+    /// A `Claim` log only exists for a *mined, successful* tx (reverted-tx logs
+    /// aren't returned by `eth_getLogs`), so one receipt read suffices — no poll
+    /// loop. That keeps this cheap on the sequential background tick AND off any
+    /// `poll_receipt → recover → poll` cycle, since `check_receipt_once` performs
+    /// no recovery. If the receipt is briefly unavailable, we've already
+    /// persisted `claim_tx_hash`, so the normal `Claiming` tick retries it.
+    async fn advance_via_winning_claim(
+        executor: &ReverseSwapExecutor,
+        store: &Arc<dyn BoltzStorage>,
+        event_emitter: &EventEmitter,
+        swap_id: &str,
+        claim_tx_hash: &str,
+    ) -> bool {
+        if let Ok(Some(mut s)) = store.get_swap(swap_id).await {
+            // Another path/instance already advanced it — don't clobber the
+            // record or re-read a now-irrelevant receipt.
+            if s.status.is_terminal() || s.status == BoltzSwapStatus::Settling {
+                return true;
+            }
+            s.claim_tx_hash = Some(claim_tx_hash.to_string());
+            s.pending_call_id = None;
+            s.updated_at = current_unix_timestamp();
+            if let Err(e) = store.upsert_swap(&s).await {
+                tracing::error!(swap_id, error = %e, "Failed to persist winning claim tx hash");
+            }
+        }
+        match Self::check_receipt_once(executor, store, event_emitter, swap_id, claim_tx_hash).await
+        {
+            ReceiptOutcome::Advanced(reached_terminal) => reached_terminal,
+            ReceiptOutcome::Reverted => {
+                // Impossible by construction (a `Claim` log implies success).
+                // Don't recover — just leave it for retry rather than looping.
+                tracing::error!(
+                    swap_id,
+                    claim_tx_hash,
+                    "Winning Claim tx unexpectedly reverted; leaving for retry"
+                );
+                false
+            }
+            ReceiptOutcome::NotMined => {
+                // Receipt not yet available; `claim_tx_hash` is persisted, so the
+                // next `Claiming` tick / WS event / resume retries it.
+                tracing::debug!(
+                    swap_id,
+                    claim_tx_hash,
+                    "Winning claim receipt not yet available; will retry"
                 );
                 false
             }
@@ -944,21 +1085,55 @@ impl SwapManager {
                 tracing::debug!(swap_id, "Past timeout but lockup not yet refunded; waiting");
             }
             Ok(false) => {
-                tracing::warn!(
-                    swap_id,
-                    claim_tx_hash = ?swap.claim_tx_hash,
-                    "Claim tx never mined and lockup refunded past timeout; finalizing Failed"
-                );
-                let mut s = swap.clone();
-                update_swap_status(
-                    &**store,
-                    event_emitter,
-                    &mut s,
-                    BoltzSwapStatus::Failed {
-                        reason: "Claim transaction never mined; lockup refunded".to_string(),
-                    },
-                )
-                .await;
+                // Past timeout and spent — but "spent" is claimed OR refunded.
+                // Only finalize Failed on a *refund*; a claim (even one whose tx
+                // we never saw mine, e.g. another instance's) advances instead.
+                match classify_spent_lockup(&executor.evm_provider, swap, &executor.key_manager)
+                    .await
+                {
+                    Ok(SpentClassification::Refunded) => {
+                        tracing::warn!(
+                            swap_id,
+                            claim_tx_hash = ?swap.claim_tx_hash,
+                            "Claim tx never mined and lockup refunded past timeout; finalizing Failed"
+                        );
+                        let mut s = swap.clone();
+                        update_swap_status(
+                            &**store,
+                            event_emitter,
+                            &mut s,
+                            BoltzSwapStatus::Failed {
+                                reason: "Claim transaction never mined; lockup refunded"
+                                    .to_string(),
+                            },
+                        )
+                        .await;
+                    }
+                    Ok(SpentClassification::Claimed { claim_tx_hash }) => {
+                        tracing::warn!(
+                            swap_id,
+                            winning_tx = claim_tx_hash,
+                            "Lockup was claimed though our claim tx didn't mine; advancing via the winning claim"
+                        );
+                        Self::advance_via_winning_claim(
+                            executor,
+                            store,
+                            event_emitter,
+                            swap_id,
+                            &claim_tx_hash,
+                        )
+                        .await;
+                    }
+                    Ok(SpentClassification::Unknown) => {
+                        tracing::debug!(
+                            swap_id,
+                            "Lockup spent past timeout but claim/refund unresolved; leaving for retry"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(swap_id, error = %e, "Spent-lockup classification failed; leaving for retry");
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!(swap_id, error = %e, "Claiming-poll lock check failed; leaving for retry");
@@ -967,8 +1142,8 @@ impl SwapManager {
     }
 
     /// Check on-chain whether the preimage was already revealed. If still
-    /// locked, retry the claim. If already claimed, wait for WS
-    /// `transaction.claimed`.
+    /// locked, retry the claim. If spent, classify (claim vs refund) and either
+    /// advance the claimed swap or finalize the refunded one.
     async fn check_on_chain_and_retry(
         executor: &ReverseSwapExecutor,
         store: &Arc<dyn BoltzStorage>,
@@ -992,96 +1167,54 @@ impl SwapManager {
                 Self::do_claim(executor, store, event_emitter, &mut s, false).await;
             }
             Ok(false) => {
-                // Already claimed on-chain: the preimage was revealed and the
-                // atomic claim + DEX + bridge-send committed. We must NOT leave
-                // the swap stranded in `Claiming` — advance it through the
-                // post-claim path (recovering the receipt-derived delivered
-                // amount when possible) so `Direct` completes and `Oft`/`Cctp`
-                // enter `Settling` for the delivery poll. Mirrors the inline
-                // `invoice.settled` already-claimed branch.
-                tracing::info!(
-                    swap_id,
-                    "Swap already claimed on-chain; advancing through post-claim status"
-                );
-                Self::advance_claimed_swap(executor, store, event_emitter, swap).await;
+                // Spent — but claimed or refunded? Only a *claim* should advance
+                // the swap to its post-claim status; a *refund* is a failure.
+                // `swaps()` can't distinguish them, so classify via events.
+                match classify_spent_lockup(&executor.evm_provider, swap, &executor.key_manager)
+                    .await
+                {
+                    Ok(SpentClassification::Claimed { claim_tx_hash }) => {
+                        tracing::info!(
+                            swap_id,
+                            winning_tx = claim_tx_hash,
+                            "Swap already claimed on-chain; advancing through post-claim status"
+                        );
+                        Self::advance_via_winning_claim(
+                            executor,
+                            store,
+                            event_emitter,
+                            swap_id,
+                            &claim_tx_hash,
+                        )
+                        .await;
+                    }
+                    Ok(SpentClassification::Refunded) => {
+                        let mut s = swap.clone();
+                        update_swap_status(
+                            &**store,
+                            event_emitter,
+                            &mut s,
+                            BoltzSwapStatus::Failed {
+                                reason: "Lockup refunded".to_string(),
+                            },
+                        )
+                        .await;
+                    }
+                    Ok(SpentClassification::Unknown) => {
+                        tracing::warn!(
+                            swap_id,
+                            "Lockup spent but claim/refund unresolved; leaving for retry"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(swap_id, error = %e, "Spent-lockup classification failed; leaving for retry");
+                    }
+                }
             }
             Err(e) => {
                 tracing::error!(swap_id, error = %e, "On-chain check failed");
             }
         }
-    }
-
-    /// Advance a swap whose lockup is provably spent (the claim already happened
-    /// on-chain) to its post-claim status. The caller must have confirmed the
-    /// lock is spent — this routine does NOT re-check it.
-    ///
-    /// Resolution order, best to worst:
-    /// 1. Known `claim_tx_hash` → poll the receipt (records `delivered_amount`
-    ///    and `bridge_ref`, then sets the post-claim status).
-    /// 2. Persisted gas-sponsor `call_id` → recover the tx hash, persist it, and
-    ///    poll the receipt.
-    /// 3. Neither recoverable → set the post-claim status directly so the swap
-    ///    is not stranded in `Claiming`. `Direct` completes; `Oft`/`Cctp` enter
-    ///    `Settling` (a missing `bridge_ref` then holds in `Settling`, the safe
-    ///    failure mode — never a falsely `Completed` swap).
-    ///
-    /// Returns `true` if the swap reached a resolved state (caller may clean up
-    /// WS tracking), `false` if a receipt poll timed out and it is still
-    /// `Claiming` (keep tracking; the next event/resume retries).
-    async fn advance_claimed_swap(
-        executor: &ReverseSwapExecutor,
-        store: &Arc<dyn BoltzStorage>,
-        event_emitter: &EventEmitter,
-        swap: &BoltzSwap,
-    ) -> bool {
-        let swap_id = &swap.id;
-
-        if let Some(ref tx_hash) = swap.claim_tx_hash {
-            return Self::poll_receipt(executor, store, event_emitter, swap_id, tx_hash).await;
-        }
-
-        if let Some(ref call_id) = swap.pending_call_id {
-            match executor.poll_pending_call(call_id).await {
-                Ok(tx_hash) => {
-                    tracing::info!(
-                        swap_id,
-                        tx_hash,
-                        "Recovered claim tx hash from pending call_id"
-                    );
-                    if let Ok(Some(mut s)) = store.get_swap(swap_id).await {
-                        s.claim_tx_hash = Some(tx_hash.clone());
-                        s.pending_call_id = None;
-                        s.updated_at = current_unix_timestamp();
-                        if let Err(e) = store.upsert_swap(&s).await {
-                            tracing::error!(swap_id, error = %e, "Failed to persist recovered tx hash");
-                        }
-                    }
-                    return Self::poll_receipt(executor, store, event_emitter, swap_id, &tx_hash)
-                        .await;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        swap_id,
-                        error = %e,
-                        "Could not recover tx hash for already-claimed swap; advancing on post-claim status without delivered amount"
-                    );
-                    // Fall through to step 3.
-                }
-            }
-        }
-
-        // No receipt recoverable. Advance anyway so the swap isn't stranded in
-        // `Claiming`; re-read first to avoid clobbering concurrent updates.
-        if let Ok(Some(mut s)) = store.get_swap(swap_id).await {
-            if s.status != BoltzSwapStatus::Claiming {
-                // Another path already advanced it.
-                return s.status.is_terminal() || s.status == BoltzSwapStatus::Settling;
-            }
-            let next = post_claim_status(&s);
-            update_swap_status(&**store, event_emitter, &mut s, next).await;
-            return true;
-        }
-        false
     }
 
     /// Unsubscribe from WS and remove from tracking set after a swap
