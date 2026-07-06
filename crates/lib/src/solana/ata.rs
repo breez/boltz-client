@@ -44,6 +44,19 @@ pub fn derive_ata(owner: &[u8; 32], mint: &[u8; 32]) -> Result<[u8; 32], BoltzEr
     find_program_address(&seeds, &ASSOCIATED_TOKEN_PROGRAM_ID)
 }
 
+/// Derive the CCTP `used_nonce` PDA for `nonce` under the Solana
+/// `MessageTransmitter` program. Its existence proves `receiveMessage` ran for
+/// this message (replay-protection record) — a forwarder-agnostic delivery
+/// signal used to complete a swap whose Circle forward stalled. Seeds match
+/// Circle's Solana program: `[b"used_nonce", nonce]`.
+pub fn derive_used_nonce_pda(
+    nonce: &[u8; 32],
+    message_transmitter: &[u8; 32],
+) -> Result<[u8; 32], BoltzError> {
+    let seeds: [&[u8]; 2] = [b"used_nonce", nonce];
+    find_program_address(&seeds, message_transmitter)
+}
+
 /// Solana `Pubkey::find_program_address` — loop a 1-byte bump seed 255→0
 /// and return the first candidate that is off-curve (valid PDA).
 fn find_program_address(seeds: &[&[u8]], program_id: &[u8; 32]) -> Result<[u8; 32], BoltzError> {
@@ -144,6 +157,28 @@ mod tests {
         let ata_a = derive_ata(&owner, &mint_a).expect("derive a");
         let ata_b = derive_ata(&owner, &mint_b).expect("derive b");
         assert_ne!(ata_a, ata_b);
+    }
+
+    /// Cross-check `derive_used_nonce_pda` against a real mainnet vector: a CCTP
+    /// nonce received on Solana, whose derived `used_nonce` PDA exists on-chain
+    /// owned by the `MessageTransmitterV2` program (re-verify via
+    /// `getAccountInfo`). PDA existence is the signal the probe treats as "mint
+    /// landed"; if this derivation drifts, the probe would miss a real delivery
+    /// or invent one.
+    #[macros::test_all]
+    fn derive_used_nonce_pda_matches_mainnet_vector() {
+        let transmitter = decode_pubkey("CCTPV2Sm4AdWt5296sk4P66VBZ7bEhcARwFaaS9YPbeC");
+        let nonce_vec =
+            hex::decode("d7c7c073ec476983e3f222924974a48a7f61a7045df31dcf3ed83172bf0bb478")
+                .expect("valid hex");
+        let mut nonce = [0u8; 32];
+        nonce.copy_from_slice(&nonce_vec);
+
+        let pda = derive_used_nonce_pda(&nonce, &transmitter).expect("derive");
+        assert_eq!(
+            bs58::encode(pda).into_string(),
+            "28W8xrmyCAKPnWyRKju5GCLp9QQeMu7YPQ7epY6KueiG"
+        );
     }
 
     #[macros::test_all]

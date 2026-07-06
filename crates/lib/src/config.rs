@@ -215,6 +215,13 @@ pub const CCTP_FORWARD_HOOK_DATA_HEX: &str =
 /// destinations.
 pub const SOLANA_USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
+/// Circle CCTP v2 `MessageTransmitter` program on Solana (the *destination*
+/// transmitter, distinct from the EVM/source [`CCTP_MESSAGE_TRANSMITTER_V2`]).
+/// On `receiveMessage` it creates a per-message `used_nonce` PDA as its
+/// replay-protection record; that PDA's existence is a forwarder-agnostic proof
+/// the mint landed, used to complete a swap whose Circle forward stalled.
+pub const SOLANA_MESSAGE_TRANSMITTER_V2: &str = "CCTPV2Sm4AdWt5296sk4P66VBZ7bEhcARwFaaS9YPbeC";
+
 /// Default Circle CCTP "Iris" API base URL (mainnet). Sandbox is
 /// `https://iris-api-sandbox.circle.com`.
 pub const DEFAULT_CCTP_API_URL: &str = "https://iris-api.circle.com";

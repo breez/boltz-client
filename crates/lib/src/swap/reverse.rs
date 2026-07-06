@@ -10,7 +10,7 @@ use crate::config::{
     ARBITRUM_ROUTER_ADDRESS, ARBITRUM_TBTC_ADDRESS, ARBITRUM_USDC_ADDRESS, ARBITRUM_USDT_ADDRESS,
     BoltzConfig, CCTP_ARBITRUM_DOMAIN, CCTP_FINALITY_FAST, CCTP_TOKEN_MESSENGER_V2,
     MAX_SLIPPAGE_BPS, MIN_TIMEOUT_L1_MARGIN, POLYGON_EVM_CHAIN_ID, PROBE_INVOICE_EXPIRY_SECS,
-    SATS_TO_TBTC_FACTOR, SOLANA_USDT0_MINT, ZERO_ADDRESS,
+    SATS_TO_TBTC_FACTOR, SOLANA_MESSAGE_TRANSMITTER_V2, SOLANA_USDT0_MINT, ZERO_ADDRESS,
 };
 use crate::error::BoltzError;
 use crate::evm::alchemy::{AlchemyGasClient, EvmCall};
@@ -35,7 +35,7 @@ use crate::models::{
     PreparedSwap, SwapLimits, Usdt0Kind,
 };
 use crate::secrets::SecretProvider;
-use crate::solana::ata::derive_ata;
+use crate::solana::ata::{derive_ata, derive_used_nonce_pda};
 use crate::solana::rpc::SolanaRpcClient;
 use crate::store::BoltzStorage;
 
@@ -1738,6 +1738,56 @@ impl ReverseSwapExecutor {
         self.cctp_fee_client
             .get_message_status(source_domain, tx_hash)
             .await
+    }
+
+    /// Fallback delivery confirmation for a CCTP swap whose Circle forward
+    /// stalled: read the *destination chain* for proof the mint landed, rather
+    /// than trusting Circle's forwarder-specific `forwardTxHash`. Returns the
+    /// authoritative delivered amount once provably delivered, else `None`.
+    ///
+    /// Only meaningful once attested — the nonce and the delivered amount both
+    /// come from the attested `message`. Only Solana is probed today (its
+    /// ATA-creating forward is the one that stalls); EVM/Tron destinations have
+    /// no destination-chain probe and rely on the forwarder fast path, so they
+    /// return `None` here. This is a drop-in seam: an EVM probe (a
+    /// `usedNonces` `eth_call` on the destination chain) slots in per-chain
+    /// when a chain's RPC is supplied and the risk justifies it.
+    pub(crate) async fn cctp_destination_delivered(
+        &self,
+        swap: &BoltzSwap,
+        status: &cctp::CctpMessageStatus,
+    ) -> Result<Option<u64>, BoltzError> {
+        let (Some(message), Some(delivered)) = (status.message.as_deref(), status.delivered_amount)
+        else {
+            return Ok(None);
+        };
+        let dest = self.resolve_destination(&swap.destination_chain, swap.asset)?;
+        match dest.transport {
+            NetworkTransport::Solana => {
+                if self.cctp_nonce_consumed_on_solana(message).await? {
+                    Ok(Some(delivered))
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Whether the CCTP message's nonce has been consumed on Solana: its
+    /// `used_nonce` PDA exists under the destination `MessageTransmitter`, which
+    /// proves `receiveMessage` ran (the mint landed) regardless of who
+    /// submitted it. Sweep-proof, unlike a recipient balance check.
+    async fn cctp_nonce_consumed_on_solana(&self, message: &str) -> Result<bool, BoltzError> {
+        let nonce = contracts::decode_cctp_nonce_from_message(message)
+            .ok_or_else(|| BoltzError::Generic("CCTP message missing nonce".into()))?;
+        let transmitter = decode_solana_pubkey(SOLANA_MESSAGE_TRANSMITTER_V2)?;
+        let pda = derive_used_nonce_pda(&nonce, &transmitter)?;
+        let pda_base58 = bs58::encode(pda.as_slice()).into_string();
+        // Single attempt: this runs inside the sequential delivery-poll loop, so
+        // a multi-second 429 backoff would stall every later swap. The poll
+        // retries next tick anyway.
+        self.solana_rpc.account_exists_no_retry(&pda_base58).await
     }
 
     /// Query `LayerZero` Scan for whether an OFT message (by its GUID) has been

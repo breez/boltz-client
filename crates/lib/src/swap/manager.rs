@@ -1600,8 +1600,35 @@ async fn confirm_delivery(
     match swap.bridge_kind {
         BridgeKind::Cctp => match executor.cctp_delivery_status(&bridge_ref).await {
             Ok(status) => {
+                // Fast path (every chain): Circle's forwarder minted.
                 if let Some(delivered) = cctp_completion_amount(&status) {
                     finalize_completed(store, event_emitter, &swap.id, Some(delivered)).await;
+                    return;
+                }
+                // The destination probe is a *fallback*, gated on Circle
+                // reporting the forward FAILED — a forward still in progress
+                // needs no probe, keeping the (rate-limited) Solana RPC off the
+                // happy path. Funds are attested and recoverable, so a FAILED
+                // forward is surfaced and confirmed from the destination chain,
+                // never treated as a swap failure.
+                if status.forward_failed() {
+                    tracing::warn!(
+                        swap_id = swap.id,
+                        error_code = status.forward_error_code.as_deref().unwrap_or("unknown"),
+                        "CCTP forward FAILED; funds attested and recoverable, confirming \
+                         from destination chain"
+                    );
+                    match executor.cctp_destination_delivered(swap, &status).await {
+                        Ok(Some(delivered)) => {
+                            finalize_completed(store, event_emitter, &swap.id, Some(delivered))
+                                .await;
+                        }
+                        Ok(None) => {}
+                        // Transient (e.g. rate-limited) — the next poll retries.
+                        Err(e) => {
+                            tracing::debug!(swap_id = swap.id, error = %e, "CCTP destination delivery probe failed");
+                        }
+                    }
                 }
             }
             Err(e) => {

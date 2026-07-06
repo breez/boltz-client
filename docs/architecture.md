@@ -61,7 +61,11 @@ direct sweep / OFT send / CCTP burn in the same call. Bridge routing is fully
 client-derived — the Boltz API is bridge-agnostic. Bridged (`Oft`/`Cctp`) swaps
 enter a non-terminal `Settling` state and complete **only after confirmed
 cross-chain delivery** (LayerZero Scan for OFT, Circle Iris for CCTP); `Direct`
-skips straight to `Completed`.
+skips straight to `Completed`. For CCTP, a stalled Circle forward (e.g. a
+Solana first-time-recipient ATA-creation `FAILED`) is completed from a
+destination-chain delivery probe — the Solana `used_nonce` PDA existence, a
+forwarder-agnostic proof the mint landed — rather than trusting Circle's
+`forwardTxHash`.
 
 ```
                     LIGHTNING                                   ARBITRUM                              DESTINATION

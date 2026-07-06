@@ -732,6 +732,8 @@ pub fn decode_delivered_from_logs(
 // Outer header: sourceDomain (uint32) at byte 4; messageBody starts at 148.
 // Burn body: amount (uint256) at body+68, feeExecuted (uint256) at body+164.
 const CCTP_SOURCE_DOMAIN_OFFSET: usize = 4;
+/// Offset of the 32-byte `nonce` in the CCTP v2 message header.
+const CCTP_NONCE_OFFSET: usize = 12;
 const CCTP_BODY_OFFSET: usize = 148;
 const CCTP_BURN_AMOUNT_OFFSET: usize = CCTP_BODY_OFFSET + 68; // 216
 const CCTP_BURN_FEE_OFFSET: usize = CCTP_BODY_OFFSET + 164; // 312
@@ -808,6 +810,16 @@ pub fn decode_cctp_delivered_from_message(message_hex: &str) -> Option<u64> {
         return None;
     }
     amount.saturating_sub(fee).try_into().ok()
+}
+
+/// Extract the 32-byte CCTP v2 message `nonce` (header offset 12) from the
+/// attested `message` hex. Used to derive the destination `used_nonce` PDA that
+/// proves the mint landed, so completion needs no separate Iris `eventNonce`
+/// field (same bytes, provably consistent with the attestation).
+pub fn decode_cctp_nonce_from_message(message_hex: &str) -> Option<[u8; 32]> {
+    let msg = parse_hex_bytes(message_hex).ok()?;
+    let end = CCTP_NONCE_OFFSET.checked_add(32)?;
+    msg.get(CCTP_NONCE_OFFSET..end)?.try_into().ok()
 }
 
 /// Read a big-endian `uint32` at `offset` from a raw byte message.
@@ -1579,6 +1591,23 @@ mod tests {
         );
         // Malformed/short message yields None.
         assert_eq!(decode_cctp_delivered_from_message("0x1234"), None);
+    }
+
+    #[macros::test_all]
+    fn test_decode_cctp_nonce_from_message() {
+        // Real header prefix of the stuck swap's attested message:
+        // version | srcDomain=3 | dstDomain=5 | nonce(32). The nonce must be
+        // read verbatim at offset 12, matching what Iris reports as eventNonce.
+        let message_hex = "0x000000010000000300000005\
+d7c7c073ec476983e3f222924974a48a7f61a7045df31dcf3ed83172bf0bb478\
+0000000000000000000000000000000000000000000000000000000000000000";
+        let nonce = decode_cctp_nonce_from_message(message_hex).expect("nonce");
+        assert_eq!(
+            hex::encode(nonce),
+            "d7c7c073ec476983e3f222924974a48a7f61a7045df31dcf3ed83172bf0bb478"
+        );
+        // Too short to hold the header nonce → None.
+        assert_eq!(decode_cctp_nonce_from_message("0x1234"), None);
     }
 
     #[macros::test_all]

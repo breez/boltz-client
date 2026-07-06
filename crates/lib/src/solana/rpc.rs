@@ -32,11 +32,30 @@ impl SolanaRpcClient {
         Self { http, rpc_url }
     }
 
-    /// Query `getAccountInfo` and return whether the account exists.
+    /// Query `getAccountInfo` and return whether the account exists, retrying a
+    /// rate-limited (429) request with bounded backoff. Use on the claim /
+    /// recipient-setup path, where a transient 429 must not fail-close a swap.
     ///
     /// `account` is the base58 pubkey to look up. A `result.value: null`
     /// response means the account is missing; any object means it's present.
     pub async fn account_exists(&self, account: &str) -> Result<bool, BoltzError> {
+        self.account_exists_inner(account, MAX_RPC_RETRIES).await
+    }
+
+    /// Single-attempt existence check: on a 429 it returns an error immediately
+    /// instead of sleeping. Used by the background delivery probe, which runs
+    /// inside the sequential poll loop — a multi-second retry backoff there
+    /// would stall confirmation of every later swap in the same pass, and the
+    /// poll itself already retries on the next tick.
+    pub async fn account_exists_no_retry(&self, account: &str) -> Result<bool, BoltzError> {
+        self.account_exists_inner(account, 1).await
+    }
+
+    async fn account_exists_inner(
+        &self,
+        account: &str,
+        max_retries: u32,
+    ) -> Result<bool, BoltzError> {
         let request = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -52,7 +71,7 @@ impl SolanaRpcClient {
 
         let mut last_err = None;
         let response = 'retry: {
-            for attempt in 0..MAX_RPC_RETRIES {
+            for attempt in 0..max_retries {
                 let response = self
                     .http
                     .post(
@@ -64,6 +83,14 @@ impl SolanaRpcClient {
                     .map_err(|e| BoltzError::Generic(format!("Solana RPC request failed: {e}")))?;
 
                 if response.status == 429 {
+                    last_err = Some(BoltzError::Generic(format!(
+                        "Solana RPC HTTP error 429: {}",
+                        response.body
+                    )));
+                    // Don't sleep after the final attempt (or when not retrying).
+                    if attempt.saturating_add(1) >= max_retries {
+                        break;
+                    }
                     let delay = RPC_RETRY_BASE_MS
                         .saturating_mul(2u64.saturating_pow(attempt))
                         .min(30_000);
@@ -76,10 +103,6 @@ impl SolanaRpcClient {
                         platform_utils::time::Duration::from_millis(delay),
                     )
                     .await;
-                    last_err = Some(BoltzError::Generic(format!(
-                        "Solana RPC HTTP error 429: {}",
-                        response.body
-                    )));
                     continue;
                 }
 
@@ -94,7 +117,7 @@ impl SolanaRpcClient {
             }
             return Err(last_err.unwrap_or_else(|| {
                 BoltzError::Generic(format!(
-                    "Solana RPC request failed after {MAX_RPC_RETRIES} retries"
+                    "Solana RPC request failed after {max_retries} retries"
                 ))
             }));
         };

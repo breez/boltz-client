@@ -322,6 +322,8 @@ impl CctpFeeClient {
             forward_tx_hash: msg.forward_tx_hash,
             message: msg.message,
             delivered_amount,
+            forward_state: msg.forward_state,
+            forward_error_code: msg.forward_error_code,
         })
     }
 
@@ -385,6 +387,14 @@ pub struct CctpMessageStatus {
     /// Authoritative delivered amount (burn amount minus the finalized CCTP
     /// fee), parsed from `message`. Present only once attested.
     pub delivered_amount: Option<u64>,
+    /// Circle forwarding-service state (`"PENDING"`/`"COMPLETE"`/`"FAILED"`).
+    /// A `FAILED` forward means the mint must land some other way (e.g. a
+    /// third-party `receiveMessage`); the funds are attested and recoverable,
+    /// not lost — so it is surfaced, never treated as a swap failure.
+    pub forward_state: Option<String>,
+    /// Forwarding error code when `forward_state` is `FAILED` (e.g.
+    /// `"INTERNAL_ERROR"`). Diagnostic only.
+    pub forward_error_code: Option<String>,
 }
 
 impl CctpMessageStatus {
@@ -393,6 +403,16 @@ impl CctpMessageStatus {
     #[must_use]
     pub fn is_forwarded(&self) -> bool {
         self.forward_tx_hash.is_some()
+    }
+
+    /// Whether Circle's forwarding service reported the forward as failed. The
+    /// funds are still attested and recoverable; delivery must be confirmed
+    /// from the destination chain instead.
+    #[must_use]
+    pub fn forward_failed(&self) -> bool {
+        self.forward_state
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case("FAILED"))
     }
 }
 
@@ -412,6 +432,10 @@ struct CctpMessageSnapshot {
     forward_tx_hash: Option<String>,
     #[serde(default)]
     message: Option<String>,
+    #[serde(default, rename = "forwardState")]
+    forward_state: Option<String>,
+    #[serde(default, rename = "forwardErrorCode")]
+    forward_error_code: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -649,6 +673,25 @@ mod tests {
         let s = CctpFeeClient::parse_message_status(&body).unwrap();
         assert_eq!(s.message.as_deref(), Some(message_hex.as_str()));
         assert_eq!(s.delivered_amount, Some(1_000_000 - 250));
+    }
+
+    #[macros::test_all]
+    fn parse_message_status_reads_failed_forward() {
+        // The stuck-swap shape: attested + status complete, but the forward
+        // failed and no forwardTxHash. Must parse as not-forwarded, failed.
+        let body = r#"{"messages":[{"status":"complete","attestation":"0xabcd","forwardState":"FAILED","forwardErrorCode":"INTERNAL_ERROR"}]}"#;
+        let s = CctpFeeClient::parse_message_status(body).unwrap();
+        assert!(!s.is_forwarded());
+        assert!(s.forward_failed());
+        assert_eq!(s.forward_error_code.as_deref(), Some("INTERNAL_ERROR"));
+
+        // A pending (not failed) forward is not `forward_failed`.
+        let pending = r#"{"messages":[{"status":"complete","forwardState":"PENDING"}]}"#;
+        assert!(
+            !CctpFeeClient::parse_message_status(pending)
+                .unwrap()
+                .forward_failed()
+        );
     }
 
     #[macros::test_all]
