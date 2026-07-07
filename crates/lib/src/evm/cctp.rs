@@ -21,10 +21,16 @@ use crate::solana::ata::derive_ata;
 /// Basis-points denominator for the `maxFee` buffer.
 const BPS_DENOMINATOR: u128 = 10_000;
 
-/// Length of the EVM forwarding-service prefix reused by the Solana hookData:
-/// the first 29 bytes of [`CCTP_FORWARD_HOOK_DATA_HEX`] (the `"cctp-forward"`
-/// tag plus padding), matching the web app's `cctpForwardHookData.slice(0,58)`.
-const SOLANA_FORWARD_PREFIX_LEN: usize = 29;
+/// Byte length of the Solana hookData prefix that precedes the payload: the
+/// `"cctp-forward"` tag zero-padded — the first 28 bytes of the EVM forward
+/// hookData.
+///
+/// Equals the web app's `cctpForwardHookData.slice(0, 58)`, but note that slices
+/// a `"0x"`-prefixed hex *string*: 58 chars is `"0x"` + 56 hex = **28 bytes**,
+/// not 29 (the count includes the `0x`). A 29-byte prefix shifts the 4-byte
+/// dataLength that follows by one, so Circle reads length 0 and drops the
+/// payload (the ATA-creation flag + wallet), and the forward fails.
+const SOLANA_FORWARD_PREFIX_LEN: usize = 28;
 
 /// Decode a base58 Solana pubkey into its 32-byte form.
 fn decode_solana_pubkey(s: &str) -> Result<[u8; 32], BoltzError> {
@@ -68,9 +74,9 @@ pub fn evm_forward_hook_data() -> [u8; 32] {
     out
 }
 
-/// Solana forwarding-service `hookData`: the EVM forward prefix (29 bytes) +
-/// payload length `0x00000021` (33) + ATA-creation flag `0x01` + the 32-byte
-/// recipient wallet pubkey. Mirrors the web app's
+/// Solana forwarding-service `hookData`: the 28-byte `"cctp-forward"` prefix
+/// (tag zero-padded) + 4-byte payload length `0x00000021` (33) + ATA-creation
+/// flag `0x01` + the 32-byte recipient wallet pubkey. Mirrors the web app's
 /// `createCctpSolanaForwardHookData`. Used when the recipient's USDC ATA does
 /// not yet exist so Circle's forwarder creates it on delivery.
 pub fn solana_forward_hook_data(recipient_wallet: &str) -> Result<Vec<u8>, BoltzError> {
@@ -505,16 +511,40 @@ mod tests {
         let wallet = "BZkwksSEeHrCVS3HeewBJKEBTEEuwnEqpkHqEg1dRpuE";
         let hook = solana_forward_hook_data(wallet).unwrap();
 
-        assert_eq!(hook.len(), 29 + 4 + 1 + 32);
-        // Prefix is "cctp-forward" + padding (first 29 bytes of the EVM hook).
+        assert_eq!(hook.len(), 28 + 4 + 1 + 32);
+        // Prefix = "cctp-forward" tag (12B) zero-padded to 28 bytes.
         assert_eq!(&hook[..12], b"cctp-forward");
-        assert_eq!(&hook[12..29], &[0u8; 17]);
-        // length = 0x00000021, flag = 0x01.
-        assert_eq!(&hook[29..33], &[0x00, 0x00, 0x00, 0x21]);
-        assert_eq!(hook[33], 0x01);
+        assert_eq!(&hook[12..28], &[0u8; 16]);
+        // dataLength = 0x00000021 (33), flag = 0x01.
+        assert_eq!(&hook[28..32], &[0x00, 0x00, 0x00, 0x21]);
+        assert_eq!(hook[32], 0x01);
         // Trailing 32 bytes = the wallet pubkey.
         let wallet_bytes = bs58::decode(wallet).into_vec().unwrap();
-        assert_eq!(&hook[34..], &wallet_bytes[..]);
+        assert_eq!(&hook[33..], &wallet_bytes[..]);
+    }
+
+    /// Byte-parity with boltz-web-app's own golden vectors
+    /// (`boltz-swaps` `cctp/evm.spec.ts`, `0x` stripped) — the reference
+    /// implementation this is ported from. Pins the exact on-wire bytes: a
+    /// prior 29-byte prefix shifted `dataLength` to 0, so Circle dropped the
+    /// payload and the forward failed. See `SOLANA_FORWARD_PREFIX_LEN`.
+    #[macros::test_all]
+    fn solana_forward_hook_matches_web_app_vectors() {
+        for (recipient, expected) in [
+            (
+                "11111111111111111111111111111111",
+                "636374702d666f7277617264000000000000000000000000000000000000002101\
+0000000000000000000000000000000000000000000000000000000000000000",
+            ),
+            (
+                "EwwMqF8sFZRBGLchFfq61g5U7mPB14EnXxLQDWb5VAe5",
+                "636374702d666f7277617264000000000000000000000000000000000000002101\
+cf3ac201d92eadcae0cd69b431f4c0e6d96c06bdb2fa28271b00409b5f1622ca",
+            ),
+        ] {
+            let hook = solana_forward_hook_data(recipient).unwrap();
+            assert_eq!(hex::encode(hook), expected, "recipient {recipient}");
+        }
     }
 
     #[macros::test_all]
