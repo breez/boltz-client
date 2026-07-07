@@ -1405,6 +1405,112 @@ mod tests {
         assert_eq!(keccak256(b"").as_slice(), &empty_keccak);
     }
 
+    /// Byte-for-byte golden vector against boltz-web-app's `cctp/evm.spec.ts`.
+    /// Pins both the canonical `CctpData` EIP-712 typehash and the full struct
+    /// hash for a fixed input — the reference's `cctpDataTypehash` and
+    /// `hashCctpData(sample)`. A mismatch means the ABI field order/units or
+    /// the typehash string diverged from the Router the signature is verified
+    /// against, which would make every CCTP claim signature revert on-chain.
+    #[macros::test_all]
+    fn test_hash_cctp_data_matches_web_app_golden() {
+        use alloy_primitives::keccak256;
+
+        // 1. cctpDataTypehash — keccak256 of the canonical type string.
+        let canonical = "CctpData(uint32 destinationDomain,bytes32 mintRecipient,bytes32 destinationCaller,uint256 maxFee,uint32 minFinalityThreshold,bytes32 hookData)";
+        let typehash: [u8; 32] = keccak256(canonical.as_bytes()).into();
+        assert_eq!(
+            hex::encode(typehash),
+            "9b5b1c929227bcc37f83e385e88fc739668266cfce6830b07fceef394627016f"
+        );
+
+        // 2. hashCctpData(sample) — mintRecipient = addressToBytes32(0x1111..1111),
+        // destinationCaller = bytes32(0), maxFee = 100, minFinalityThreshold =
+        // 1000, empty hookData.
+        let sample = CctpData {
+            destinationDomain: 0,
+            mintRecipient: address_to_bytes32(
+                parse_address("0x1111111111111111111111111111111111111111").unwrap(),
+            ),
+            destinationCaller: FixedBytes::<32>::ZERO,
+            maxFee: U256::from(100u64),
+            minFinalityThreshold: 1000,
+            hookData: vec![].into(),
+        };
+        assert_eq!(
+            hex::encode(hash_cctp_data(typehash, &sample)),
+            "7680d81fad262508a7c1de25f63bb8fa2d7594056fa551b9978e34330c5941c5"
+        );
+    }
+
+    /// CCTP v2 event topic hashes pinned against Circle's on-chain signature
+    /// fixtures (boltz-web-app `cctp/events.spec.ts`). Independent of alloy's
+    /// `SIGNATURE_HASH` derivation: a typo in the event declaration would make
+    /// every `MessageSent`/`MintAndWithdraw` log query silently miss.
+    #[macros::test_all]
+    fn test_cctp_event_topics_match_circle_fixtures() {
+        use alloy_primitives::keccak256;
+        // Literal fixtures pinned in the web app's `cctp/events.spec.ts`.
+        assert_eq!(
+            hex::encode(MessageSent::SIGNATURE_HASH.as_slice()),
+            "8c5261668696ce22758910d05bab8f186d6eb247ceac2af2e82c7dc17669b036"
+        );
+        assert_eq!(
+            hex::encode(MintAndWithdraw::SIGNATURE_HASH.as_slice()),
+            "50c55e915134d457debfa58eb6f4342956f8b0616d51a89a3659360178e1ab63"
+        );
+        // OFTSent: the web app pins it against keccak256 of the canonical
+        // signature string rather than a literal — mirror that.
+        assert_eq!(
+            OFTSent::SIGNATURE_HASH.as_slice(),
+            keccak256(b"OFTSent(bytes32,uint32,address,uint256,uint256)").as_slice()
+        );
+    }
+
+    /// Independent validation of the CCTP burn-message byte offsets by building
+    /// a message from its field layout (per Circle's `MessageV2` + `BurnMessageV2`)
+    /// rather than by writing to the same offsets the decoder reads. Mirrors
+    /// boltz-web-app `cctp/events.spec.ts` `parseCctpBurnMessage`. If an offset
+    /// constant drifted, the amount/fee/nonce would decode wrong here even
+    /// though the crate's self-referential test still passed.
+    #[macros::test_all]
+    fn test_cctp_burn_message_offsets_from_field_layout() {
+        // Outer header: version(4) srcDomain(4) dstDomain(4) nonce(32)
+        // sender(32) recipient(32) destinationCaller(32) minFinality(4)
+        // finalityExecuted(4) = 148 bytes, then the body.
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&2u32.to_be_bytes()); // version = 2
+        msg.extend_from_slice(&3u32.to_be_bytes()); // sourceDomain = 3
+        msg.extend_from_slice(&6u32.to_be_bytes()); // destinationDomain = 6
+        let nonce = [0x44u8; 32];
+        msg.extend_from_slice(&nonce); // nonce
+        msg.extend_from_slice(&[0x22u8; 32]); // sender
+        msg.extend_from_slice(&[0x11u8; 32]); // recipient
+        msg.extend_from_slice(&[0u8; 32]); // destinationCaller
+        msg.extend_from_slice(&1000u32.to_be_bytes()); // minFinalityThreshold
+        msg.extend_from_slice(&1000u32.to_be_bytes()); // finalityThresholdExecuted
+        assert_eq!(msg.len(), CCTP_BODY_OFFSET);
+        // BurnMessage body: version(4) burnToken(32) mintRecipient(32)
+        // amount(32) messageSender(32) maxFee(32) feeExecuted(32) expiry(32).
+        msg.extend_from_slice(&1u32.to_be_bytes()); // body version
+        msg.extend_from_slice(&[0u8; 32]); // burnToken
+        msg.extend_from_slice(&[0x11u8; 32]); // mintRecipient
+        msg.extend_from_slice(&U256::from(1_000_000u64).to_be_bytes::<32>()); // amount
+        msg.extend_from_slice(&[0u8; 32]); // messageSender
+        msg.extend_from_slice(&[0u8; 32]); // maxFee
+        msg.extend_from_slice(&U256::from(130u64).to_be_bytes::<32>()); // feeExecuted
+        msg.extend_from_slice(&[0u8; 32]); // expirationBlock
+
+        let message_hex = format!("0x{}", hex::encode(&msg));
+        // amountReceived = 1_000_000 - 130 = 999_870 (web-app golden).
+        assert_eq!(
+            decode_cctp_delivered_from_message(&message_hex),
+            Some(999_870)
+        );
+        // Offsets land the right fields.
+        assert_eq!(read_u32_be(&msg, CCTP_SOURCE_DOMAIN_OFFSET), Some(3));
+        assert_eq!(decode_cctp_nonce_from_message(&message_hex), Some(nonce));
+    }
+
     #[macros::test_all]
     fn test_build_oft_send_param_empty_extra_options() {
         let addr = parse_address("0x0000000000000000000000000000000000000042").unwrap();
