@@ -395,6 +395,19 @@ impl Default for DepositConfig {
 /// confirmation depth anyway.
 pub const DEFAULT_DEPOSIT_SCAN_INTERVAL_SECS: u64 = 30;
 
+/// Canonical ERC-4337 `EntryPoint` v0.7 — same address on every supported EVM
+/// chain. Deposit sends read `getNonce` here to anchor the send-schedule
+/// derivation (see `deposit::sends`).
+pub const ENTRYPOINT_V07_ADDRESS: &str = "0x0000000071727De22E5E9d8BAf0edAc6f37da032";
+
+/// The 4337 2D-nonce key the gas sponsor's wallet stack uses (verified
+/// empirically 2026-07-20: every `wallet_prepareCalls` returns key = 1 with a
+/// chain-read sequence). The value itself is NOT load-bearing: the sender
+/// compares the prepared `UserOp` nonce against `getNonce(sender, this key)`
+/// and refuses to send on any mismatch, so a sponsor-side key change stalls
+/// deposit sends loudly instead of silently voiding the collision guarantee.
+pub const DEPOSIT_NONCE_KEY: u64 = 1;
+
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "browser-tests")]

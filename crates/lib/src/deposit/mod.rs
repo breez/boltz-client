@@ -7,3 +7,8 @@
 #[cfg_attr(not(test), expect(dead_code))]
 pub(crate) mod detect;
 pub mod models;
+// dead_code: consumed by the deposit manager (in progress on this branch).
+#[cfg_attr(not(test), expect(dead_code))]
+pub(crate) mod schedule;
+#[cfg_attr(not(test), expect(dead_code))]
+pub(crate) mod sends;

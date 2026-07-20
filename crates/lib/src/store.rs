@@ -341,6 +341,7 @@ mod tests {
             deposit_ids,
             amount: 49_000_000,
             deposit_address: "0x9858EfFD232B4033E47d90003D41EC34EcaEda94".to_string(),
+            created_at_block: 100,
             erc20swap_address: None,
             claim_address: None,
             timelock: None,

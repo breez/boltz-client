@@ -88,7 +88,7 @@ impl AlchemyGasClient {
     }
 
     /// Step 1: `wallet_prepareCalls` — prepare calls for gas abstraction.
-    async fn prepare_calls(
+    pub(crate) async fn prepare_calls(
         &self,
         calls: &[EvmCall],
         chain_id: u64,
@@ -121,7 +121,7 @@ impl AlchemyGasClient {
     }
 
     /// Step 2: Sign the prepared calls and send via `wallet_sendPreparedCalls`.
-    async fn sign_and_send(
+    pub(crate) async fn sign_and_send(
         &self,
         prepared: serde_json::Value,
         gas_signer: &EvmSigner,

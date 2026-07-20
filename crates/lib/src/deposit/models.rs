@@ -133,6 +133,10 @@ pub struct DepositSwap {
     /// The deposit address: burn recipient, lock `refundAddress`, and
     /// `Commit`/refund-authorization signer.
     pub deposit_address: String,
+    /// Arbitrum height when this record was first created — the lower bound
+    /// for `Lockup`-log rescans (any instance's creation height necessarily
+    /// precedes the first lock attempt, so an LWW-collapsed value is safe).
+    pub created_at_block: u64,
 
     // Lock parameters, snapshotted from `GET /v2/commitment/{cur}/details`
     // at lock time — enough to rebuild `hashValues`, the bind signature,

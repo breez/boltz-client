@@ -202,6 +202,13 @@ sol! {
     /// Nonzero iff the CCTP nonce was consumed — `receiveMessage` idempotency.
     function usedNonces(bytes32 nonce) external view returns (uint256);
 
+    // ─── ERC-4337 EntryPoint v0.7 ────────────────────────────────────────
+
+    /// 2D account nonce: `(key << 64) | sequence`. Read BEFORE deriving the
+    /// deposit send schedule; the prepared `UserOp`'s nonce must equal this
+    /// read or the send aborts (see `deposit::sends`).
+    function getNonce(address sender, uint192 key) external view returns (uint256);
+
     // ─── OFT Contract (LayerZero USDT0) ──────────────────────────────
 
     struct OftSendParam {
@@ -822,6 +829,23 @@ pub fn encode_used_nonces(nonce: [u8; 32]) -> Vec<u8> {
         nonce: nonce.into(),
     }
     .abi_encode()
+}
+
+/// Encode `EntryPoint.getNonce(sender, key)` calldata.
+pub fn encode_get_nonce(sender: Address, key: u64) -> Vec<u8> {
+    getNonceCall {
+        sender,
+        key: alloy_primitives::aliases::U192::from(key),
+    }
+    .abi_encode()
+}
+
+/// Decode `EntryPoint.getNonce` return: the full 2D nonce `(key << 64) | seq`.
+pub fn decode_get_nonce_return(data: &[u8]) -> Result<U256, BoltzError> {
+    <U256>::abi_decode(data).map_err(|e| BoltzError::Evm {
+        reason: format!("Failed to decode getNonce return: {e}"),
+        tx_hash: None,
+    })
 }
 
 /// Decode `usedNonces` return: nonzero = the nonce was consumed (mint landed).
@@ -2233,6 +2257,15 @@ d7c7c073ec476983e3f222924974a48a7f61a7045df31dcf3ed83172bf0bb478\
         );
         assert_eq!(sel(encode_receive_message(b"m", b"a")), "57ecfd28");
         assert_eq!(sel(encode_used_nonces([0; 32])), "feb61724");
+        assert_eq!(sel(encode_get_nonce(a, 1)), "35567e1a");
+    }
+
+    #[macros::test_all]
+    fn test_get_nonce_roundtrip() {
+        // (key=1) << 64 | seq=5
+        let nonce: U256 = (U256::from(1u64) << 64) | U256::from(5u64);
+        let decoded = decode_get_nonce_return(&nonce.abi_encode()).unwrap();
+        assert_eq!(decoded, nonce);
     }
 
     #[macros::test_all]
