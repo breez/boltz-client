@@ -93,6 +93,11 @@ pub enum ParkReason {
     /// Below the Boltz pair minimum; waiting to be aggregated with other
     /// parked inflows into one lock.
     BelowPairLimit,
+    /// A cooperative-refund return landing back at the deposit address on
+    /// Arbitrum. Never auto-retried — a failed flow re-entering by itself
+    /// would loop (fail -> refund -> detect -> retry); it waits for an
+    /// explicit `retry_parked`.
+    RefundReturned,
 }
 
 /// Anchor for an in-flight sponsored send, persisted BEFORE broadcast so a

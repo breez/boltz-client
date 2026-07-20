@@ -3,4 +3,7 @@
 //! `ERC20Swap` commitment, bound to a Boltz submarine swap, and paid out over
 //! Lightning to an integrator-supplied invoice.
 
+// dead_code: consumed by the deposit manager (in progress on this branch).
+#[cfg_attr(not(test), expect(dead_code))]
+pub(crate) mod detect;
 pub mod models;

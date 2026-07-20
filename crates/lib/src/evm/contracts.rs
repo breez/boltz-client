@@ -833,6 +833,11 @@ pub fn decode_used_nonces_return(data: &[u8]) -> Result<bool, BoltzError> {
     Ok(!decoded.is_zero())
 }
 
+/// `eth_getLogs` topic0 for the ERC20 `Transfer` event.
+pub fn transfer_event_topic0() -> String {
+    format!("0x{}", hex::encode(Transfer::SIGNATURE_HASH.as_slice()))
+}
+
 /// `eth_getLogs` topic0 for the `ERC20Swap` `Lockup` event.
 pub fn lockup_event_topic0() -> String {
     format!("0x{}", hex::encode(Lockup::SIGNATURE_HASH.as_slice()))
