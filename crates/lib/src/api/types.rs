@@ -184,6 +184,118 @@ pub struct SwapContracts {
     pub erc20_swap: String,
 }
 
+// ─── Submarine Swap Pairs ─────────────────────────────────────────────────
+
+/// Response from `GET /v2/swap/submarine`.
+/// Keyed by `from` currency (e.g. "USDC"), then `to` currency (e.g. "BTC").
+#[derive(Debug, Clone, Deserialize)]
+pub struct SubmarinePairsResponse(pub HashMap<String, HashMap<String, SubmarinePairInfo>>);
+
+/// Fee/rate/limit info for a single submarine swap pair. Only the fields the
+/// deposit engine needs are modeled — see `SubmarinePairTypeTaproot` in
+/// `boltz-web-app`'s client for the full wire shape.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmarinePairInfo {
+    pub hash: String,
+    pub rate: f64,
+    pub limits: SubmarinePairLimits,
+    pub fees: SubmarinePairFees,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmarinePairLimits {
+    pub minimal: u64,
+    pub maximal: u64,
+    #[serde(default)]
+    pub maximal_zero_conf: Option<u64>,
+}
+
+/// Unlike reverse swaps, submarine `minerFees` is a single flat number rather
+/// than a `{claim, lockup}` breakdown.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmarinePairFees {
+    pub percentage: f64,
+    pub miner_fees: u64,
+}
+
+// ─── Submarine Swap Creation ──────────────────────────────────────────────
+
+/// Request body for `POST /v2/swap/submarine`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateSubmarineSwapRequest {
+    pub from: String,
+    pub to: String,
+    pub invoice: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub referral_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pair_hash: Option<String>,
+}
+
+/// Response from `POST /v2/swap/submarine`. Only the fields relevant to
+/// EVM/commitment submarine swaps are modeled.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateSubmarineSwapResponse {
+    pub id: String,
+    pub expected_amount: u64,
+    #[serde(default)]
+    pub claim_address: Option<String>,
+    #[serde(default)]
+    pub timeout_block_height: Option<u64>,
+    #[serde(default)]
+    pub accept_zero_conf: Option<bool>,
+}
+
+// ─── Commitment Swaps ─────────────────────────────────────────────────────
+
+/// Response from `GET /v2/commitment/{currency}/details`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitmentDetailsResponse {
+    pub contract: String,
+    pub claim_address: String,
+    pub timelock: u64,
+}
+
+/// Request body for `POST /v2/commitment/{currency}` — binds a commitment
+/// lockup to a swap via its EIP-712 `Commit` signature.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BindCommitmentRequest {
+    pub swap_id: String,
+    /// Hex-encoded EIP-712 `Commit` signature.
+    pub signature: String,
+    pub transaction_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_index: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_overpayment_percentage: Option<f64>,
+}
+
+/// Request body for `POST /v2/commitment/{currency}/refund`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitmentRefundRequest {
+    pub transaction_hash: String,
+    /// EIP-191 signature (hex) of the refund authorization message, signed
+    /// by the commitment's refund address.
+    pub refund_address_signature: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_index: Option<u32>,
+}
+
+/// Response from `POST /v2/commitment/{currency}/refund` — the server's
+/// EIP-712 refund signature.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CommitmentRefundResponse {
+    pub signature: String,
+}
+
 // ─── WebSocket Messages ───────────────────────────────────────────────────
 
 /// Subscribe message sent to Boltz WS.
@@ -425,6 +537,160 @@ mod tests {
             arb.tokens["TBTC"],
             "0x6c84a8f1c29108F47a79964b5Fe888D4f4D0dE40"
         );
+    }
+
+    #[macros::test_all]
+    fn test_deserialize_submarine_pairs() {
+        let json = r#"{
+            "USDC": {
+                "BTC": {
+                    "hash": "def456",
+                    "rate": 1.0,
+                    "limits": { "minimal": 1000, "maximal": 5000000, "maximalZeroConf": 100000 },
+                    "fees": {
+                        "percentage": 0.1,
+                        "minerFees": 143
+                    }
+                }
+            }
+        }"#;
+
+        let parsed: SubmarinePairsResponse = serde_json::from_str(json).unwrap();
+        let pair = &parsed.0["USDC"]["BTC"];
+        assert_eq!(pair.hash, "def456");
+        assert!((pair.rate - 1.0).abs() < f64::EPSILON);
+        assert_eq!(pair.limits.minimal, 1000);
+        assert_eq!(pair.limits.maximal, 5_000_000);
+        assert_eq!(pair.limits.maximal_zero_conf, Some(100_000));
+        assert!((pair.fees.percentage - 0.1).abs() < f64::EPSILON);
+        assert_eq!(pair.fees.miner_fees, 143);
+    }
+
+    #[macros::test_all]
+    fn test_serialize_create_submarine_swap_request() {
+        let req = CreateSubmarineSwapRequest {
+            from: "USDC".to_string(),
+            to: "BTC".to_string(),
+            invoice: "lnbc1000n1...".to_string(),
+            referral_id: Some("test_ref".to_string()),
+            pair_hash: Some("hash123".to_string()),
+        };
+
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["from"], "USDC");
+        assert_eq!(json["to"], "BTC");
+        assert_eq!(json["invoice"], "lnbc1000n1...");
+        assert_eq!(json["referralId"], "test_ref");
+        assert_eq!(json["pairHash"], "hash123");
+    }
+
+    #[macros::test_all]
+    fn test_serialize_create_submarine_swap_request_omits_optionals() {
+        let req = CreateSubmarineSwapRequest {
+            from: "USDC".to_string(),
+            to: "BTC".to_string(),
+            invoice: "lnbc1000n1...".to_string(),
+            referral_id: None,
+            pair_hash: None,
+        };
+
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("referralId").is_none());
+        assert!(json.get("pairHash").is_none());
+    }
+
+    #[macros::test_all]
+    fn test_deserialize_create_submarine_swap_response() {
+        let json = r#"{
+            "id": "swap123",
+            "address": "0xabc",
+            "bip21": "bitcoin:bc1...",
+            "swapTree": { "claimLeaf": {}, "refundLeaf": {} },
+            "acceptZeroConf": true,
+            "expectedAmount": 100000,
+            "claimPublicKey": "02abcdef",
+            "timeoutBlockHeight": 123456,
+            "claimAddress": "0xdef"
+        }"#;
+
+        let resp: CreateSubmarineSwapResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.id, "swap123");
+        assert_eq!(resp.expected_amount, 100_000);
+        assert_eq!(resp.claim_address.as_deref(), Some("0xdef"));
+        assert_eq!(resp.timeout_block_height, Some(123_456));
+        assert_eq!(resp.accept_zero_conf, Some(true));
+    }
+
+    #[macros::test_all]
+    fn test_deserialize_commitment_details() {
+        // Live-probe shape.
+        let json = r#"{
+            "contract": "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+            "claimAddress": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+            "timelock": 25675807
+        }"#;
+
+        let resp: CommitmentDetailsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.contract, "0x5FbDB2315678afecb367f032d93F642f64180aa3");
+        assert_eq!(
+            resp.claim_address,
+            "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+        );
+        assert_eq!(resp.timelock, 25_675_807);
+    }
+
+    #[macros::test_all]
+    fn test_serialize_bind_commitment_request() {
+        let req = BindCommitmentRequest {
+            swap_id: "swap123".to_string(),
+            signature: "0xsignature".to_string(),
+            transaction_hash: "0xtxhash".to_string(),
+            log_index: Some(1),
+            max_overpayment_percentage: Some(10.0),
+        };
+
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["swapId"], "swap123");
+        assert_eq!(json["signature"], "0xsignature");
+        assert_eq!(json["transactionHash"], "0xtxhash");
+        assert_eq!(json["logIndex"], 1);
+        assert_eq!(json["maxOverpaymentPercentage"], 10.0);
+    }
+
+    #[macros::test_all]
+    fn test_serialize_bind_commitment_request_omits_optionals() {
+        let req = BindCommitmentRequest {
+            swap_id: "swap123".to_string(),
+            signature: "0xsignature".to_string(),
+            transaction_hash: "0xtxhash".to_string(),
+            log_index: None,
+            max_overpayment_percentage: None,
+        };
+
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("logIndex").is_none());
+        assert!(json.get("maxOverpaymentPercentage").is_none());
+    }
+
+    #[macros::test_all]
+    fn test_serialize_commitment_refund_request() {
+        let req = CommitmentRefundRequest {
+            transaction_hash: "0xtxhash".to_string(),
+            refund_address_signature: "0xrefundsig".to_string(),
+            log_index: Some(2),
+        };
+
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["transactionHash"], "0xtxhash");
+        assert_eq!(json["refundAddressSignature"], "0xrefundsig");
+        assert_eq!(json["logIndex"], 2);
+    }
+
+    #[macros::test_all]
+    fn test_deserialize_commitment_refund_response() {
+        let json = r#"{"signature": "0xserversignature"}"#;
+        let resp: CommitmentRefundResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.signature, "0xserversignature");
     }
 
     #[macros::test_all]
