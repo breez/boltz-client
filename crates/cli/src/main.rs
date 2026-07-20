@@ -1,4 +1,5 @@
 use std::borrow::Cow::{self, Owned};
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,13 +13,16 @@ use rustyline::error::ReadlineError;
 use rustyline::hint::HistoryHinter;
 use rustyline::{Completer, Helper, Hinter, Validator, highlight::Highlighter};
 
+use boltz_client::deposit::models::{Deposit, DepositSwap};
 use boltz_client::{
     Asset, BoltzConfig, BoltzError, BoltzEventListener, BoltzService, BoltzStorage, BoltzSwapEvent,
-    BoltzSwapStatus, DerivedKeyStore,
+    BoltzSwapStatus, DepositConfig, DepositInvoiceResolver, DepositParams, DepositStorage,
+    DerivedKeyStore, InvoiceRequest,
 };
 
 const PHRASE_FILE_NAME: &str = "phrase";
 const HISTORY_FILE_NAME: &str = "history.txt";
+const INVOICE_FILE_NAME: &str = "invoice.txt";
 
 // ─── Top-level CLI (startup args only) ─────────────────────────────────
 #[derive(Parser)]
@@ -48,6 +52,12 @@ struct Cli {
     /// Slippage tolerance in basis points (100 = 1%). Defaults to 100.
     #[arg(long)]
     slippage_bps: Option<u32>,
+
+    /// Enable inbound stablecoin deposits (reusable EVM address -> Lightning
+    /// payout). The deposit key is always HD-derived, so this requires a
+    /// mnemonic even in seedless mode (see `DepositParams::seed`).
+    #[arg(long, env = "BOLTZ_DEPOSITS")]
+    deposits: bool,
 }
 
 // ─── REPL commands (parsed per-line inside the interactive loop) ───────
@@ -99,6 +109,18 @@ enum Command {
     /// automatically on the background poll cadence.
     RefreshDeliveries,
 
+    /// Print the reusable inbound-deposit address (requires --deposits).
+    DepositAddress,
+
+    /// List open deposits and in-flight deposit swaps (requires --deposits).
+    Deposits,
+
+    /// List deposits parked awaiting an explicit `retry-parked` (requires --deposits).
+    Parked,
+
+    /// Re-enter parked deposits into one new lock unit (requires --deposits).
+    RetryParked,
+
     /// Exit the interactive shell.
     #[command(hide = true)]
     Exit,
@@ -128,21 +150,29 @@ async fn main() -> Result<()> {
 
     init_logging(&cli.data_dir)?;
 
-    // Resolve a seed only in seeded mode; seedless swaps need no mnemonic.
-    let seed: Option<[u8; 64]> = if cli.seeded {
-        let mnemonic = if let Some(m) = &cli.mnemonic {
-            Mnemonic::from_str(m).context("Invalid mnemonic")?
-        } else {
-            get_or_create_mnemonic(&cli.data_dir)?
-        };
-        Some(mnemonic.to_seed(""))
+    // Resolve a mnemonic if seeded swaps need one, or if deposits are on: the
+    // deposit key is always HD-derived, even for an otherwise-seedless service.
+    let mnemonic: Option<Mnemonic> = if cli.seeded || cli.deposits {
+        Some(match &cli.mnemonic {
+            Some(m) => Mnemonic::from_str(m).context("Invalid mnemonic")?,
+            None => get_or_create_mnemonic(&cli.data_dir)?,
+        })
     } else {
         if cli.mnemonic.is_some() {
-            println!("Note: --mnemonic is ignored in seedless mode (pass --seeded to use it).");
+            println!(
+                "Note: --mnemonic is ignored in seedless mode (pass --seeded or --deposits to use it)."
+            );
         }
         None
     };
+
+    let seed: Option<[u8; 64]> = cli.seeded.then(|| mnemonic.as_ref().unwrap().to_seed(""));
     let seed = seed.as_ref().map(<[u8; 64]>::as_slice);
+
+    // Deposits always need explicit key material for a seedless service (the
+    // seeded path defaults DepositParams::seed to the service seed instead).
+    let deposit_seed: Option<Vec<u8>> =
+        (cli.deposits && !cli.seeded).then(|| mnemonic.as_ref().unwrap().to_seed("").to_vec());
 
     let mut config = BoltzConfig::mainnet(cli.referral_id);
     if let Some(slippage_bps) = cli.slippage_bps {
@@ -151,7 +181,7 @@ async fn main() -> Result<()> {
 
     // Initialize the service once — WebSocket + SwapManager stay alive for the
     // entire session, handling ongoing swaps in the background.
-    let svc = init_service(config, seed, &cli.data_dir).await?;
+    let svc = init_service(config, seed, &cli.data_dir, cli.deposits, deposit_seed).await?;
 
     println!(
         "Boltz CLI Interactive Mode ({} mode)",
@@ -272,6 +302,22 @@ async fn execute_command(
             println!("Delivery check complete. Use `info`/status events to see any completions.");
             Ok(true)
         }
+        Command::DepositAddress => {
+            cmd_deposit_address(svc);
+            Ok(true)
+        }
+        Command::Deposits => {
+            cmd_deposits(svc).await?;
+            Ok(true)
+        }
+        Command::Parked => {
+            cmd_parked(svc).await?;
+            Ok(true)
+        }
+        Command::RetryParked => {
+            cmd_retry_parked(svc).await?;
+            Ok(true)
+        }
     }
 }
 
@@ -305,11 +351,21 @@ async fn init_service(
     config: BoltzConfig,
     seed: Option<&[u8]>,
     data_dir: &Path,
+    deposits_enabled: bool,
+    deposit_seed: Option<Vec<u8>>,
 ) -> Result<BoltzService> {
     let store = Arc::new(FileBoltzStorage::new(data_dir));
+
+    let deposits = deposits_enabled.then(|| DepositParams {
+        config: DepositConfig::default(),
+        store: store.clone(),
+        resolver: Arc::new(PromptingInvoiceResolver::new(data_dir)),
+        seed: deposit_seed,
+    });
+
     let svc = match seed {
-        Some(seed) => BoltzService::new(config, seed, store, None).await,
-        None => BoltzService::new_seedless(config, store, None).await,
+        Some(seed) => BoltzService::new(config, seed, store, deposits).await,
+        None => BoltzService::new_seedless(config, store, deposits).await,
     }
     .context("Failed to initialize BoltzService")?;
 
@@ -380,6 +436,34 @@ fn cmd_info(svc: &BoltzService, seed: Option<&[u8]>) -> Result<()> {
 async fn cmd_limits(svc: &BoltzService) -> Result<()> {
     let limits = svc.get_limits().await?;
     print_json(&limits);
+    Ok(())
+}
+
+fn cmd_deposit_address(svc: &BoltzService) {
+    match svc.deposit_address() {
+        Some(address) => println!("Deposit address: {address}"),
+        None => println!("Deposits are not enabled — restart with --deposits."),
+    }
+}
+
+async fn cmd_deposits(svc: &BoltzService) -> Result<()> {
+    println!("Open deposits:");
+    print_json(&svc.list_open_deposits().await?);
+    println!("\nActive deposit swaps:");
+    print_json(&svc.list_active_deposit_swaps().await?);
+    Ok(())
+}
+
+async fn cmd_parked(svc: &BoltzService) -> Result<()> {
+    print_json(&svc.parked_deposits().await?);
+    Ok(())
+}
+
+async fn cmd_retry_parked(svc: &BoltzService) -> Result<()> {
+    match svc.retry_parked().await? {
+        Some(id) => println!("Created new deposit swap: {id}"),
+        None => println!("Nothing to retry."),
+    }
     Ok(())
 }
 
@@ -532,6 +616,46 @@ impl BoltzEventListener for PrintingEventListener {
     }
 }
 
+/// Manual-testing [`DepositInvoiceResolver`]: prints the request and reads a
+/// BOLT11 string from `<data_dir>/invoice.txt`. Rustyline owns stdin on the
+/// REPL thread, so this async callback can't prompt interactively — the file
+/// is the hand-off point instead; write the invoice there after seeing the
+/// printed instructions, and the engine's next retry tick picks it up.
+struct PromptingInvoiceResolver {
+    invoice_file: PathBuf,
+}
+
+impl PromptingInvoiceResolver {
+    fn new(data_dir: &Path) -> Self {
+        Self {
+            invoice_file: data_dir.join(INVOICE_FILE_NAME),
+        }
+    }
+}
+
+#[macros::async_trait]
+impl DepositInvoiceResolver for PromptingInvoiceResolver {
+    async fn resolve_invoice(&self, request: &InvoiceRequest) -> Result<String, BoltzError> {
+        match fs::read_to_string(&self.invoice_file) {
+            Ok(contents) if !contents.trim().is_empty() => Ok(contents.trim().to_string()),
+            _ => {
+                println!(
+                    "\n>>> Deposit swap {} needs a BOLT11 invoice for EXACTLY {} sats \
+                     (locking {} USDC, 6dp) <<<\n    Write it to {} — this will be retried \
+                     automatically.\n",
+                    request.deposit_swap_id,
+                    request.amount_sats,
+                    request.lock_amount,
+                    self.invoice_file.display()
+                );
+                Err(BoltzError::Generic(
+                    "no invoice available yet — write one to invoice.txt".to_string(),
+                ))
+            }
+        }
+    }
+}
+
 // ─── Formatting ────────────────────────────────────────────────────────
 
 const OUTPUT_FIELDS: &[&str] = &[
@@ -618,6 +742,11 @@ fn init_logging(data_dir: &Path) -> Result<()> {
 // ─── File-backed BoltzStorage ─────────────────────────────────────────────
 // Persists the key index to `{data_dir}/key_index` and swap state to
 // `{data_dir}/swaps/{swap_id}.json` so that active swaps survive CLI restarts.
+// Deposit records/deposit-swaps follow the same one-file-per-record layout
+// under `{data_dir}/deposits/` and `{data_dir}/deposit_swaps/`; scan
+// watermarks are a single `{data_dir}/watermarks.json` map keyed by chain id
+// (JSON object keys must be strings, so chain ids round-trip through
+// `to_string`/`parse`).
 //
 // Known limitations (acceptable for a CLI tool):
 // - Writes are not atomic (fs::write, not write-to-temp-then-rename). A crash
@@ -687,6 +816,152 @@ impl FileBoltzStorage {
             Err(e) => Err(BoltzError::Store(format!("Failed to read swap: {e}"))),
         }
     }
+
+    fn deposits_dir(&self) -> PathBuf {
+        self.data_dir.join("deposits")
+    }
+
+    /// Deposit ids are `"{chain_id}:{tx_hash}:{log_index}"` — `:` is escaped
+    /// for filesystem safety; the record's own `id` field (read back from the
+    /// file contents) stays canonical.
+    fn deposit_path(&self, id: &str) -> PathBuf {
+        self.deposits_dir()
+            .join(format!("{}.json", id.replace(':', "_")))
+    }
+
+    fn deposit_swaps_dir(&self) -> PathBuf {
+        self.data_dir.join("deposit_swaps")
+    }
+
+    fn deposit_swap_path(&self, id: &str) -> PathBuf {
+        self.deposit_swaps_dir().join(format!("{id}.json"))
+    }
+
+    fn watermarks_path(&self) -> PathBuf {
+        self.data_dir.join("watermarks.json")
+    }
+
+    fn write_deposit(&self, deposit: &Deposit) -> Result<(), BoltzError> {
+        let dir = self.deposits_dir();
+        fs::create_dir_all(&dir)
+            .map_err(|e| BoltzError::Store(format!("Failed to create deposits dir: {e}")))?;
+        let json = serde_json::to_string_pretty(deposit)
+            .map_err(|e| BoltzError::Store(format!("Failed to serialize deposit: {e}")))?;
+        fs::write(self.deposit_path(&deposit.id), json)
+            .map_err(|e| BoltzError::Store(format!("Failed to write deposit: {e}")))
+    }
+
+    fn read_deposit(&self, id: &str) -> Result<Option<Deposit>, BoltzError> {
+        match fs::read_to_string(self.deposit_path(id)) {
+            Ok(json) => {
+                let deposit: Deposit = serde_json::from_str(&json)
+                    .map_err(|e| BoltzError::Store(format!("Failed to parse deposit: {e}")))?;
+                Ok(Some(deposit))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(BoltzError::Store(format!("Failed to read deposit: {e}"))),
+        }
+    }
+
+    fn list_deposits(&self) -> Result<Vec<Deposit>, BoltzError> {
+        let dir = self.deposits_dir();
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut deposits = Vec::new();
+        let entries = fs::read_dir(&dir)
+            .map_err(|e| BoltzError::Store(format!("Failed to read deposits dir: {e}")))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| BoltzError::Store(format!("Failed to read dir entry: {e}")))?;
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "json") {
+                let json = fs::read_to_string(&path)
+                    .map_err(|e| BoltzError::Store(format!("Failed to read deposit file: {e}")))?;
+                let deposit: Deposit = serde_json::from_str(&json)
+                    .map_err(|e| BoltzError::Store(format!("Failed to parse deposit: {e}")))?;
+                deposits.push(deposit);
+            }
+        }
+        Ok(deposits)
+    }
+
+    fn write_deposit_swap(&self, swap: &DepositSwap) -> Result<(), BoltzError> {
+        let dir = self.deposit_swaps_dir();
+        fs::create_dir_all(&dir)
+            .map_err(|e| BoltzError::Store(format!("Failed to create deposit-swaps dir: {e}")))?;
+        let json = serde_json::to_string_pretty(swap)
+            .map_err(|e| BoltzError::Store(format!("Failed to serialize deposit swap: {e}")))?;
+        fs::write(self.deposit_swap_path(&swap.id), json)
+            .map_err(|e| BoltzError::Store(format!("Failed to write deposit swap: {e}")))
+    }
+
+    fn read_deposit_swap(&self, id: &str) -> Result<Option<DepositSwap>, BoltzError> {
+        match fs::read_to_string(self.deposit_swap_path(id)) {
+            Ok(json) => {
+                let swap: DepositSwap = serde_json::from_str(&json)
+                    .map_err(|e| BoltzError::Store(format!("Failed to parse deposit swap: {e}")))?;
+                Ok(Some(swap))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(BoltzError::Store(format!(
+                "Failed to read deposit swap: {e}"
+            ))),
+        }
+    }
+
+    fn list_deposit_swaps(&self) -> Result<Vec<DepositSwap>, BoltzError> {
+        let dir = self.deposit_swaps_dir();
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut swaps = Vec::new();
+        let entries = fs::read_dir(&dir)
+            .map_err(|e| BoltzError::Store(format!("Failed to read deposit-swaps dir: {e}")))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| BoltzError::Store(format!("Failed to read dir entry: {e}")))?;
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "json") {
+                let json = fs::read_to_string(&path).map_err(|e| {
+                    BoltzError::Store(format!("Failed to read deposit-swap file: {e}"))
+                })?;
+                let swap: DepositSwap = serde_json::from_str(&json)
+                    .map_err(|e| BoltzError::Store(format!("Failed to parse deposit swap: {e}")))?;
+                swaps.push(swap);
+            }
+        }
+        Ok(swaps)
+    }
+
+    fn read_watermarks(&self) -> Result<HashMap<u64, u64>, BoltzError> {
+        match fs::read_to_string(self.watermarks_path()) {
+            Ok(json) => {
+                let raw: HashMap<String, u64> = serde_json::from_str(&json)
+                    .map_err(|e| BoltzError::Store(format!("Failed to parse watermarks: {e}")))?;
+                raw.into_iter()
+                    .map(|(k, v)| {
+                        k.parse::<u64>()
+                            .map(|k| (k, v))
+                            .map_err(|e| BoltzError::Store(format!("Invalid watermark key: {e}")))
+                    })
+                    .collect()
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(HashMap::new()),
+            Err(e) => Err(BoltzError::Store(format!("Failed to read watermarks: {e}"))),
+        }
+    }
+
+    fn write_watermarks(&self, watermarks: &HashMap<u64, u64>) -> Result<(), BoltzError> {
+        let raw: HashMap<String, u64> = watermarks
+            .iter()
+            .map(|(k, v)| (k.to_string(), *v))
+            .collect();
+        let json = serde_json::to_string_pretty(&raw)
+            .map_err(|e| BoltzError::Store(format!("Failed to serialize watermarks: {e}")))?;
+        fs::write(self.watermarks_path(), json)
+            .map_err(|e| BoltzError::Store(format!("Failed to write watermarks: {e}")))
+    }
 }
 
 #[macros::async_trait]
@@ -734,6 +1009,59 @@ impl DerivedKeyStore for FileBoltzStorage {
             .ok_or_else(|| BoltzError::Store("Key index overflow".to_string()))?;
         self.write_index(next)?;
         Ok(current)
+    }
+}
+
+#[macros::async_trait]
+impl DepositStorage for FileBoltzStorage {
+    async fn upsert_deposit(&self, deposit: &Deposit) -> Result<(), BoltzError> {
+        self.write_deposit(deposit)
+    }
+
+    async fn get_deposit(&self, id: &str) -> Result<Option<Deposit>, BoltzError> {
+        self.read_deposit(id)
+    }
+
+    async fn list_open_deposits(&self) -> Result<Vec<Deposit>, BoltzError> {
+        Ok(self
+            .list_deposits()?
+            .into_iter()
+            .filter(|d| !d.is_terminal())
+            .collect())
+    }
+
+    async fn list_chain_deposits(&self, chain_id: u64) -> Result<Vec<Deposit>, BoltzError> {
+        Ok(self
+            .list_deposits()?
+            .into_iter()
+            .filter(|d| d.chain_id == chain_id)
+            .collect())
+    }
+
+    async fn upsert_deposit_swap(&self, swap: &DepositSwap) -> Result<(), BoltzError> {
+        self.write_deposit_swap(swap)
+    }
+
+    async fn get_deposit_swap(&self, id: &str) -> Result<Option<DepositSwap>, BoltzError> {
+        self.read_deposit_swap(id)
+    }
+
+    async fn list_active_deposit_swaps(&self) -> Result<Vec<DepositSwap>, BoltzError> {
+        Ok(self
+            .list_deposit_swaps()?
+            .into_iter()
+            .filter(|s| !s.status.is_terminal())
+            .collect())
+    }
+
+    async fn get_deposit_watermark(&self, chain_id: u64) -> Result<Option<u64>, BoltzError> {
+        Ok(self.read_watermarks()?.get(&chain_id).copied())
+    }
+
+    async fn set_deposit_watermark(&self, chain_id: u64, block: u64) -> Result<(), BoltzError> {
+        let mut watermarks = self.read_watermarks()?;
+        watermarks.insert(chain_id, block);
+        self.write_watermarks(&watermarks)
     }
 }
 
