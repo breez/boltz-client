@@ -75,7 +75,7 @@ pub(crate) struct DepositEngineDeps {
     pub config: DepositConfig,
     pub deposit_key: EvmKeyPair,
     pub resolver: Arc<dyn DepositInvoiceResolver>,
-    pub events: EventEmitter,
+    pub events: Arc<EventEmitter>,
     pub referral_id: String,
 }
 

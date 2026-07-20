@@ -308,8 +308,8 @@ async fn init_service(
 ) -> Result<BoltzService> {
     let store = Arc::new(FileBoltzStorage::new(data_dir));
     let svc = match seed {
-        Some(seed) => BoltzService::new(config, seed, store).await,
-        None => BoltzService::new_seedless(config, store).await,
+        Some(seed) => BoltzService::new(config, seed, store, None).await,
+        None => BoltzService::new_seedless(config, store, None).await,
     }
     .context("Failed to initialize BoltzService")?;
 
@@ -518,6 +518,15 @@ impl BoltzEventListener for PrintingEventListener {
                      Call accept_degraded_quote to proceed.",
                     swap.id, expected_usd, quoted_usd
                 );
+            }
+            BoltzSwapEvent::DepositUpdated { deposit } => {
+                println!(
+                    "[deposit {}] {:?} — {} USDC(6dp) on chain {}",
+                    deposit.id, deposit.status, deposit.amount, deposit.chain_id
+                );
+            }
+            BoltzSwapEvent::DepositSwapUpdated { swap } => {
+                println!("[deposit-swap {}] {:?}", swap.id, swap.status);
             }
         }
     }

@@ -17,16 +17,22 @@ use platform_utils::DefaultHttpClient;
 use platform_utils::tokio::sync::mpsc;
 
 pub use config::*;
+pub use deposit::{DepositInvoiceResolver, InvoiceRequest};
 pub use error::BoltzError;
 pub use events::{BoltzEventListener, BoltzSwapEvent, EventEmitter};
 pub use evm::cctp::CctpMessageStatus;
 pub use evm::recipient::is_valid_destination_address;
 pub use keys::EvmKeyManager;
 pub use models::*;
-pub use store::{BoltzStorage, DerivedKeyStore};
+pub use store::{BoltzStorage, DepositStorage, DerivedKeyStore};
+
+use std::collections::HashMap;
 
 use api::BoltzApiClient;
 use api::ws::SwapStatusSubscriber;
+use deposit::engine::{DepositEngine, DepositEngineDeps};
+use deposit::manager::DepositManager;
+use deposit::models::{Deposit, DepositStatus, DepositSwap};
 use evm::alchemy::AlchemyGasClient;
 use evm::oft::fetch_chain_registry;
 use evm::provider::EvmProvider;
@@ -35,6 +41,23 @@ use solana::rpc::SolanaRpcClient;
 use swap::locks::SwapLocks;
 use swap::manager::SwapManager;
 use swap::reverse::{ReverseSwapExecutor, current_unix_timestamp, resolve_slippage_bps};
+
+/// Opt-in configuration for the inbound deposit feature, supplied at service
+/// construction. Absent, the feature is entirely inactive: no background
+/// scanning, no deposit API, nothing.
+pub struct DepositParams {
+    pub config: DepositConfig,
+    /// Storage for deposit records and scan watermarks — typically the same
+    /// object as the service's [`BoltzStorage`], implementing both traits.
+    pub store: Arc<dyn DepositStorage>,
+    /// Integrator invoice source (a mechanical fetch; see
+    /// [`DepositInvoiceResolver`]).
+    pub resolver: Arc<dyn DepositInvoiceResolver>,
+    /// Seed for the HD-only deposit key (`m/44'/60'/0'/0/0` — one address on
+    /// every chain). `None` reuses the service seed, which only a seeded
+    /// service has; a seedless service must supply key material explicitly.
+    pub seed: Option<Vec<u8>>,
+}
 
 /// `User-Agent` sent on every outbound HTTP request. Some upstreams reject
 /// header-less requests.
@@ -61,33 +84,63 @@ pub struct BoltzService {
     /// `update_swap_slippage`, `refresh_pending_deliveries`) acquire the swap's
     /// lock so they never race the loop's handler for the same swap.
     swap_locks: Arc<SwapLocks>,
+    /// Present iff deposits were configured at construction.
+    deposits: Option<DepositHandle>,
+}
+
+/// Internal deposit wiring kept on the service.
+struct DepositHandle {
+    manager: DepositManager,
+    store: Arc<dyn DepositStorage>,
 }
 
 impl BoltzService {
     /// Construct a **seeded** service: preimages and the global gas signer are
     /// HD-derived from `seed`. The store must implement [`DerivedKeyStore`] to
     /// supply the durable key-index counter that prevents preimage reuse.
+    ///
+    /// `deposits`: opt-in inbound-deposit feature; its `seed` defaults to the
+    /// service seed here.
     pub async fn new(
         config: BoltzConfig,
         seed: &[u8],
         store: Arc<dyn DerivedKeyStore>,
+        mut deposits: Option<DepositParams>,
     ) -> Result<Self, BoltzError> {
         let key_manager = EvmKeyManager::from_seed(seed)?;
         let secret_provider = Arc::new(DerivedSecretProvider::new(key_manager, store.clone()));
+        if let Some(params) = deposits.as_mut()
+            && params.seed.is_none()
+        {
+            params.seed = Some(seed.to_vec());
+        }
         // Upcast the derived store to the base storage trait for the shared
         // construction path (stable trait upcasting).
-        Self::new_with_provider(config, secret_provider, store).await
+        Self::new_with_provider(config, secret_provider, store, deposits).await
     }
 
     /// Construct a **seedless** service: each swap gets a random preimage and a
     /// random per-swap gas/claim key, persisted inline on the swap. Recoverable
     /// only from the local store — there is no mnemonic backup. No key-index
     /// counter is needed, so a plain [`BoltzStorage`] suffices.
+    ///
+    /// `deposits`: the deposit address is HD-only even here (deterministic
+    /// across instances — no creation race, seed-recoverable), so
+    /// `DepositParams::seed` MUST be supplied; there is no service seed to
+    /// fall back on.
     pub async fn new_seedless(
         config: BoltzConfig,
         store: Arc<dyn BoltzStorage>,
+        deposits: Option<DepositParams>,
     ) -> Result<Self, BoltzError> {
-        Self::new_with_provider(config, Arc::new(RandomSecretProvider), store).await
+        if let Some(params) = &deposits
+            && params.seed.is_none()
+        {
+            return Err(BoltzError::Generic(
+                "deposits on a seedless service require DepositParams::seed".to_string(),
+            ));
+        }
+        Self::new_with_provider(config, Arc::new(RandomSecretProvider), store, deposits).await
     }
 
     /// Shared construction for both modes; differs only in the
@@ -96,6 +149,7 @@ impl BoltzService {
         config: BoltzConfig,
         secret_provider: Arc<dyn SecretProvider>,
         store: Arc<dyn BoltzStorage>,
+        deposits: Option<DepositParams>,
     ) -> Result<Self, BoltzError> {
         // Each component gets its own DefaultHttpClient. They mostly hit
         // distinct hosts, so a shared reqwest connection pool would rarely be
@@ -167,6 +221,15 @@ impl BoltzService {
         // Capture before `config` is moved into the executor.
         let delivery_poll_interval_secs = config.delivery_poll_interval_secs;
 
+        let event_emitter = Arc::new(EventEmitter::new());
+
+        // Deposit wiring happens while `config` is still borrowable; the
+        // handle is started (or not) after the swap manager below.
+        let deposit_handle = match deposits {
+            Some(params) => Some(Self::build_deposits(&config, params, &event_emitter)?),
+            None => None,
+        };
+
         let executor = Arc::new(ReverseSwapExecutor::new(
             api_client,
             secret_provider,
@@ -181,7 +244,6 @@ impl BoltzService {
             solana_rpc,
         ));
 
-        let event_emitter = Arc::new(EventEmitter::new());
         let swap_locks = Arc::new(SwapLocks::new());
 
         let swap_manager = SwapManager::start(
@@ -202,6 +264,80 @@ impl BoltzService {
             ws_subscriber,
             chain_registry,
             swap_locks,
+            deposits: deposit_handle,
+        })
+    }
+
+    /// Build and start the deposit engine + background manager.
+    fn build_deposits(
+        config: &BoltzConfig,
+        params: DepositParams,
+        event_emitter: &Arc<EventEmitter>,
+    ) -> Result<DepositHandle, BoltzError> {
+        let seed = params.seed.ok_or_else(|| {
+            BoltzError::Generic("deposit feature requires key material".to_string())
+        })?;
+        let deposit_key = EvmKeyManager::from_seed(&seed)?.derive_deposit_key(0)?;
+
+        let mut providers: HashMap<u64, EvmProvider> = HashMap::new();
+        for chain in &params.config.source_chains {
+            if deposit_chain_spec(chain.chain_id).is_none() {
+                return Err(BoltzError::Generic(format!(
+                    "unsupported deposit source chain {}",
+                    chain.chain_id
+                )));
+            }
+            providers.insert(
+                chain.chain_id,
+                EvmProvider::new(
+                    chain.rpc_url.clone(),
+                    Box::new(DefaultHttpClient::new(Some(USER_AGENT.to_string()))),
+                ),
+            );
+        }
+        // Locks/refunds/mints always run on Arbitrum, even when it is
+        // trimmed from the watched source-chain set.
+        providers.entry(ARBITRUM_CHAIN_ID).or_insert_with(|| {
+            EvmProvider::new(
+                config.arbitrum_rpc_url.clone(),
+                Box::new(DefaultHttpClient::new(Some(USER_AGENT.to_string()))),
+            )
+        });
+
+        let watch = params.config.watch;
+        let scan_interval = params.config.scan_interval_secs;
+        let engine = Arc::new(DepositEngine::new(DepositEngineDeps {
+            api: BoltzApiClient::new(
+                config,
+                Box::new(DefaultHttpClient::new(Some(USER_AGENT.to_string()))),
+            ),
+            store: params.store.clone(),
+            alchemy: AlchemyGasClient::new(
+                &config.alchemy_config,
+                Box::new(DefaultHttpClient::new(Some(USER_AGENT.to_string()))),
+            ),
+            cctp_fee: evm::cctp::CctpFeeClient::new(
+                Box::new(DefaultHttpClient::new(Some(USER_AGENT.to_string()))),
+                config.cctp_api_url.clone(),
+            ),
+            providers,
+            config: params.config,
+            deposit_key,
+            resolver: params.resolver,
+            events: event_emitter.clone(),
+            referral_id: config.referral_id.clone(),
+        }));
+
+        let manager = DepositManager::new(engine);
+        // `watch: false` = passive instance: no scanning AND no driving —
+        // money-safety never depends on who runs (chain-derived schedules),
+        // only redundant work does.
+        if watch {
+            manager.start(scan_interval);
+        }
+        Ok(DepositHandle {
+            manager,
+            store: params.store,
         })
     }
 
@@ -257,8 +393,67 @@ impl BoltzService {
 
     /// Shut down the swap manager and close the WebSocket connection.
     pub async fn shutdown(&self) {
+        if let Some(deposits) = &self.deposits {
+            deposits.manager.shutdown();
+        }
         self.swap_manager.shutdown().await;
         self.ws_subscriber.close().await;
+    }
+
+    // ─── Inbound deposits ───────────────────────────────────────────────
+
+    /// The reusable deposit address — one address on every supported chain.
+    /// `None` when deposits were not configured.
+    pub fn deposit_address(&self) -> Option<String> {
+        self.deposits
+            .as_ref()
+            .map(|d| d.manager.engine().deposit_address().to_string())
+    }
+
+    /// All inflows not yet consumed by a lock unit (parked included).
+    pub async fn list_open_deposits(&self) -> Result<Vec<Deposit>, BoltzError> {
+        self.deposit_handle()?.store.list_open_deposits().await
+    }
+
+    /// All lock units still in flight.
+    pub async fn list_active_deposit_swaps(&self) -> Result<Vec<DepositSwap>, BoltzError> {
+        self.deposit_handle()?
+            .store
+            .list_active_deposit_swaps()
+            .await
+    }
+
+    /// Parked inflows: funds sitting at the deposit address awaiting an
+    /// explicit [`retry_parked`](Self::retry_parked) (refund returns,
+    /// sub-limit amounts, sub-bridge-fee dust).
+    pub async fn parked_deposits(&self) -> Result<Vec<Deposit>, BoltzError> {
+        Ok(self
+            .deposit_handle()?
+            .store
+            .list_open_deposits()
+            .await?
+            .into_iter()
+            .filter(|d| matches!(d.status, DepositStatus::Parked { .. }))
+            .collect())
+    }
+
+    /// Re-enter parked funds: sub-bridge-fee dust is re-checked against
+    /// current fees, and every Arbitrum-side parked balance is aggregated
+    /// into ONE new lock unit (returns its id, if created). Deliberately
+    /// integrator-triggered — a failed flow never retries itself into a
+    /// loop, and the integrator decides the moment (e.g. after showing the
+    /// user the parked balance).
+    pub async fn retry_parked(&self) -> Result<Option<String>, BoltzError> {
+        self.deposit_handle()?
+            .manager
+            .with_engine_exclusive(async |engine| engine.retry_parked().await)
+            .await
+    }
+
+    fn deposit_handle(&self) -> Result<&DepositHandle, BoltzError> {
+        self.deposits.as_ref().ok_or_else(|| {
+            BoltzError::Generic("deposits were not configured on this service".to_string())
+        })
     }
 
     /// Get a quote for converting sats to a stablecoin (USDT/USDT0/USDC,

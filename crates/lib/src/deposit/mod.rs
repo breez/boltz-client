@@ -6,11 +6,7 @@
 use crate::error::BoltzError;
 
 pub(crate) mod detect;
-// dead_code: wired into BoltzService by the service-integration change (in
-// progress on this branch).
-#[expect(dead_code)]
 pub(crate) mod engine;
-#[expect(dead_code)]
 pub(crate) mod manager;
 pub mod models;
 pub(crate) mod schedule;
