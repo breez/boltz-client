@@ -187,8 +187,6 @@ impl EvmSigner {
     /// Sign the `ERC20Swap` commitment `Commit` EIP-712 typed data — binds a
     /// deposit commitment to a swap's real preimage hash. MUST be signed by
     /// the deposit key: the contract requires recovery to `refundAddress`.
-    // dead_code: consumed by the deposit engine (in progress on this branch).
-    #[cfg_attr(not(test), expect(dead_code))]
     #[expect(clippy::too_many_arguments)]
     pub fn sign_eip712_erc20swap_commit(
         &self,

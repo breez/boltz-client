@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use platform_utils::tokio::sync::RwLock;
 
+use crate::deposit::models::{Deposit, DepositSwap};
 use crate::models::BoltzSwap;
 
 /// Event emitted when a swap's state changes.
@@ -19,6 +20,10 @@ pub enum BoltzSwapEvent {
         expected_usd: u64,
         quoted_usd: u64,
     },
+    /// A deposit inflow's persisted state was updated (detection included).
+    DepositUpdated { deposit: Deposit },
+    /// A deposit lock unit's persisted state was updated.
+    DepositSwapUpdated { swap: DepositSwap },
 }
 
 /// Callback trait for receiving swap events.

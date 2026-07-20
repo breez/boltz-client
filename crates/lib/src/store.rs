@@ -69,6 +69,10 @@ pub trait DepositStorage: BoltzStorage {
     async fn get_deposit(&self, id: &str) -> Result<Option<Deposit>, BoltzError>;
     /// All inflows not yet `Consumed` (parked inflows included).
     async fn list_open_deposits(&self) -> Result<Vec<Deposit>, BoltzError>;
+    /// EVERY inflow recorded for a chain, `Consumed` included — the burn
+    /// scheduler matches observed chain sends against the full inflow
+    /// history, so filtering here would misalign the matching.
+    async fn list_chain_deposits(&self, chain_id: u64) -> Result<Vec<Deposit>, BoltzError>;
 
     async fn upsert_deposit_swap(&self, swap: &DepositSwap) -> Result<(), BoltzError>;
     async fn get_deposit_swap(&self, id: &str) -> Result<Option<DepositSwap>, BoltzError>;
@@ -167,6 +171,17 @@ impl DepositStorage for MemoryBoltzStorage {
             .await
             .values()
             .filter(|d| !d.is_terminal())
+            .cloned()
+            .collect())
+    }
+
+    async fn list_chain_deposits(&self, chain_id: u64) -> Result<Vec<Deposit>, BoltzError> {
+        Ok(self
+            .deposits
+            .lock()
+            .await
+            .values()
+            .filter(|d| d.chain_id == chain_id)
             .cloned()
             .collect())
     }

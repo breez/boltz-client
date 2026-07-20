@@ -247,6 +247,19 @@ impl AlchemyGasClient {
         Ok(attach_signature(prepared, &sig))
     }
 
+    /// One non-blocking `wallet_getCallsStatus` check. The deposit engine is
+    /// tick-driven and must not park a whole tick inside the 60-attempt
+    /// poll loop; it re-checks pending call ids once per tick instead.
+    pub(crate) async fn check_call_status_once(
+        &self,
+        call_id: &str,
+    ) -> Result<CallStatus, BoltzError> {
+        let raw = self
+            .rpc_call::<serde_json::Value>("wallet_getCallsStatus", serde_json::json!([call_id]))
+            .await?;
+        Ok(classify_calls_status(&raw))
+    }
+
     /// Poll `wallet_getCallsStatus` until confirmed or timeout. Also used on
     /// resume to recover the tx hash for a previously persisted `call_id`.
     ///
@@ -453,7 +466,7 @@ struct SendPreparedCallsResponse {
 }
 
 /// Classified outcome of a `wallet_getCallsStatus` poll.
-enum CallStatus {
+pub(crate) enum CallStatus {
     /// Included on-chain without reverts; carries the claim tx hash.
     Confirmed(String),
     /// Terminally failed (reverted or not included) — won't succeed on retry.

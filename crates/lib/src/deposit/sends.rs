@@ -26,9 +26,6 @@ use crate::evm::signing::EvmSigner;
 
 /// Outcome of a guarded send attempt.
 #[derive(Debug)]
-// dead_code(test target only): tests never reach a real `Sent` (that needs
-// the full sign-and-send mock chain); the engine reads `call_id` in prod.
-#[cfg_attr(test, expect(dead_code))]
 pub(crate) enum SendOutcome {
     /// Submitted; poll the gas sponsor by `call_id` for the tx hash.
     Sent { call_id: String },
