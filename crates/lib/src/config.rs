@@ -271,6 +271,130 @@ pub const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 /// the unfunded swap's server-side state self-clears as quickly as possible.
 pub const PROBE_INVOICE_EXPIRY_SECS: u64 = 60;
 
+// ─── Inbound deposits ────────────────────────────────────────────────────
+
+/// Protocol facts for a supported deposit source chain. The
+/// runtime-overridable parts (RPC URL, confirmation depth) live on
+/// [`DepositChainConfig`].
+#[derive(Clone, Copy, Debug)]
+pub struct DepositChainSpec {
+    pub chain_id: u64,
+    /// Stable lowercase identifier — also the per-chain watermark key, so
+    /// renaming one orphans that chain's stored scan cursor.
+    pub label: &'static str,
+    /// Native USDC token contract on this chain.
+    pub usdc_address: &'static str,
+    /// Circle CCTP domain id.
+    pub cctp_domain: u32,
+    /// Default confirmation depth a deposit must reach before it may drive
+    /// the irreversible CCTP burn — a reorged-out transfer must never burn.
+    pub default_confirmations: u64,
+    pub default_rpc_url: &'static str,
+}
+
+/// Supported deposit source chains. Confirmation depths for ETH/POL/BASE
+/// mirror boltz-web-app deposits. Arbitrum is the special local case: inflows
+/// there (cooperative-refund returns, direct deposits) skip the bridge
+/// entirely, and the guarded action is only the lock, so a shallow depth
+/// suffices (sequencer reorgs are practically nonexistent).
+pub const DEPOSIT_SOURCE_CHAINS: &[DepositChainSpec] = &[
+    DepositChainSpec {
+        chain_id: 1,
+        label: "ethereum",
+        usdc_address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+        cctp_domain: 0,
+        default_confirmations: 12,
+        default_rpc_url: "https://ethereum-rpc.publicnode.com",
+    },
+    DepositChainSpec {
+        chain_id: 137,
+        label: "polygon",
+        usdc_address: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
+        cctp_domain: 7,
+        default_confirmations: 64,
+        default_rpc_url: "https://polygon-bor-rpc.publicnode.com",
+    },
+    DepositChainSpec {
+        chain_id: 8453,
+        label: "base",
+        usdc_address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+        cctp_domain: 6,
+        default_confirmations: 12,
+        default_rpc_url: "https://base-rpc.publicnode.com",
+    },
+    DepositChainSpec {
+        chain_id: ARBITRUM_CHAIN_ID,
+        label: "arbitrum",
+        usdc_address: ARBITRUM_USDC_ADDRESS,
+        cctp_domain: CCTP_ARBITRUM_DOMAIN,
+        default_confirmations: 12,
+        default_rpc_url: "https://arb1.arbitrum.io/rpc",
+    },
+];
+
+/// Look up a deposit source chain's protocol facts by EVM chain id.
+pub fn deposit_chain_spec(chain_id: u64) -> Option<&'static DepositChainSpec> {
+    DEPOSIT_SOURCE_CHAINS
+        .iter()
+        .find(|s| s.chain_id == chain_id)
+}
+
+/// Per-chain runtime deposit configuration.
+#[derive(Clone, Debug)]
+pub struct DepositChainConfig {
+    /// Must match a [`DEPOSIT_SOURCE_CHAINS`] entry.
+    pub chain_id: u64,
+    pub rpc_url: String,
+    /// Confirmation depth before the deposit may be acted on.
+    pub confirmations: u64,
+}
+
+impl DepositChainConfig {
+    /// Chain config with the spec's defaults.
+    pub fn from_spec(spec: &DepositChainSpec) -> Self {
+        Self {
+            chain_id: spec.chain_id,
+            rpc_url: spec.default_rpc_url.to_string(),
+            confirmations: spec.default_confirmations,
+        }
+    }
+}
+
+/// Configuration for the inbound stablecoin deposit feature. Supplied via
+/// `DepositParams` at service construction; the feature is fully absent
+/// without it.
+#[derive(Clone, Debug)]
+pub struct DepositConfig {
+    /// Chains to accept deposits on. Defaults to every supported chain with
+    /// public-RPC defaults; trim the set or override URLs per chain.
+    pub source_chains: Vec<DepositChainConfig>,
+    /// Deposit scanner cadence in seconds (per source chain).
+    pub scan_interval_secs: u64,
+    /// Whether this instance scans for deposits and drives them. Disable on
+    /// secondary instances to save RPC — money-safety NEVER depends on
+    /// there being a single watcher (see the chain-derived scheduling
+    /// design), only redundant work does.
+    pub watch: bool,
+}
+
+impl Default for DepositConfig {
+    fn default() -> Self {
+        Self {
+            source_chains: DEPOSIT_SOURCE_CHAINS
+                .iter()
+                .map(DepositChainConfig::from_spec)
+                .collect(),
+            scan_interval_secs: DEFAULT_DEPOSIT_SCAN_INTERVAL_SECS,
+            watch: true,
+        }
+    }
+}
+
+/// Default deposit scan cadence. Half the web app's 15s: the defaults point
+/// at rate-limited public RPCs and detection latency is dwarfed by
+/// confirmation depth anyway.
+pub const DEFAULT_DEPOSIT_SCAN_INTERVAL_SECS: u64 = 30;
+
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "browser-tests")]
@@ -291,6 +415,46 @@ mod tests {
     #[macros::test_all]
     fn cctp_fee_denominator_is_scaled_bps() {
         assert_eq!(CCTP_FEE_BPS_DENOMINATOR, 10_000 * CCTP_FEE_SCALE);
+    }
+
+    /// The deposit source-chain table must agree with the outbound CCTP
+    /// destination table wherever a chain appears in both — one source of
+    /// truth would be circular (they serve different directions), so pin
+    /// them against each other instead.
+    #[macros::test_all]
+    fn deposit_chains_consistent_with_cctp_destinations() {
+        for spec in DEPOSIT_SOURCE_CHAINS {
+            if let Some(dest) = crate::models::CCTP_DESTINATIONS
+                .iter()
+                .find(|d| d.evm_chain_id == Some(spec.chain_id))
+            {
+                assert_eq!(spec.cctp_domain, dest.domain, "{}", spec.label);
+                assert!(
+                    spec.usdc_address.eq_ignore_ascii_case(dest.token_address),
+                    "{}",
+                    spec.label
+                );
+            }
+        }
+        // Arbitrum is the outbound source, never in CCTP_DESTINATIONS — pin
+        // it against the outbound source constants directly.
+        let arb = deposit_chain_spec(ARBITRUM_CHAIN_ID).unwrap();
+        assert_eq!(arb.cctp_domain, CCTP_ARBITRUM_DOMAIN);
+        assert_eq!(arb.usdc_address, ARBITRUM_USDC_ADDRESS);
+    }
+
+    #[macros::test_all]
+    fn deposit_config_default_covers_all_supported_chains() {
+        let cfg = DepositConfig::default();
+        assert_eq!(cfg.source_chains.len(), DEPOSIT_SOURCE_CHAINS.len());
+        for chain in &cfg.source_chains {
+            let spec = deposit_chain_spec(chain.chain_id).unwrap();
+            assert_eq!(chain.confirmations, spec.default_confirmations);
+            assert_eq!(chain.rpc_url, spec.default_rpc_url);
+        }
+        assert!(cfg.watch);
+        // Ethereum, Polygon, Base + local Arbitrum.
+        assert_eq!(cfg.source_chains.len(), 4);
     }
 
     #[macros::test_all]
