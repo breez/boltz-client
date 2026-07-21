@@ -36,8 +36,9 @@ struct Cli {
     #[arg(long, env = "BOLTZ_SEEDED")]
     seeded: bool,
 
-    /// BIP-39 mnemonic (12 or 24 words). Only used in `--seeded` mode; if not
-    /// provided there, reads from data-dir or generates new.
+    /// BIP-39 mnemonic (12 or 24 words); if not provided, reads from
+    /// data-dir or generates new. Always required: the inbound-deposit key is
+    /// HD-derived even when swap secrets are seedless.
     #[arg(long, env = "BOLTZ_MNEMONIC")]
     mnemonic: Option<String>,
 
@@ -52,12 +53,6 @@ struct Cli {
     /// Slippage tolerance in basis points (100 = 1%). Defaults to 100.
     #[arg(long)]
     slippage_bps: Option<u32>,
-
-    /// Enable inbound stablecoin deposits (reusable EVM address -> Lightning
-    /// payout). The deposit key is always HD-derived, so this requires a
-    /// mnemonic even in seedless mode (see `DepositParams::seed`).
-    #[arg(long, env = "BOLTZ_DEPOSITS")]
-    deposits: bool,
 }
 
 // ─── REPL commands (parsed per-line inside the interactive loop) ───────
@@ -109,16 +104,16 @@ enum Command {
     /// automatically on the background poll cadence.
     RefreshDeliveries,
 
-    /// Print the reusable inbound-deposit address (requires --deposits).
+    /// Print the reusable inbound-deposit address.
     DepositAddress,
 
-    /// List open deposits and in-flight deposit swaps (requires --deposits).
+    /// List open deposits and in-flight deposit swaps.
     Deposits,
 
-    /// List deposits parked awaiting an explicit `retry-parked` (requires --deposits).
+    /// List deposits parked awaiting an explicit `retry-parked`.
     Parked,
 
-    /// Re-enter parked deposits into one new lock unit (requires --deposits).
+    /// Re-enter parked deposits into one new lock unit.
     RetryParked,
 
     /// Exit the interactive shell.
@@ -150,29 +145,16 @@ async fn main() -> Result<()> {
 
     init_logging(&cli.data_dir)?;
 
-    // Resolve a mnemonic if seeded swaps need one, or if deposits are on: the
-    // deposit key is always HD-derived, even for an otherwise-seedless service.
-    let mnemonic: Option<Mnemonic> = if cli.seeded || cli.deposits {
-        Some(match &cli.mnemonic {
-            Some(m) => Mnemonic::from_str(m).context("Invalid mnemonic")?,
-            None => get_or_create_mnemonic(&cli.data_dir)?,
-        })
-    } else {
-        if cli.mnemonic.is_some() {
-            println!(
-                "Note: --mnemonic is ignored in seedless mode (pass --seeded or --deposits to use it)."
-            );
-        }
-        None
+    // A mnemonic is always required: deposits are always enabled and their
+    // key is HD-derived even when swap secrets are seedless.
+    let mnemonic = match &cli.mnemonic {
+        Some(m) => Mnemonic::from_str(m).context("Invalid mnemonic")?,
+        None => get_or_create_mnemonic(&cli.data_dir)?,
     };
+    let full_seed: [u8; 64] = mnemonic.to_seed("");
 
-    let seed: Option<[u8; 64]> = cli.seeded.then(|| mnemonic.as_ref().unwrap().to_seed(""));
-    let seed = seed.as_ref().map(<[u8; 64]>::as_slice);
-
-    // Deposits always need explicit key material for a seedless service (the
-    // seeded path defaults DepositParams::seed to the service seed instead).
-    let deposit_seed: Option<Vec<u8>> =
-        (cli.deposits && !cli.seeded).then(|| mnemonic.as_ref().unwrap().to_seed("").to_vec());
+    let seed: Option<&[u8]> = cli.seeded.then_some(full_seed.as_slice());
+    let deposit_seed = full_seed.to_vec();
 
     let mut config = BoltzConfig::mainnet(cli.referral_id);
     if let Some(slippage_bps) = cli.slippage_bps {
@@ -181,7 +163,7 @@ async fn main() -> Result<()> {
 
     // Initialize the service once — WebSocket + SwapManager stay alive for the
     // entire session, handling ongoing swaps in the background.
-    let svc = init_service(config, seed, &cli.data_dir, cli.deposits, deposit_seed).await?;
+    let svc = init_service(config, seed, &cli.data_dir, deposit_seed).await?;
 
     println!(
         "Boltz CLI Interactive Mode ({} mode)",
@@ -351,16 +333,15 @@ async fn init_service(
     config: BoltzConfig,
     seed: Option<&[u8]>,
     data_dir: &Path,
-    deposits_enabled: bool,
-    deposit_seed: Option<Vec<u8>>,
+    deposit_seed: Vec<u8>,
 ) -> Result<BoltzService> {
     let store = Arc::new(FileBoltzStorage::new(data_dir));
 
-    let deposits = deposits_enabled.then(|| DepositParams {
+    let deposits = Some(DepositParams {
         config: DepositConfig::default(),
         store: store.clone(),
         resolver: Arc::new(PromptingInvoiceResolver::new(data_dir)),
-        seed: deposit_seed,
+        seed: Some(deposit_seed),
     });
 
     let svc = match seed {
@@ -442,7 +423,7 @@ async fn cmd_limits(svc: &BoltzService) -> Result<()> {
 fn cmd_deposit_address(svc: &BoltzService) {
     match svc.deposit_address() {
         Some(address) => println!("Deposit address: {address}"),
-        None => println!("Deposits are not enabled — restart with --deposits."),
+        None => println!("Deposits are not enabled."),
     }
 }
 
