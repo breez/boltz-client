@@ -933,7 +933,17 @@ impl DepositEngine {
             amount_sats: request_sats,
             lock_amount: ds.amount,
         };
-        let invoice = self.deps.resolver.resolve_invoice(&request).await?;
+        let invoice = match self.deps.resolver.resolve_invoice(&request).await? {
+            crate::deposit::InvoiceResolution::Invoice(invoice) => invoice,
+            crate::deposit::InvoiceResolution::Decline => {
+                // Receiver rejected the current terms. Nothing is locked, so
+                // this is free; the unit parks whole (see the status docs for
+                // why it is never dissolved) until an explicit retry_parked.
+                tracing::info!(id = %ds.id, "resolver declined terms; parking lock unit");
+                ds.status = DepositSwapStatus::Parked;
+                return self.persist_deposit_swap(ds).await;
+            }
+        };
         verify_invoice(&invoice, request_sats)?;
 
         ds.invoice = Some(invoice);
@@ -1161,9 +1171,18 @@ impl DepositEngine {
 
     // ─── Parked recovery (integrator-triggered) ──────────────────────────
 
-    /// Re-evaluate parked inflows and aggregate every Arbitrum-side parked
-    /// balance into ONE new lock unit. Returns its id, if one was created.
+    /// Re-enter everything parked: resume declined lock units at
+    /// `Resolving` (re-sized at current numbers), re-evaluate parked
+    /// inflows, and aggregate every Arbitrum-side parked balance into ONE
+    /// new lock unit. Returns the new unit's id, if one was created.
     pub(crate) async fn retry_parked(&self) -> Result<Option<String>, BoltzError> {
+        for mut swap in self.deps.store.list_active_deposit_swaps().await? {
+            if matches!(swap.status, DepositSwapStatus::Parked) {
+                swap.status = DepositSwapStatus::Resolving;
+                self.persist_deposit_swap(swap).await?;
+            }
+        }
+
         let deposits = self.deps.store.list_open_deposits().await?;
 
         // Source-chain dust: back to Detected — the burn drive re-checks the

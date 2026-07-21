@@ -187,6 +187,12 @@ pub enum DepositSwapStatus {
     /// Resolving the integrator invoice (pre-lock; transient failures
     /// retry — funds sit minted and safe).
     Resolving,
+    /// The resolver declined the current terms. Non-terminal but not
+    /// driven; `retry_parked` re-enters it at `Resolving`, re-sized at
+    /// then-current numbers. The unit keeps its deposits and its
+    /// deterministic id — dissolving it would recreate the same inflow set
+    /// and collide with this id, which multi-instance lock safety rests on.
+    Parked,
     /// Sponsored `ERC20Swap.lock` in flight.
     Locking,
     /// Creating the Boltz submarine swap.
@@ -251,5 +257,8 @@ mod tests {
         );
         assert!(!DepositSwapStatus::Refunding.is_terminal());
         assert!(!DepositSwapStatus::Resolving.is_terminal());
+        // Parked must stay non-terminal: retry_parked resumes it, and a
+        // terminal Parked would drop it from list_active_deposit_swaps.
+        assert!(!DepositSwapStatus::Parked.is_terminal());
     }
 }

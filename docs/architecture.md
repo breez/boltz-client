@@ -131,7 +131,8 @@ types through their phases, persisting at every boundary:
      bridge and enter at Minted / Parked{RefundReturned}.)
 
   DepositSwap (a lock unit consuming >=1 inflows; N:1 only for parked recovery):
-    Resolving (integrator invoice, PRE-lock) ─► Locking (ERC20Swap commitment,
+    Resolving (integrator invoice, PRE-lock; a resolver Decline parks the
+    unit whole until retry_parked resumes it) ─► Locking (ERC20Swap commitment,
     zero preimage hash) ─► Creating (submarine swap) ─► Binding (EIP-712 Commit
     signature posted; no on-chain tx) ─► Settling (server pays the invoice) ─► Done
         └► Refunding (cooperative, server-signed) ─► Failed  (refund re-enters
@@ -210,7 +211,7 @@ All paths are under `crates/lib/src/` unless noted.
 
 | File | Responsibility | Key types |
 |---|---|---|
-| `deposit/mod.rs` | Public deposit surface: the integrator invoice hook. A **mechanical fetch** — errors always mean transient-retry, no acceptance semantics; may fire more than once per deposit across instances. | `DepositInvoiceResolver` (trait), `InvoiceRequest` |
+| `deposit/mod.rs` | Public deposit surface: the integrator invoice hook — and the receiver's one decision point (the crate has no market oracle; integrators bound Boltz's rate against their own feed here). Returns `Invoice` or `Decline` (parks the unit, free — pre-lock); errors always mean transient-retry; may fire more than once per deposit across instances. | `DepositInvoiceResolver` (trait), `InvoiceRequest`, `InvoiceResolution` |
 | `deposit/models.rs` | The two persisted record types and their phase enums; each phase guards on its own output field so resume is idempotent. `DepositSwap::derive_id` is deterministic over the consumed inflow set so concurrent instances collapse under LWW sync. `PendingSend` anchors every sponsored send **before** broadcast. | `Deposit`, `DepositStatus`, `ParkReason`, `DepositSwap`, `DepositSwapStatus`, `PendingSend` |
 | `deposit/detect.rs` | Per-chain USDC `Transfer` scanner over `[watermark+1, tip - confirmations]` in 2000-block ranges. Identity dedup carries correctness; the watermark is a per-instance cursor advanced only after all inflows persist. Arbitrum-local inflows from the swap contract are refund returns and park. | `scan_chain_once` |
 | `deposit/schedule.rs` | The multi-instance safety core: matches observed `DepositForBurn`/commitment-`Lockup` logs against inflows/lock units greedily in chain order by amount (fungible within one address — only the send COUNT per amount matters). Unmatched sends stall the chain (`Inconsistent`), never send. | `derive_burn_schedule`, `derive_lock_schedule`, `ObservedBurn`, `ObservedLock`, `ScheduleError` |

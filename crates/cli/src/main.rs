@@ -17,7 +17,7 @@ use boltz_client::deposit::models::{Deposit, DepositSwap};
 use boltz_client::{
     Asset, BoltzConfig, BoltzError, BoltzEventListener, BoltzService, BoltzStorage, BoltzSwapEvent,
     BoltzSwapStatus, DepositConfig, DepositInvoiceResolver, DepositParams, DepositStorage,
-    DerivedKeyStore, InvoiceRequest,
+    DerivedKeyStore, InvoiceRequest, InvoiceResolution,
 };
 
 const PHRASE_FILE_NAME: &str = "phrase";
@@ -616,14 +616,21 @@ impl PromptingInvoiceResolver {
 
 #[macros::async_trait]
 impl DepositInvoiceResolver for PromptingInvoiceResolver {
-    async fn resolve_invoice(&self, request: &InvoiceRequest) -> Result<String, BoltzError> {
+    async fn resolve_invoice(
+        &self,
+        request: &InvoiceRequest,
+    ) -> Result<InvoiceResolution, BoltzError> {
         match fs::read_to_string(&self.invoice_file) {
-            Ok(contents) if !contents.trim().is_empty() => Ok(contents.trim().to_string()),
+            // The literal "decline" exercises the park-until-retry path.
+            Ok(contents) if contents.trim() == "decline" => Ok(InvoiceResolution::Decline),
+            Ok(contents) if !contents.trim().is_empty() => {
+                Ok(InvoiceResolution::Invoice(contents.trim().to_string()))
+            }
             _ => {
                 println!(
                     "\n>>> Deposit swap {} needs a BOLT11 invoice for EXACTLY {} sats \
-                     (locking {} USDC, 6dp) <<<\n    Write it to {} — this will be retried \
-                     automatically.\n",
+                     (locking {} USDC, 6dp) <<<\n    Write it to {} (or the word \"decline\" \
+                     to park) — this will be retried automatically.\n",
                     request.deposit_swap_id,
                     request.amount_sats,
                     request.lock_amount,

@@ -17,7 +17,7 @@ use platform_utils::DefaultHttpClient;
 use platform_utils::tokio::sync::mpsc;
 
 pub use config::*;
-pub use deposit::{DepositInvoiceResolver, InvoiceRequest};
+pub use deposit::{DepositInvoiceResolver, InvoiceRequest, InvoiceResolution};
 pub use error::BoltzError;
 pub use events::{BoltzEventListener, BoltzSwapEvent, EventEmitter};
 pub use evm::cctp::CctpMessageStatus;
@@ -423,9 +423,24 @@ impl BoltzService {
             .await
     }
 
+    /// Lock units parked by a resolver [`Decline`](InvoiceResolution::Decline):
+    /// their funds are minted and consumed but deliberately not progressing
+    /// until [`retry_parked`](Self::retry_parked) resumes them.
+    pub async fn parked_deposit_swaps(&self) -> Result<Vec<DepositSwap>, BoltzError> {
+        Ok(self
+            .deposit_handle()?
+            .store
+            .list_active_deposit_swaps()
+            .await?
+            .into_iter()
+            .filter(|s| matches!(s.status, deposit::models::DepositSwapStatus::Parked))
+            .collect())
+    }
+
     /// Parked inflows: funds sitting at the deposit address awaiting an
     /// explicit [`retry_parked`](Self::retry_parked) (refund returns,
-    /// sub-limit amounts, sub-bridge-fee dust).
+    /// sub-limit amounts, sub-bridge-fee dust). Declined lock units are
+    /// separate — see [`parked_deposit_swaps`](Self::parked_deposit_swaps).
     pub async fn parked_deposits(&self) -> Result<Vec<Deposit>, BoltzError> {
         Ok(self
             .deposit_handle()?
