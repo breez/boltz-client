@@ -11,13 +11,21 @@ use crate::error::BoltzError;
 /// Key identity model:
 /// - **Gas signer** (`m/44/{chainId}/1/0`): Signs all EVM transactions, used as `claimAddress`.
 /// - **Per-swap preimage key** (`m/44/{chainId}/0/0/{index}`): Deterministic preimage source.
+/// - **Deposit key** (`m/44'/60'/0'/0/{index}`): The reusable inbound-deposit
+///   address. Standard BIP-44 Ethereum (hardened purpose/coin/account),
+///   matching viem's `mnemonicToAccount` and boltz-web-app's deposit
+///   derivation. Deliberately chain-independent: one address serves as the
+///   source-chain receive address, CCTP burn signer, Arbitrum
+///   `mintRecipient`, and lockup `refundAddress` on every chain.
 ///
-/// All derivation levels are NON-HARDENED so that the same mnemonic
+/// Swap-key derivation levels are NON-HARDENED so that the same mnemonic
 /// produces the same keys across any client using the same derivation
 /// scheme — including the Boltz backend's restore endpoint
 /// (`POST /v2/swap/restore`), which derives child public keys from the
 /// master xpub without access to private keys. Hardened derivation would
-/// make that restore path impossible.
+/// make that restore path impossible. The deposit key is the exception:
+/// Boltz's EVM restore is address-based (never xpub-based), so hardening
+/// costs nothing and buys parity with the standard BIP-44 tree.
 ///
 /// As of 2026-04, restore only works for BTC/L-BTC swaps (the backend
 /// doesn't store `claimPublicKey` for EVM swaps), but there are no
@@ -55,6 +63,23 @@ impl EvmKeyManager {
             child_number(44)?,
             child_number(chain_id)?,
             child_number(0)?,
+            child_number(0)?,
+            child_number(index)?,
+        ];
+        self.derive_key_pair(&path)
+    }
+
+    /// Derive the deposit-address key at `m/44'/60'/0'/0/{index}`.
+    ///
+    /// CRITICAL: this path is a compatibility contract with viem
+    /// `mnemonicToAccount` / boltz-web-app deposits — changing it after
+    /// go-live orphans every deposit address handed out (funds remain at
+    /// addresses this code can no longer derive).
+    pub fn derive_deposit_key(&self, index: u32) -> Result<EvmKeyPair, BoltzError> {
+        let path = [
+            hardened_child_number(44)?,
+            hardened_child_number(60)?,
+            hardened_child_number(0)?,
             child_number(0)?,
             child_number(index)?,
         ];
@@ -205,6 +230,11 @@ fn checksum_address(address: &[u8; 20]) -> String {
 
 fn child_number(index: u32) -> Result<ChildNumber, BoltzError> {
     ChildNumber::new(index, false)
+        .map_err(|e| BoltzError::Signing(format!("Invalid BIP-32 child number: {e}")))
+}
+
+fn hardened_child_number(index: u32) -> Result<ChildNumber, BoltzError> {
+    ChildNumber::new(index, true)
         .map_err(|e| BoltzError::Signing(format!("Invalid BIP-32 child number: {e}")))
 }
 
@@ -392,6 +422,77 @@ mod tests {
     //
     // Seed: "abandon" x11 + "about" mnemonic (empty passphrase)
     // All paths use NON-HARDENED derivation.
+
+    #[macros::test_all]
+    fn test_deposit_key_deterministic_and_distinct() {
+        let seed = test_seed();
+        let manager = EvmKeyManager::from_seed(&seed).unwrap();
+
+        let a = manager.derive_deposit_key(0).unwrap();
+        let b = manager.derive_deposit_key(0).unwrap();
+        assert_eq!(a.address, b.address);
+
+        let c = manager.derive_deposit_key(1).unwrap();
+        assert_ne!(a.address, c.address);
+
+        // The deposit key must not collide with any swap-key branch.
+        let gas = manager.derive_gas_signer(42161).unwrap();
+        let preimage = manager.derive_preimage_key(42161, 0).unwrap();
+        assert_ne!(a.address, gas.address);
+        assert_ne!(a.address, preimage.address);
+    }
+
+    // Deposit-key vectors: verified against BOTH viem `mnemonicToAccount`
+    // (what boltz-web-app deposits use) and `@scure/bip32` at
+    // m/44'/60'/0'/0/{index}. Same "abandon"x11+"about" seed as above.
+
+    #[macros::test_all]
+    fn test_known_derivation_deposit_key() {
+        let seed = test_seed();
+        let manager = EvmKeyManager::from_seed(&seed).unwrap();
+
+        let key0 = manager.derive_deposit_key(0).unwrap();
+        assert_eq!(
+            hex::encode(key0.private_key_bytes()),
+            "1ab42cc412b618bdea3a599e3c9bae199ebf030895b039e9db1e30dafb12b727"
+        );
+        assert_eq!(
+            hex::encode(&key0.public_key),
+            "0237b0bb7a8288d38ed49a524b5dc98cff3eb5ca824c9f9dc0dfdb3d9cd600f299"
+        );
+        assert_eq!(
+            key0.address_hex(),
+            "0x9858EfFD232B4033E47d90003D41EC34EcaEda94"
+        );
+
+        let key1 = manager.derive_deposit_key(1).unwrap();
+        assert_eq!(
+            key1.address_hex(),
+            "0x6Fac4D18c912343BF86fa7049364Dd4E424Ab9C0"
+        );
+    }
+
+    #[macros::test_all]
+    fn test_deposit_key_hardhat_anchor() {
+        // "test"x11+"junk" — the hardhat/foundry mnemonic. Its index-0
+        // account is the universally known 0xf39F…2266, anchoring our
+        // hardened derivation against the entire EVM tooling ecosystem.
+        let seed = hex::decode(
+            "9dfc3c64c2f8bede1533b6a79f8570e5943e0b8fd1cf77107adf7b72cef42185d564a3aee24cab43f80e3c4538087d70fc824eabbad596a23c97b6ee8322ccc0",
+        )
+        .unwrap();
+        let manager = EvmKeyManager::from_seed(&seed).unwrap();
+
+        let key = manager.derive_deposit_key(0).unwrap();
+        assert_eq!(
+            key.address_hex(),
+            "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+        );
+        assert_eq!(
+            hex::encode(key.private_key_bytes()),
+            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+        );
+    }
 
     #[macros::test_all]
     fn test_known_derivation_gas_signer() {

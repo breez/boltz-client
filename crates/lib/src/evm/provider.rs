@@ -36,6 +36,11 @@ pub struct LogEntry {
     pub data: String,
     pub block_number: String,
     pub transaction_hash: String,
+    /// Present on every mined log; `None` only for exotic RPC responses.
+    /// Deposit identity (`txHash:logIndex`) requires it, so the deposit
+    /// scanner rejects logs without one.
+    #[serde(default)]
+    pub log_index: Option<String>,
 }
 
 /// Minimal transaction receipt from `eth_getTransactionReceipt`.

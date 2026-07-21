@@ -28,6 +28,20 @@ pub(crate) mod erc20swap_eip712 {
             uint256 timelock;
             address destination;
         }
+
+        /// `ERC20Swap` commitment bind authorization. Signed by the deposit
+        /// key (`refundAddress`); recorded by Boltz off-chain and consumed by
+        /// the server's commitment claim. `preimageHash` is the SWAP's real
+        /// preimage hash — the on-chain lock itself stays keyed to the
+        /// all-zero hash. Same domain as `Claim`.
+        struct Commit {
+            bytes32 preimageHash;
+            uint256 amount;
+            address tokenAddress;
+            address claimAddress;
+            address refundAddress;
+            uint256 timelock;
+        }
     }
 }
 
@@ -167,6 +181,47 @@ impl EvmSigner {
             .inner
             .sign_typed_data_sync(&claim, &domain)
             .map_err(|e| BoltzError::Signing(format!("ERC20Swap EIP-712 signing failed: {e}")))?;
+        Ok(alloy_sig_to_evm_sig(&sig))
+    }
+
+    /// Sign the `ERC20Swap` commitment `Commit` EIP-712 typed data — binds a
+    /// deposit commitment to a swap's real preimage hash. MUST be signed by
+    /// the deposit key: the contract requires recovery to `refundAddress`.
+    #[expect(clippy::too_many_arguments)]
+    pub fn sign_eip712_erc20swap_commit(
+        &self,
+        erc20swap_address: Address,
+        erc20swap_version: &str,
+        preimage_hash: &[u8; 32],
+        amount: U256,
+        token_address: Address,
+        claim_address: Address,
+        refund_address: Address,
+        timelock: U256,
+    ) -> Result<EvmSignature, BoltzError> {
+        let domain = Eip712Domain {
+            name: Some("ERC20Swap".into()),
+            version: Some(erc20swap_version.to_string().into()),
+            chain_id: Some(U256::from(self.chain_id)),
+            verifying_contract: Some(erc20swap_address),
+            salt: None,
+        };
+
+        let commit = erc20swap_eip712::Commit {
+            preimageHash: (*preimage_hash).into(),
+            amount,
+            tokenAddress: token_address,
+            claimAddress: claim_address,
+            refundAddress: refund_address,
+            timelock,
+        };
+
+        let sig = self
+            .inner
+            .sign_typed_data_sync(&commit, &domain)
+            .map_err(|e| {
+                BoltzError::Signing(format!("ERC20Swap Commit EIP-712 signing failed: {e}"))
+            })?;
         Ok(alloy_sig_to_evm_sig(&sig))
     }
 
@@ -652,6 +707,85 @@ mod tests {
             format!("{}", claim_cctp.eip712_type_hash()),
             "0xf854d53d13bfc357f12f22b9d29b6f5c46693d79fb5dfd1153ba80151e59528c"
         );
+    }
+
+    #[macros::test_all]
+    fn test_erc20swap_commit_type_hash_matches_contract() {
+        use alloy_sol_types::SolStruct;
+
+        let commit = erc20swap_eip712::Commit {
+            preimageHash: [0u8; 32].into(),
+            amount: U256::ZERO,
+            tokenAddress: Address::ZERO,
+            claimAddress: Address::ZERO,
+            refundAddress: Address::ZERO,
+            timelock: U256::ZERO,
+        };
+
+        // keccak256("Commit(bytes32 preimageHash,uint256 amount,address tokenAddress,address claimAddress,address refundAddress,uint256 timelock)")
+        // = boltz-core ERC20Swap.sol TYPEHASH_COMMIT (v6). Independently
+        // computed with viem/noble keccak256 over the source type string.
+        assert_eq!(
+            format!("{}", commit.eip712_type_hash()),
+            "0xb13bddd37ac9193ef6fd7865d7fcfd2255978b29aaf7317aac327fcb9c53951b"
+        );
+    }
+
+    #[macros::test_all]
+    fn test_commit_signature_recovers_to_refund_address() {
+        use alloy_sol_types::SolStruct;
+
+        // The contract's checkCommitmentSignature requires recovery to
+        // refundAddress — sign with the deposit key and verify recovery.
+        let manager = EvmKeyManager::from_seed(&test_seed()).unwrap();
+        let deposit_key = manager.derive_deposit_key(0).unwrap();
+        let deposit_address = Address::from(deposit_key.address);
+        let signer = EvmSigner::new(&deposit_key, 42161);
+
+        let erc20swap = addr("0x6398B76DF91C5eBe9f488e3656658E79284dDc0F");
+        let preimage_hash = [7u8; 32];
+        let amount = U256::from(100_000_000u64);
+        let token = addr("0xaf88d065e77c8cC2239327C5EDb3A432268e5831");
+        let claim = addr("0x0000000000000000000000000000000000000009");
+        let timelock = U256::from(25_675_807u64);
+
+        let sig = signer
+            .sign_eip712_erc20swap_commit(
+                erc20swap,
+                "6",
+                &preimage_hash,
+                amount,
+                token,
+                claim,
+                deposit_address,
+                timelock,
+            )
+            .unwrap();
+
+        let domain = Eip712Domain {
+            name: Some("ERC20Swap".into()),
+            version: Some("6".into()),
+            chain_id: Some(U256::from(42161u64)),
+            verifying_contract: Some(erc20swap),
+            salt: None,
+        };
+        let commit = erc20swap_eip712::Commit {
+            preimageHash: preimage_hash.into(),
+            amount,
+            tokenAddress: token,
+            claimAddress: claim,
+            refundAddress: deposit_address,
+            timelock,
+        };
+        let digest = commit.eip712_signing_hash(&domain);
+
+        let alloy_sig = alloy_primitives::Signature::new(
+            U256::from_be_bytes(sig.r),
+            U256::from_be_bytes(sig.s),
+            sig.v == 28,
+        );
+        let recovered = alloy_sig.recover_address_from_prehash(&digest).unwrap();
+        assert_eq!(recovered, deposit_address);
     }
 
     // ─── Misc ────────────────────────────────────────────────────────

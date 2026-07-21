@@ -11,12 +11,19 @@
 ## 1. What this is
 
 `boltz-client` is a **headless Rust library** (WASM-compatible, no UI, no
-filesystem deps) that performs **reverse-only swaps**: it turns Lightning sats
-into a stablecoin at a destination address. The path is always
-`Lightning (sats) -> tBTC (Boltz reverse swap) -> stablecoin (DEX on Arbitrum) -> destination`.
-The Boltz exchange only ever sees a bridge-agnostic `BTC -> TBTC` reverse swap;
-everything downstream (the DEX swap and the cross-chain bridge) is **client-derived
-and client-executed**.
+filesystem deps) with two flows:
+
+- **Outbound (reverse swaps)**: Lightning sats into a stablecoin at a
+  destination address —
+  `Lightning (sats) -> tBTC (Boltz reverse swap) -> stablecoin (DEX on Arbitrum) -> destination`.
+  The Boltz exchange only ever sees a bridge-agnostic `BTC -> TBTC` reverse
+  swap; everything downstream (the DEX swap and the cross-chain bridge) is
+  **client-derived and client-executed**.
+- **Inbound (deposits, opt-in)**: USDC sent to a reusable EVM deposit address
+  into Lightning sats —
+  `USDC on ETH/POL/BASE -> CCTP burn/mint to Arbitrum -> ERC20Swap commitment lock -> Boltz submarine swap (USDC -> BTC) -> integrator-supplied BOLT11 paid`.
+  Enabled by passing `DepositParams` at construction; see §3b and the
+  `deposit/` module reference.
 
 The single public entrypoint is `BoltzService` (see `crates/lib/src/lib.rs`),
 which exposes a two-step `prepare` / `create` reverse-swap API plus lifecycle,
@@ -108,6 +115,38 @@ the persisted Alchemy `call_id` (stored as the `pending_call_id` field on
 `BoltzSwap`) and an on-chain `ERC20Swap` lockup liveness check — no blockchain
 scanning.
 
+### 3b. The inbound deposit flow (opt-in)
+
+A single HD-derived deposit address (`m/44'/60'/0'/0/0`, chain-independent —
+the same address is the source-chain receive address, CCTP burn signer,
+Arbitrum `mintRecipient`, and lockup `refundAddress`) accepts USDC on the
+configured source chains. A background `DepositManager` tick drives two record
+types through their phases, persisting at every boundary:
+
+```
+  Deposit (an inflow, identity = {chain}:{txHash}:{logIndex}, NEVER balance):
+    Detected ─► Bridging (sponsored CCTP burn) ─► AwaitingMint ─► Minted ─► Consumed
+        └► Parked{BelowBridgeFee | BelowPairLimit | RefundReturned}  (awaits retry_parked)
+    (Arbitrum-local inflows — refund returns, direct deposits — skip the
+     bridge and enter at Minted / Parked{RefundReturned}.)
+
+  DepositSwap (a lock unit consuming >=1 inflows; N:1 only for parked recovery):
+    Resolving (integrator invoice, PRE-lock; a resolver Decline parks the
+    unit whole until retry_parked resumes it) ─► Locking (ERC20Swap commitment,
+    zero preimage hash) ─► Creating (submarine swap) ─► Binding (EIP-712 Commit
+    signature posted; no on-chain tx) ─► Settling (server pays the invoice) ─► Done
+        └► Refunding (cooperative, server-signed) ─► Failed  (refund re-enters
+           as a fresh parked inflow)
+```
+
+Multi-instance safety never relies on storage consistency: whether a burn or
+lock is still needed is re-derived each tick from chain logs (greedy
+amount-matching in chain order; any unmatched send stalls the chain), and
+every sponsored send refuses to sign unless the prepared 4337 `UserOp` nonce
+equals a pre-derivation `EntryPoint.getNonce` read — racing instances collide
+on the nonce and the chain executes at most one. See the 2026-07-20 decision
+entries for the reasoning.
+
 ## 4. Module reference
 
 All paths are under `crates/lib/src/` unless noted.
@@ -168,6 +207,18 @@ All paths are under `crates/lib/src/` unless noted.
 | `solana/ata.rs` | Deterministically derives the recipient's SPL-Token ATA (the CCTP/OFT mint target) by reimplementing `find_program_address` (bump loop + SHA256 + ed25519 off-curve check). | `derive_ata`, `is_on_curve` |
 | `solana/rpc.rs` | Minimal Solana JSON-RPC client; one op: `getAccountInfo` to report whether an ATA already exists (so the cross-chain message pre-funds ATA creation only when needed). | `SolanaRpcClient`/`account_exists` |
 
+### Inbound deposits (`deposit/`)
+
+| File | Responsibility | Key types |
+|---|---|---|
+| `deposit/mod.rs` | Public deposit surface: the integrator invoice hook — and the receiver's one decision point (the crate has no market oracle; integrators bound Boltz's rate against their own feed here). Returns `Invoice` or `Decline` (parks the unit, free — pre-lock); errors always mean transient-retry; may fire more than once per deposit across instances. | `DepositInvoiceResolver` (trait), `InvoiceRequest`, `InvoiceResolution` |
+| `deposit/models.rs` | The two persisted record types and their phase enums; each phase guards on its own output field so resume is idempotent. `DepositSwap::derive_id` is deterministic over the consumed inflow set so concurrent instances collapse under LWW sync. `PendingSend` anchors every sponsored send **before** broadcast. | `Deposit`, `DepositStatus`, `ParkReason`, `DepositSwap`, `DepositSwapStatus`, `PendingSend` |
+| `deposit/detect.rs` | Per-chain USDC `Transfer` scanner over `[watermark+1, tip - confirmations]` in 2000-block ranges. Identity dedup carries correctness; the watermark is a per-instance cursor advanced only after all inflows persist. Arbitrum-local inflows from the swap contract are refund returns and park. | `scan_chain_once` |
+| `deposit/schedule.rs` | The multi-instance safety core: matches observed `DepositForBurn`/commitment-`Lockup` logs against inflows/lock units greedily in chain order by amount (fungible within one address — only the send COUNT per amount matters). Unmatched sends stall the chain (`Inconsistent`), never send. | `derive_burn_schedule`, `derive_lock_schedule`, `ObservedBurn`, `ObservedLock`, `ScheduleError` |
+| `deposit/sends.rs` | Nonce-guarded sponsored sends: read `EntryPoint.getNonce(key=1)` BEFORE the schedule's log scan, then refuse to sign unless the prepared `UserOp` nonce equals that read (`NonceMoved` aborts). Fails closed on any shape/key change at the sponsor. | `read_deposit_nonce`, `send_nonce_guarded`, `SendOutcome` |
+| `deposit/engine.rs` | One serialized tick: resolve pending sends (confirmations discriminated by receipt content — burn vs approve vs mint) → scan → burn schedule (adopt/park/send; CCTP-fee floor; balance-conservation check) → mints (Circle forwarder, `usedNonces`-guarded manual `receiveMessage` after the 5-min deadline) → promote minted inflows → lock schedule → per-unit phases. Money guard: `expectedAmount <= locked`, oversize re-resolves. Bind 400 "exists already" adopts as possible-success. `retry_parked` aggregates Arbitrum-side parked funds into one unit. | `DepositEngine`, `DepositEngineDeps`, `estimate_submarine_receive_sats`, `COMMITMENT_CURRENCY` |
+| `deposit/manager.rs` | Background tick loop; ticks are the unit of consistency and never overlap (shared mutex also serializes `retry_parked`). Started only when `DepositConfig.watch` is true. | `DepositManager` |
+
 ### Keys, store, events
 
 | File | Responsibility | Key types |
@@ -207,6 +258,10 @@ see [`docs/decisions.md`](./decisions.md).
 - The lockup `timeout_block_height` is denominated in **L1** block height; it is validated (≥ `MIN_TIMEOUT_L1_MARGIN` over the current L1 height via `eth_l1_block_number`, **not** the L2 `eth_block_number`) both as an early abort in `create()` and, fail-safe, immediately before the preimage is revealed in `claim_and_swap` — a too-short timeout would let a malicious server refund and settle the LN HTLC with the leaked preimage.
 - `create_probe_invoice` returns an invoice that must **never** be paid (its random preimage is discarded; payment locks funds unrecoverably).
 - OFT `extraOptions`/`composeMsg`/`oftCmd` must be byte-identical across every `quoteOFT`/`quoteSend` call, the on-chain `SendData`, and the EIP-712 hash input — the Router signs over their keccak hashes.
+- **Deposit identity is `{chain}:{txHash}:{logIndex}`, never balance** — the reusable address commingles inflows, which is exactly why a duplicate CCTP burn is theft (it spends another inflow's funds) and why burn/lock decisions are re-derived from chain logs + serialized by the 4337 nonce, never taken from the (possibly stale) store.
+- The deposit-key derivation path (`m/44'/60'/0'/0/{index}`) is a shipped-forever compatibility contract — changing it orphans every deposit address already handed out.
+- A commitment lock may be bound only after its `Lockup` event is validated (amount / token / refundAddress) against the intended values, and the invoice's exact-amount/network/expiry verification runs before any lock exists.
+- Refund returns are never auto-retried (`Parked{RefundReturned}` awaits an explicit `retry_parked`) — a failed flow re-entering by itself would loop burn/lock/refund forever.
 
 ## 6. Pointers
 

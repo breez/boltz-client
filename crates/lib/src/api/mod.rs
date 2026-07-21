@@ -9,9 +9,11 @@ use crate::config::BoltzConfig;
 use crate::error::BoltzError;
 
 use self::types::{
-    ContractsResponse, CreateReverseSwapRequest, CreateReverseSwapResponse, EncodeRequest,
-    EncodeResponse, QuoteResponse, ReversePairsResponse, SwapStatusResponse,
-    SwapTransactionResponse,
+    BindCommitmentRequest, CommitmentDetailsResponse, CommitmentRefundRequest,
+    CommitmentRefundResponse, ContractsResponse, CreateReverseSwapRequest,
+    CreateReverseSwapResponse, CreateSubmarineSwapRequest, CreateSubmarineSwapResponse,
+    EncodeRequest, EncodeResponse, QuoteResponse, ReversePairsResponse, SubmarinePairsResponse,
+    SwapStatusResponse, SwapTransactionResponse,
 };
 
 /// HTTP client for the Boltz REST API.
@@ -104,6 +106,56 @@ impl BoltzApiClient {
         self.get_request("v2/chain/contracts").await
     }
 
+    // ─── Submarine Swap ──────────────────────────────────────────────────
+
+    /// `GET /v2/swap/submarine` — fetch pair info (fees, limits, pairHash).
+    pub async fn get_submarine_pairs(&self) -> Result<SubmarinePairsResponse, BoltzError> {
+        self.get_request("v2/swap/submarine").await
+    }
+
+    /// `POST /v2/swap/submarine` — create a submarine swap.
+    pub async fn create_submarine_swap(
+        &self,
+        req: &CreateSubmarineSwapRequest,
+    ) -> Result<CreateSubmarineSwapResponse, BoltzError> {
+        self.post_request("v2/swap/submarine", req).await
+    }
+
+    // ─── Commitment Swaps ────────────────────────────────────────────────
+
+    /// `GET /v2/commitment/{currency}/details` — lockup details (contract,
+    /// claim address, timelock) for commitment swaps on an EVM chain.
+    pub async fn get_commitment_details(
+        &self,
+        currency: &str,
+    ) -> Result<CommitmentDetailsResponse, BoltzError> {
+        self.get_request(&format!("v2/commitment/{currency}/details"))
+            .await
+    }
+
+    /// `POST /v2/commitment/{currency}` — bind a commitment lockup to a swap.
+    /// The backend responds with an empty body; a 400 (e.g. "commitment
+    /// exists already") surfaces via `BoltzError::Api`.
+    pub async fn bind_commitment(
+        &self,
+        currency: &str,
+        req: &BindCommitmentRequest,
+    ) -> Result<(), BoltzError> {
+        self.post_request_no_content(&format!("v2/commitment/{currency}"), req)
+            .await
+    }
+
+    /// `POST /v2/commitment/{currency}/refund` — request the server's
+    /// EIP-712 signature for a cooperative refund of an unlinked commitment.
+    pub async fn get_commitment_refund_signature(
+        &self,
+        currency: &str,
+        req: &CommitmentRefundRequest,
+    ) -> Result<CommitmentRefundResponse, BoltzError> {
+        self.post_request(&format!("v2/commitment/{currency}/refund"), req)
+            .await
+    }
+
     // ─── Internal Helpers ────────────────────────────────────────────────
 
     /// Headers sent on every request: `Content-Type` plus the `referral`
@@ -174,6 +226,34 @@ impl BoltzApiClient {
             reason: format!("Failed to parse response: {e}"),
             code: None,
         })
+    }
+
+    /// Like `post_request`, but for endpoints whose success body carries no
+    /// meaningful data (e.g. `POST /v2/commitment/{currency}` responds `{}`).
+    /// Status/reason on failure are preserved identically.
+    async fn post_request_no_content<S>(&self, endpoint: &str, body: &S) -> Result<(), BoltzError>
+    where
+        S: serde::Serialize,
+    {
+        let url = format!("{}/{endpoint}", self.config.api_url);
+        let body_json = serde_json::to_string(body).map_err(|e| BoltzError::Api {
+            reason: format!("Failed to serialize request: {e}"),
+            code: None,
+        })?;
+
+        let response = self
+            .http_client
+            .post(url, Some(self.default_headers()), Some(body_json))
+            .await?;
+
+        if !response.is_success() {
+            return Err(BoltzError::Api {
+                reason: response.body,
+                code: Some(response.status),
+            });
+        }
+
+        Ok(())
     }
 }
 

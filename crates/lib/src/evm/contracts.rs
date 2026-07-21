@@ -129,6 +129,34 @@ sol! {
     /// Check whether a swap is still locked (true = funds present, false = already claimed/refunded).
     function swaps(bytes32 hash) external view returns (bool);
 
+    /// Lock tokens for a swap or — with the all-zero preimage hash — an
+    /// unbound deposit commitment. Explicit-`refundAddress` overload: under
+    /// EIP-7702 sponsorship `msg.sender` is not the depositor, so the refund
+    /// identity must be named.
+    function lock(
+        bytes32 preimageHash,
+        uint256 amount,
+        address tokenAddress,
+        address claimAddress,
+        address refundAddress,
+        uint256 timelock
+    );
+
+    /// Cooperative refund authorized by the claimAddress's (Boltz's) EIP-712
+    /// `Refund` signature; callable by anyone (sponsored sends), tokens go to
+    /// `refundAddress`. Explicit-`refundAddress` overload.
+    function refundCooperative(
+        bytes32 preimageHash,
+        uint256 amount,
+        address tokenAddress,
+        address claimAddress,
+        address refundAddress,
+        uint256 timelock,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    );
+
     // ─── ERC20 ───────────────────────────────────────────────────────────
 
     function transfer(address to, uint256 amount) returns (bool);
@@ -140,6 +168,46 @@ sol! {
 
     function TYPEHASH_SEND_DATA() external view returns (bytes32);
     function TYPEHASH_CCTP_DATA() external view returns (bytes32);
+
+    // ─── CCTP v2 TokenMessengerV2 / MessageTransmitterV2 (deposits) ──────
+
+    /// Standalone source-chain burn. Inbound deposits burn directly from the
+    /// deposit address; outbound burns instead ride inside the Router claim.
+    function depositForBurn(
+        uint256 amount,
+        uint32 destinationDomain,
+        bytes32 mintRecipient,
+        address burnToken,
+        bytes32 destinationCaller,
+        uint256 maxFee,
+        uint32 minFinalityThreshold
+    ) external returns (uint64 nonce);
+
+    /// Burn carrying forwarding-service hook data (Forwarded receive mode).
+    function depositForBurnWithHook(
+        uint256 amount,
+        uint32 destinationDomain,
+        bytes32 mintRecipient,
+        address burnToken,
+        bytes32 destinationCaller,
+        uint256 maxFee,
+        uint32 minFinalityThreshold,
+        bytes hookData
+    ) external returns (uint64 nonce);
+
+    /// Self-submit a mint on the destination `MessageTransmitterV2` — the
+    /// manual fallback when Circle's forwarder stalls.
+    function receiveMessage(bytes message, bytes attestation) external returns (bool);
+
+    /// Nonzero iff the CCTP nonce was consumed — `receiveMessage` idempotency.
+    function usedNonces(bytes32 nonce) external view returns (uint256);
+
+    // ─── ERC-4337 EntryPoint v0.7 ────────────────────────────────────────
+
+    /// 2D account nonce: `(key << 64) | sequence`. Read BEFORE deriving the
+    /// deposit send schedule; the prepared `UserOp`'s nonce must equal this
+    /// read or the send aborts (see `deposit::sends`).
+    function getNonce(address sender, uint192 key) external view returns (uint256);
 
     // ─── OFT Contract (LayerZero USDT0) ──────────────────────────────
 
@@ -217,6 +285,35 @@ sol! {
         uint256 amount,
         address indexed mintToken,
         uint256 feeCollected
+    );
+
+    /// `ERC20Swap` lockup. For deposit commitments `preimageHash` is the
+    /// all-zero hash on every lock, so commitment identity comes from the
+    /// (indexed) `refundAddress` plus the log's txHash:logIndex — never from
+    /// `preimageHash`.
+    event Lockup(
+        bytes32 indexed preimageHash,
+        uint256 amount,
+        address tokenAddress,
+        address indexed claimAddress,
+        address indexed refundAddress,
+        uint256 timelock
+    );
+
+    /// CCTP v2 `TokenMessengerV2` burn event on the source chain. The
+    /// chain-truth record that a deposit's bridge send happened (scanned by
+    /// depositor when re-deriving the burn schedule).
+    event DepositForBurn(
+        address indexed burnToken,
+        uint256 amount,
+        address indexed depositor,
+        bytes32 mintRecipient,
+        uint32 destinationDomain,
+        bytes32 destinationTokenMessenger,
+        bytes32 destinationCaller,
+        uint256 maxFee,
+        uint32 indexed minFinalityThreshold,
+        bytes hookData
     );
 
     /// `ERC20Swap` claim. Emitted only on a successful claim — the contract
@@ -614,6 +711,264 @@ pub fn decode_swaps_check_return(data: &[u8]) -> Result<bool, BoltzError> {
 /// `eth_getLogs` topic0 for the `ERC20Swap` `Claim` event.
 pub fn claim_event_topic0() -> String {
     format!("0x{}", hex::encode(Claim::SIGNATURE_HASH.as_slice()))
+}
+
+// ─── Deposit commitment / CCTP-inbound helpers ──────────────────────────
+
+/// The all-zero preimage hash that marks an `ERC20Swap` lock as an unbound
+/// deposit commitment (bound off-chain via the EIP-712 `Commit` signature).
+pub const COMMITMENT_PREIMAGE_HASH: [u8; 32] = [0u8; 32];
+
+/// Encode the 6-arg `ERC20Swap.lock` calldata.
+pub fn encode_lock(
+    preimage_hash: [u8; 32],
+    amount: U256,
+    token_address: Address,
+    claim_address: Address,
+    refund_address: Address,
+    timelock: U256,
+) -> Vec<u8> {
+    lockCall {
+        preimageHash: preimage_hash.into(),
+        amount,
+        tokenAddress: token_address,
+        claimAddress: claim_address,
+        refundAddress: refund_address,
+        timelock,
+    }
+    .abi_encode()
+}
+
+/// Encode the 9-arg `ERC20Swap.refundCooperative` calldata (server-signed
+/// EIP-712 `Refund` v/r/s).
+#[expect(clippy::too_many_arguments)]
+pub fn encode_refund_cooperative(
+    preimage_hash: [u8; 32],
+    amount: U256,
+    token_address: Address,
+    claim_address: Address,
+    refund_address: Address,
+    timelock: U256,
+    v: u8,
+    r: [u8; 32],
+    s: [u8; 32],
+) -> Vec<u8> {
+    refundCooperativeCall {
+        preimageHash: preimage_hash.into(),
+        amount,
+        tokenAddress: token_address,
+        claimAddress: claim_address,
+        refundAddress: refund_address,
+        timelock,
+        v,
+        r: r.into(),
+        s: s.into(),
+    }
+    .abi_encode()
+}
+
+/// Encode `TokenMessengerV2.depositForBurn` calldata (no hook).
+pub fn encode_deposit_for_burn(
+    amount: U256,
+    destination_domain: u32,
+    mint_recipient: [u8; 32],
+    burn_token: Address,
+    destination_caller: [u8; 32],
+    max_fee: U256,
+    min_finality_threshold: u32,
+) -> Vec<u8> {
+    depositForBurnCall {
+        amount,
+        destinationDomain: destination_domain,
+        mintRecipient: mint_recipient.into(),
+        burnToken: burn_token,
+        destinationCaller: destination_caller.into(),
+        maxFee: max_fee,
+        minFinalityThreshold: min_finality_threshold,
+    }
+    .abi_encode()
+}
+
+/// Encode `TokenMessengerV2.depositForBurnWithHook` calldata.
+#[expect(clippy::too_many_arguments)]
+pub fn encode_deposit_for_burn_with_hook(
+    amount: U256,
+    destination_domain: u32,
+    mint_recipient: [u8; 32],
+    burn_token: Address,
+    destination_caller: [u8; 32],
+    max_fee: U256,
+    min_finality_threshold: u32,
+    hook_data: Vec<u8>,
+) -> Vec<u8> {
+    depositForBurnWithHookCall {
+        amount,
+        destinationDomain: destination_domain,
+        mintRecipient: mint_recipient.into(),
+        burnToken: burn_token,
+        destinationCaller: destination_caller.into(),
+        maxFee: max_fee,
+        minFinalityThreshold: min_finality_threshold,
+        hookData: hook_data.into(),
+    }
+    .abi_encode()
+}
+
+/// Encode `MessageTransmitterV2.receiveMessage` calldata (manual mint).
+pub fn encode_receive_message(message: &[u8], attestation: &[u8]) -> Vec<u8> {
+    receiveMessageCall {
+        message: message.to_vec().into(),
+        attestation: attestation.to_vec().into(),
+    }
+    .abi_encode()
+}
+
+/// Encode `MessageTransmitterV2.usedNonces(bytes32)` calldata.
+pub fn encode_used_nonces(nonce: [u8; 32]) -> Vec<u8> {
+    usedNoncesCall {
+        nonce: nonce.into(),
+    }
+    .abi_encode()
+}
+
+/// Encode `EntryPoint.getNonce(sender, key)` calldata.
+pub fn encode_get_nonce(sender: Address, key: u64) -> Vec<u8> {
+    getNonceCall {
+        sender,
+        key: alloy_primitives::aliases::U192::from(key),
+    }
+    .abi_encode()
+}
+
+/// Decode `EntryPoint.getNonce` return: the full 2D nonce `(key << 64) | seq`.
+pub fn decode_get_nonce_return(data: &[u8]) -> Result<U256, BoltzError> {
+    <U256>::abi_decode(data).map_err(|e| BoltzError::Evm {
+        reason: format!("Failed to decode getNonce return: {e}"),
+        tx_hash: None,
+    })
+}
+
+/// Decode `usedNonces` return: nonzero = the nonce was consumed (mint landed).
+pub fn decode_used_nonces_return(data: &[u8]) -> Result<bool, BoltzError> {
+    let decoded = <U256>::abi_decode(data).map_err(|e| BoltzError::Evm {
+        reason: format!("Failed to decode usedNonces return: {e}"),
+        tx_hash: None,
+    })?;
+    Ok(!decoded.is_zero())
+}
+
+/// `eth_getLogs` topic0 for the ERC20 `Transfer` event.
+pub fn transfer_event_topic0() -> String {
+    format!("0x{}", hex::encode(Transfer::SIGNATURE_HASH.as_slice()))
+}
+
+/// `eth_getLogs` topic0 for the `ERC20Swap` `Lockup` event.
+pub fn lockup_event_topic0() -> String {
+    format!("0x{}", hex::encode(Lockup::SIGNATURE_HASH.as_slice()))
+}
+
+/// `eth_getLogs` topic0 for the CCTP v2 `DepositForBurn` event.
+pub fn deposit_for_burn_event_topic0() -> String {
+    format!(
+        "0x{}",
+        hex::encode(DepositForBurn::SIGNATURE_HASH.as_slice())
+    )
+}
+
+/// A decoded `ERC20Swap` `Lockup` event.
+#[derive(Debug, Clone)]
+pub struct LockupEvent {
+    pub preimage_hash: [u8; 32],
+    pub amount: U256,
+    pub token_address: Address,
+    pub claim_address: Address,
+    pub refund_address: Address,
+    pub timelock: U256,
+}
+
+/// Decode a single log as an `ERC20Swap` `Lockup` event. Returns `None` for
+/// non-matching or undecodable logs (callers scan lists and skip).
+pub fn decode_lockup_event(log: &crate::evm::provider::LogEntry) -> Option<LockupEvent> {
+    let topic0 = lockup_event_topic0();
+    if log.topics.len() < 4 || !topics_equal(&log.topics[0], &topic0) {
+        return None;
+    }
+    let preimage_hash = topic_to_bytes32(&log.topics[1])?;
+    let claim_address = topic_to_address(&log.topics[2])?;
+    let refund_address = topic_to_address(&log.topics[3])?;
+    let data_bytes = parse_hex_bytes(&log.data).ok()?;
+    // Non-indexed fields, in declaration order: amount, tokenAddress, timelock.
+    let (amount, token_address, timelock) =
+        <(U256, Address, U256)>::abi_decode(&data_bytes).ok()?;
+    Some(LockupEvent {
+        preimage_hash,
+        amount,
+        token_address,
+        claim_address,
+        refund_address,
+        timelock,
+    })
+}
+
+/// A decoded CCTP v2 `DepositForBurn` event (fields the deposit scheduler
+/// needs; the rest of the payload is ignored).
+#[derive(Debug, Clone)]
+pub struct DepositForBurnEvent {
+    pub burn_token: Address,
+    pub amount: U256,
+    pub depositor: Address,
+    pub mint_recipient: [u8; 32],
+    pub destination_domain: u32,
+    pub max_fee: U256,
+}
+
+/// Decode a single log as a CCTP v2 `DepositForBurn` event. Returns `None`
+/// for non-matching or undecodable logs.
+pub fn decode_deposit_for_burn_event(
+    log: &crate::evm::provider::LogEntry,
+) -> Option<DepositForBurnEvent> {
+    let topic0 = deposit_for_burn_event_topic0();
+    if log.topics.len() < 4 || !topics_equal(&log.topics[0], &topic0) {
+        return None;
+    }
+    let burn_token = topic_to_address(&log.topics[1])?;
+    let depositor = topic_to_address(&log.topics[2])?;
+    let data_bytes = parse_hex_bytes(&log.data).ok()?;
+    // Non-indexed fields, in declaration order: amount, mintRecipient,
+    // destinationDomain, destinationTokenMessenger, destinationCaller,
+    // maxFee, hookData.
+    let (amount, mint_recipient, destination_domain, _dest_messenger, _dest_caller, max_fee, _hook) =
+        <(
+            U256,
+            FixedBytes<32>,
+            u32,
+            FixedBytes<32>,
+            FixedBytes<32>,
+            U256,
+            alloy_primitives::Bytes,
+        )>::abi_decode(&data_bytes)
+        .ok()?;
+    Some(DepositForBurnEvent {
+        burn_token,
+        amount,
+        depositor,
+        mint_recipient: mint_recipient.into(),
+        destination_domain,
+        max_fee,
+    })
+}
+
+/// Parse a 32-byte log topic into an `Address` (last 20 bytes).
+fn topic_to_address(topic: &str) -> Option<Address> {
+    let bytes = topic_to_bytes32(topic)?;
+    Some(Address::from_slice(&bytes[12..]))
+}
+
+/// Parse a 32-byte log topic into a `[u8; 32]`.
+fn topic_to_bytes32(topic: &str) -> Option<[u8; 32]> {
+    let hex_part = topic.strip_prefix("0x").unwrap_or(topic);
+    let bytes = hex::decode(hex_part).ok()?;
+    bytes.try_into().ok()
 }
 
 /// `eth_getLogs` topic0 for the `ERC20Swap` `Refund` event.
@@ -1557,6 +1912,7 @@ mod tests {
             data: data.to_string(),
             block_number: "0x1".to_string(),
             transaction_hash: "0x0".to_string(),
+            log_index: Some("0x0".to_string()),
         }
     }
 
@@ -1834,5 +2190,178 @@ d7c7c073ec476983e3f222924974a48a7f61a7045df31dcf3ed83172bf0bb478\
         let result =
             decode_delivered_from_logs(&[], &DeliveredAmountSource::OftSent { oft_contract });
         assert!(result.is_none());
+    }
+
+    // ─── Deposit codec pins & round-trips ─────────────────────────────
+    // Selector / topic0 literals independently computed with viem
+    // (`toFunctionSelector` / keccak256 over the source signatures).
+
+    fn make_log(topics: Vec<String>, data: &[u8]) -> crate::evm::provider::LogEntry {
+        crate::evm::provider::LogEntry {
+            address: "0x0000000000000000000000000000000000000001".to_string(),
+            topics,
+            data: format!("0x{}", hex::encode(data)),
+            block_number: "0x1".to_string(),
+            transaction_hash: "0xabc".to_string(),
+            log_index: Some("0x0".to_string()),
+        }
+    }
+
+    #[macros::test_all]
+    fn test_deposit_selectors_match_reference() {
+        let sel = |data: Vec<u8>| hex::encode(&data[..4]);
+
+        let a = Address::ZERO;
+        assert_eq!(
+            sel(encode_lock([0; 32], U256::ZERO, a, a, a, U256::ZERO)),
+            "e64fafcc"
+        );
+        assert_eq!(
+            sel(encode_refund_cooperative(
+                [0; 32],
+                U256::ZERO,
+                a,
+                a,
+                a,
+                U256::ZERO,
+                27,
+                [0; 32],
+                [0; 32]
+            )),
+            "8b4f3c23"
+        );
+        assert_eq!(
+            sel(encode_deposit_for_burn(
+                U256::ZERO,
+                0,
+                [0; 32],
+                a,
+                [0; 32],
+                U256::ZERO,
+                0
+            )),
+            "8e0250ee"
+        );
+        assert_eq!(
+            sel(encode_deposit_for_burn_with_hook(
+                U256::ZERO,
+                0,
+                [0; 32],
+                a,
+                [0; 32],
+                U256::ZERO,
+                0,
+                vec![]
+            )),
+            "779b432d"
+        );
+        assert_eq!(sel(encode_receive_message(b"m", b"a")), "57ecfd28");
+        assert_eq!(sel(encode_used_nonces([0; 32])), "feb61724");
+        assert_eq!(sel(encode_get_nonce(a, 1)), "35567e1a");
+    }
+
+    #[macros::test_all]
+    fn test_get_nonce_roundtrip() {
+        // (key=1) << 64 | seq=5
+        let nonce: U256 = (U256::from(1u64) << 64) | U256::from(5u64);
+        let decoded = decode_get_nonce_return(&nonce.abi_encode()).unwrap();
+        assert_eq!(decoded, nonce);
+    }
+
+    #[macros::test_all]
+    fn test_lockup_and_deposit_for_burn_topic0_pins() {
+        assert_eq!(
+            lockup_event_topic0(),
+            "0xa98eaa2bd8230d87a1a4c356f5c1d41cb85ff88131122ec8b1931cb9d31ae145"
+        );
+        assert_eq!(
+            deposit_for_burn_event_topic0(),
+            "0x0c8c1cbdc5190613ebd485511d4e2812cfa45eecb79d845893331fedad5130a5"
+        );
+    }
+
+    #[macros::test_all]
+    fn test_decode_lockup_event_roundtrip() {
+        let preimage_hash = [0u8; 32]; // commitment: all-zero
+        let claim = parse_address("0xA6D0956216da39AA1989066A9B22b64c30924DCd").unwrap();
+        let refund = parse_address("0x9858EfFD232B4033E47d90003D41EC34EcaEda94").unwrap();
+        let token = parse_address("0xaf88d065e77c8cC2239327C5EDb3A432268e5831").unwrap();
+        let amount = U256::from(123_456_789u64);
+        let timelock = U256::from(25_675_807u64);
+
+        let data = (amount, token, timelock).abi_encode();
+        let log = make_log(
+            vec![
+                lockup_event_topic0(),
+                bytes32_to_topic(&preimage_hash),
+                address_to_topic(&claim.into_array()),
+                address_to_topic(&refund.into_array()),
+            ],
+            &data,
+        );
+
+        let ev = decode_lockup_event(&log).unwrap();
+        assert_eq!(ev.preimage_hash, COMMITMENT_PREIMAGE_HASH);
+        assert_eq!(ev.amount, amount);
+        assert_eq!(ev.token_address, token);
+        assert_eq!(ev.claim_address, claim);
+        assert_eq!(ev.refund_address, refund);
+        assert_eq!(ev.timelock, timelock);
+
+        // Wrong topic0 → None.
+        let wrong = make_log(vec![claim_event_topic0()], &data);
+        assert!(decode_lockup_event(&wrong).is_none());
+    }
+
+    #[macros::test_all]
+    fn test_decode_deposit_for_burn_event_roundtrip() {
+        let burn_token = parse_address("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359").unwrap();
+        let depositor = parse_address("0x9858EfFD232B4033E47d90003D41EC34EcaEda94").unwrap();
+        let amount = U256::from(50_000_000u64);
+        let mint_recipient = [9u8; 32];
+        let max_fee = U256::from(500u64);
+
+        let data = (
+            amount,
+            FixedBytes::<32>::from(mint_recipient),
+            3u32,
+            FixedBytes::<32>::from([1u8; 32]),
+            FixedBytes::<32>::from([0u8; 32]),
+            max_fee,
+            alloy_primitives::Bytes::new(),
+        )
+            .abi_encode();
+        let min_finality_topic = format!(
+            "0x{}",
+            hex::encode({
+                let mut t = [0u8; 32];
+                t[28..].copy_from_slice(&1000u32.to_be_bytes());
+                t
+            })
+        );
+        let log = make_log(
+            vec![
+                deposit_for_burn_event_topic0(),
+                address_to_topic(&burn_token.into_array()),
+                address_to_topic(&depositor.into_array()),
+                min_finality_topic,
+            ],
+            &data,
+        );
+
+        let ev = decode_deposit_for_burn_event(&log).unwrap();
+        assert_eq!(ev.burn_token, burn_token);
+        assert_eq!(ev.amount, amount);
+        assert_eq!(ev.depositor, depositor);
+        assert_eq!(ev.mint_recipient, mint_recipient);
+        assert_eq!(ev.destination_domain, 3);
+        assert_eq!(ev.max_fee, max_fee);
+    }
+
+    #[macros::test_all]
+    fn test_decode_used_nonces_return() {
+        assert!(!decode_used_nonces_return(&U256::ZERO.abi_encode()).unwrap());
+        assert!(decode_used_nonces_return(&U256::from(1u64).abi_encode()).unwrap());
+        assert!(decode_used_nonces_return(&U256::MAX.abi_encode()).unwrap());
     }
 }
