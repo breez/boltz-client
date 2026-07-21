@@ -49,8 +49,13 @@ use crate::keys::EvmKeyPair;
 use crate::store::DepositStorage;
 use crate::swap::reverse::current_unix_timestamp;
 
-/// Boltz currency symbol for the commitment chain (Arbitrum).
-pub(crate) const COMMITMENT_CURRENCY: &str = "ARB";
+/// Boltz currency of the locked token — commitment endpoints are keyed by
+/// CURRENCY, not chain: `/v2/commitment/ARB/...` serves native-ETH
+/// (`EtherSwap`) commitments, `/v2/commitment/USDC/...` the `ERC20Swap` ones we
+/// lock. Matches PR #1550's `commitmentAsset = "USDC"`. Not live in
+/// production yet (details 404s until Boltz lists the currency) — the engine
+/// just retries.
+pub(crate) const COMMITMENT_CURRENCY: &str = "USDC";
 /// Boltz asset symbol of the bridged token (submarine pair "from").
 pub(crate) const DEPOSIT_BRIDGE_ASSET: &str = "USDC";
 /// Submarine pair "to" (Lightning BTC).
