@@ -12,16 +12,19 @@ pub mod swap;
 
 use std::sync::Arc;
 
+use platform_utils::HttpClient;
 use platform_utils::tokio::sync::mpsc;
-use platform_utils::{HttpClient, ProxyConfig};
 
 pub use config::*;
+// `BoltzConfig::proxy` is a public field, so its type has to be nameable by
+// consumers without depending on this workspace's `platform-utils` directly.
 pub use error::BoltzError;
 pub use events::{BoltzEventListener, BoltzSwapEvent, EventEmitter};
 pub use evm::cctp::CctpMessageStatus;
 pub use evm::recipient::is_valid_destination_address;
 pub use keys::EvmKeyManager;
 pub use models::*;
+pub use platform_utils::ProxyConfig;
 pub use store::{BoltzStorage, DerivedKeyStore};
 
 use api::BoltzApiClient;
