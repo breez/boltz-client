@@ -189,7 +189,7 @@ mod tests {
         let config = BoltzConfig::mainnet("test_referral".to_string());
         let client = BoltzApiClient::new(
             &config,
-            Box::new(platform_utils::DefaultHttpClient::new(None)),
+            Box::new(platform_utils::DefaultHttpClient::new(None).expect("http client")),
         );
         assert_eq!(client.config.api_url, "https://api.boltz.exchange");
     }
@@ -199,7 +199,7 @@ mod tests {
         let config = BoltzConfig::mainnet("test_referral".to_string());
         let client = BoltzApiClient::new(
             &config,
-            Box::new(platform_utils::DefaultHttpClient::new(None)),
+            Box::new(platform_utils::DefaultHttpClient::new(None).expect("http client")),
         );
         let headers = client.default_headers();
         assert_eq!(headers.get("Content-Type").unwrap(), "application/json");

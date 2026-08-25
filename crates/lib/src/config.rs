@@ -45,6 +45,14 @@ pub struct BoltzConfig {
     /// drive confirmation on demand via
     /// [`crate::BoltzService::refresh_pending_deliveries`]. Default: 30s.
     pub delivery_poll_interval_secs: Option<u64>,
+    /// Routes every connection this client opens through a SOCKS5 proxy, HTTP
+    /// and WebSocket alike. Hostnames are resolved by the proxy, and a
+    /// connection that cannot be established through it fails rather than
+    /// falling back to a direct one. `None` connects directly.
+    ///
+    /// Not supported on WASM, where the browser owns connection setup:
+    /// constructing the service with one set is an error there.
+    pub proxy: Option<platform_utils::ProxyConfig>,
 }
 
 /// Alchemy configuration for EIP-7702 gas abstraction.
@@ -79,6 +87,7 @@ impl BoltzConfig {
             solana_rpc_url: DEFAULT_SOLANA_RPC_URL.to_string(),
             lz_scan_api_url: DEFAULT_LZ_SCAN_API_URL.to_string(),
             delivery_poll_interval_secs: Some(DEFAULT_DELIVERY_POLL_INTERVAL_SECS),
+            proxy: None,
         }
     }
 

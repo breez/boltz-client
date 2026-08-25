@@ -135,6 +135,20 @@ pub trait HttpClient: Send + Sync {
 }
 
 /// Create a new HTTP client with the given user agent.
-pub fn create_http_client(user_agent: Option<&str>) -> Box<dyn HttpClient> {
-    Box::new(ReqwestHttpClient::new(user_agent.map(String::from)))
+pub fn create_http_client(user_agent: Option<&str>) -> Result<Box<dyn HttpClient>, HttpError> {
+    create_http_client_with_proxy(user_agent, None)
+}
+
+/// Create a new HTTP client that routes every request through `proxy`.
+///
+/// Fails when `proxy` does not form a usable proxy URL, rather than falling
+/// back to a client that would connect directly.
+pub fn create_http_client_with_proxy(
+    user_agent: Option<&str>,
+    proxy: Option<&crate::proxy::ProxyConfig>,
+) -> Result<Box<dyn HttpClient>, HttpError> {
+    Ok(Box::new(ReqwestHttpClient::with_proxy(
+        user_agent.map(String::from),
+        proxy,
+    )?))
 }

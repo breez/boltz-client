@@ -12,8 +12,8 @@ pub mod swap;
 
 use std::sync::Arc;
 
-use platform_utils::DefaultHttpClient;
 use platform_utils::tokio::sync::mpsc;
+use platform_utils::{HttpClient, ProxyConfig};
 
 pub use config::*;
 pub use error::BoltzError;
@@ -38,6 +38,16 @@ use swap::reverse::{ReverseSwapExecutor, current_unix_timestamp, resolve_slippag
 /// `User-Agent` sent on every outbound HTTP request. Some upstreams reject
 /// header-less requests.
 const USER_AGENT: &str = concat!("boltz-client/", env!("CARGO_PKG_VERSION"));
+
+/// A client for one component, routed through `proxy` when one is set.
+///
+/// The single place a client is built, so a proxy reaches every outbound
+/// request. A proxy that cannot be applied fails here rather than yielding a
+/// client that would connect directly.
+fn http_client(proxy: Option<&ProxyConfig>) -> Result<Box<dyn HttpClient>, BoltzError> {
+    platform_utils::create_http_client_with_proxy(Some(USER_AGENT), proxy)
+        .map_err(|e| BoltzError::InvalidConfig(format!("Failed to build HTTP client: {e}")))
+}
 
 /// Top-level Boltz service facade.
 ///
@@ -101,24 +111,20 @@ impl BoltzService {
         // reused; giving each its own keeps ownership simple (Box, not a
         // cloned Arc). All carry USER_AGENT — some upstreams 403 without it
         // (native only; the WASM client omits it, see ReqwestHttpClient::new).
-        let api_client = BoltzApiClient::new(
-            &config,
-            Box::new(DefaultHttpClient::new(Some(USER_AGENT.to_string()))),
-        );
+        // All are built through `http_client`, so `config.proxy` reaches every
+        // one of them and none can be created unproxied by accident.
+        let http_client = || http_client(config.proxy.as_ref());
+        let api_client = BoltzApiClient::new(&config, http_client()?);
 
         // Create the global WS channel and subscriber.
         let (ws_tx, ws_rx) = mpsc::channel(256);
-        let ws_subscriber = Arc::new(SwapStatusSubscriber::connect(&config.ws_url(), ws_tx).await?);
-
-        let alchemy_client = AlchemyGasClient::new(
-            &config.alchemy_config,
-            Box::new(DefaultHttpClient::new(Some(USER_AGENT.to_string()))),
+        let ws_subscriber = Arc::new(
+            SwapStatusSubscriber::connect(&config.ws_url(), ws_tx, config.proxy.clone()).await?,
         );
 
-        let evm_provider = EvmProvider::new(
-            config.arbitrum_rpc_url.clone(),
-            Box::new(DefaultHttpClient::new(Some(USER_AGENT.to_string()))),
-        );
+        let alchemy_client = AlchemyGasClient::new(&config.alchemy_config, http_client()?);
+
+        let evm_provider = EvmProvider::new(config.arbitrum_rpc_url.clone(), http_client()?);
 
         // Chain registry is fetched once from the USDT0 deployments API and
         // cached for the service lifetime. A service restart picks up any
@@ -126,7 +132,7 @@ impl BoltzService {
         // shipping a new client.
         let chain_registry = Arc::new(
             fetch_chain_registry(
-                &DefaultHttpClient::new(Some(USER_AGENT.to_string())),
+                http_client()?.as_ref(),
                 &config.oft_deployments_url,
                 config.chain_id,
             )
@@ -148,20 +154,13 @@ impl BoltzService {
                 code: None,
             })?;
 
-        let solana_rpc = SolanaRpcClient::new(
-            Box::new(DefaultHttpClient::new(Some(USER_AGENT.to_string()))),
-            config.solana_rpc_url.clone(),
-        );
+        let solana_rpc = SolanaRpcClient::new(http_client()?, config.solana_rpc_url.clone());
 
-        let cctp_fee_client = crate::evm::cctp::CctpFeeClient::new(
-            Box::new(DefaultHttpClient::new(Some(USER_AGENT.to_string()))),
-            config.cctp_api_url.clone(),
-        );
+        let cctp_fee_client =
+            crate::evm::cctp::CctpFeeClient::new(http_client()?, config.cctp_api_url.clone());
 
-        let lz_scan_client = crate::evm::lz_scan::LzScanClient::new(
-            Box::new(DefaultHttpClient::new(Some(USER_AGENT.to_string()))),
-            config.lz_scan_api_url.clone(),
-        );
+        let lz_scan_client =
+            crate::evm::lz_scan::LzScanClient::new(http_client()?, config.lz_scan_api_url.clone());
 
         // Capture before `config` is moved into the executor.
         let delivery_poll_interval_secs = config.delivery_poll_interval_secs;

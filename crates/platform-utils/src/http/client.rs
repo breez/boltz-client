@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use super::{HttpClient, HttpError, HttpResponse, REQUEST_TIMEOUT};
+use crate::proxy::ProxyConfig;
 
 /// HTTP client implementation backed by reqwest.
 pub struct ReqwestHttpClient {
@@ -26,13 +27,33 @@ impl ReqwestHttpClient {
     /// their own `User-Agent` regardless, so omitting it loses nothing. This
     /// is a deliberate divergence from the upstream `spark-sdk` client, which
     /// only talks to servers it controls and so can keep the override.
+    ///
+    /// Fails when reqwest cannot assemble a client: an invalid `user_agent`
+    /// (one that is not a valid header value), or a TLS backend or system
+    /// resolver that will not initialise.
+    pub fn new(user_agent: Option<String>) -> Result<Self, HttpError> {
+        Self::with_proxy(user_agent, None)
+    }
+
+    /// Like [`Self::new`], but routes every request through `proxy`.
+    ///
+    /// Setting a proxy also switches reqwest off system-proxy autodetection,
+    /// so no environment variable can redirect traffic around it. A proxy that
+    /// can't be reached fails the request: there is no direct fallback.
+    ///
+    /// A proxy is rejected on WASM: `fetch` exposes no proxy control, so
+    /// honouring it is impossible and ignoring it would connect direct behind
+    /// the caller's back.
     // `user_agent` is unused on WASM by design (see above); the signature is
     // kept uniform across targets and to match the upstream client.
     #[cfg_attr(
         all(target_family = "wasm", target_os = "unknown"),
         expect(clippy::needless_pass_by_value, unused_variables)
     )]
-    pub fn new(user_agent: Option<String>) -> Self {
+    pub fn with_proxy(
+        user_agent: Option<String>,
+        proxy: Option<&ProxyConfig>,
+    ) -> Result<Self, HttpError> {
         let builder = reqwest::Client::builder();
 
         #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -41,6 +62,9 @@ impl ReqwestHttpClient {
             if let Some(ua) = user_agent {
                 builder = builder.user_agent(ua);
             }
+            if let Some(proxy) = proxy {
+                builder = builder.proxy(reqwest::Proxy::all(proxy.reqwest_url())?);
+            }
             builder
                 .tcp_keepalive(Some(Duration::from_mins(1)))
                 .http2_keep_alive_interval(Duration::from_secs(30))
@@ -48,20 +72,17 @@ impl ReqwestHttpClient {
                 .http2_keep_alive_while_idle(true)
         };
 
-        let client = match builder.build() {
-            Ok(client) => client,
-            Err(e) => {
-                tracing::error!("Failed to create reqwest client: {e}");
-                panic!("Failed to create reqwest client: {e}");
-            }
-        };
-        Self { client }
-    }
-}
+        #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+        if proxy.is_some() {
+            return Err(HttpError::Builder(
+                "a SOCKS5 proxy cannot be honoured on WASM: fetch exposes no proxy control"
+                    .to_string(),
+            ));
+        }
 
-impl Default for ReqwestHttpClient {
-    fn default() -> Self {
-        Self::new(None)
+        Ok(Self {
+            client: builder.build()?,
+        })
     }
 }
 

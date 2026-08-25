@@ -1,9 +1,11 @@
 use std::collections::HashSet;
+use std::pin::Pin;
 
-use futures::{SinkExt, StreamExt};
+use futures::{Sink, SinkExt, Stream, StreamExt, TryStreamExt};
+use platform_utils::ProxyConfig;
 use platform_utils::tokio;
 use tokio::sync::mpsc;
-use tokio_tungstenite_wasm::{Message, WebSocketStream};
+use tokio_tungstenite_wasm::Message;
 
 use crate::error::BoltzError;
 
@@ -19,6 +21,19 @@ const RECONNECT_DELAY: platform_utils::time::Duration =
 
 /// JSON-encoded ping message for the Boltz WS protocol.
 const PING_JSON: &str = r#"{"op":"ping"}"#;
+
+// The two dial paths hand back different stream types (the wrapper crate's own
+// on the direct path, a raw `tokio-tungstenite` stream over a SOCKS5 tunnel on
+// the proxied one), so both are boxed into one shape the reader loop can drive.
+// WASM futures are not `Send`, and never take the proxied path.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+type WsSink = Pin<Box<dyn Sink<Message, Error = BoltzError> + Send>>;
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+type WsSource = Pin<Box<dyn Stream<Item = Result<Message, BoltzError>> + Send>>;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+type WsSink = Pin<Box<dyn Sink<Message, Error = BoltzError>>>;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+type WsSource = Pin<Box<dyn Stream<Item = Result<Message, BoltzError>>>>;
 
 /// Reject a `ws_url` that can't possibly connect — an unparseable URL, a
 /// non-`ws`/`wss` scheme (e.g. an `http://` typo), or one with no host. Catches
@@ -75,6 +90,7 @@ impl SwapStatusSubscriber {
     pub async fn connect(
         ws_url: &str,
         global_tx: mpsc::Sender<SwapStatusUpdate>,
+        proxy: Option<ProxyConfig>,
     ) -> Result<Self, BoltzError> {
         // The reader loop reconnects resiliently, so we don't dial here — but
         // that means a misconfigured `ws_url` would otherwise degrade silently
@@ -85,7 +101,12 @@ impl SwapStatusSubscriber {
 
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
 
-        let reader_handle = tokio::spawn(Self::reader_loop(ws_url.to_string(), global_tx, cmd_rx));
+        let reader_handle = tokio::spawn(Self::reader_loop(
+            ws_url.to_string(),
+            global_tx,
+            cmd_rx,
+            proxy,
+        ));
         let abort_handle = reader_handle.abort_handle();
 
         Ok(Self {
@@ -144,6 +165,7 @@ impl SwapStatusSubscriber {
         ws_url: String,
         global_tx: mpsc::Sender<SwapStatusUpdate>,
         mut cmd_rx: mpsc::Receiver<ReaderCommand>,
+        proxy: Option<ProxyConfig>,
     ) {
         // The reader owns the authoritative set of subscribed IDs, driven by the
         // ordered `ReaderCommand` stream from subscribe/unsubscribe/close. Kept
@@ -152,8 +174,8 @@ impl SwapStatusSubscriber {
         let mut local_ids: HashSet<String> = HashSet::new();
 
         loop {
-            let ws_stream = match Self::try_connect(&ws_url).await {
-                Ok(stream) => stream,
+            let connection = match Self::try_connect(&ws_url, proxy.as_ref()).await {
+                Ok(connection) => connection,
                 Err(e) => {
                     tracing::warn!("WebSocket connection failed: {e}, retrying in 5s");
                     tokio::select! {
@@ -171,7 +193,7 @@ impl SwapStatusSubscriber {
             };
 
             tracing::info!("WebSocket connected to {ws_url}");
-            let (mut write, mut read) = ws_stream.split();
+            let (mut write, mut read) = connection;
 
             // Drain pending commands before resubscribing.
             while let Ok(cmd) = cmd_rx.try_recv() {
@@ -270,10 +292,30 @@ impl SwapStatusSubscriber {
 
     // ─── Shared helpers ──────────────────────────────────────────────
 
-    async fn try_connect(url: &str) -> Result<WebSocketStream, BoltzError> {
-        tokio_tungstenite_wasm::connect(url)
+    async fn try_connect(
+        url: &str,
+        proxy: Option<&ProxyConfig>,
+    ) -> Result<(WsSink, WsSource), BoltzError> {
+        #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+        if let Some(proxy) = proxy {
+            return connect_via_proxy(url, proxy).await;
+        }
+        #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+        if proxy.is_some() {
+            return Err(BoltzError::WebSocket(
+                "a SOCKS5 proxy cannot be honoured on WASM: the browser owns connection setup"
+                    .to_string(),
+            ));
+        }
+
+        let stream = tokio_tungstenite_wasm::connect(url)
             .await
-            .map_err(|e| BoltzError::WebSocket(format!("Connection failed: {e}")))
+            .map_err(|e| BoltzError::WebSocket(format!("Connection failed: {e}")))?;
+        let (write, read) = stream.split();
+        Ok((
+            Box::pin(write.sink_map_err(|e| BoltzError::WebSocket(e.to_string()))),
+            Box::pin(read.map_err(|e| BoltzError::WebSocket(e.to_string()))),
+        ))
     }
 
     async fn handle_message(text: &str, global_tx: &mpsc::Sender<SwapStatusUpdate>) {
@@ -325,6 +367,71 @@ impl SwapStatusSubscriber {
             }
         }
     }
+}
+
+/// Dials `url` through `proxy` and hands back the same boxed pair the direct
+/// path produces.
+///
+/// `tokio-tungstenite-wasm` owns its socket and exposes no proxy knob, so the
+/// proxied path drops to `tokio-tungstenite` directly: SOCKS5 first, then the
+/// WebSocket (and TLS, for `wss`) handshake on top of the tunnel. The target
+/// host is sent to the proxy as a name, so only the proxy's own address is
+/// resolved locally.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+async fn connect_via_proxy(
+    url: &str,
+    proxy: &ProxyConfig,
+) -> Result<(WsSink, WsSource), BoltzError> {
+    use tokio_socks::tcp::Socks5Stream;
+    use tokio_tungstenite::tungstenite::Message as TgMessage;
+
+    let parsed = url::Url::parse(url)
+        .map_err(|e| BoltzError::WebSocket(format!("Invalid ws_url '{url}': {e}")))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| BoltzError::WebSocket(format!("ws_url '{url}' has no host")))?
+        .to_string();
+    let port = parsed
+        .port()
+        .unwrap_or(if parsed.scheme() == "wss" { 443 } else { 80 });
+
+    let proxy_addr = proxy.address();
+    // `(String, u16)` becomes a `TargetAddr::Domain`, which is what makes the
+    // proxy resolve the name instead of this process.
+    let target = (host.clone(), port);
+    let socks = match proxy.credentials() {
+        Some((user, pass)) => {
+            Socks5Stream::connect_with_password(proxy_addr.as_str(), target, user, pass).await
+        }
+        None => Socks5Stream::connect(proxy_addr.as_str(), target).await,
+    }
+    .map_err(|e| {
+        BoltzError::WebSocket(format!(
+            "SOCKS5 connection to {host}:{port} via {proxy_addr} failed: {e}"
+        ))
+    })?;
+
+    let (stream, _response) =
+        tokio_tungstenite::client_async_tls_with_config(url, socks.into_inner(), None, None)
+            .await
+            .map_err(|e| BoltzError::WebSocket(format!("Connection failed: {e}")))?;
+    let (write, read) = stream.split();
+
+    let write = write
+        .sink_map_err(|e| BoltzError::WebSocket(e.to_string()))
+        .with(|msg: Message| std::future::ready(Ok::<_, BoltzError>(TgMessage::from(msg))));
+    let read = read.filter_map(|item| {
+        std::future::ready(match item {
+            // The wrapper's `Message` has no Ping/Pong/Frame variant and its
+            // `From` impl panics on one, so drop them here the way the wrapper
+            // does. tungstenite answers pings itself.
+            Ok(TgMessage::Ping(_) | TgMessage::Pong(_) | TgMessage::Frame(_)) => None,
+            Ok(msg) => Some(Ok(Message::from(msg))),
+            Err(e) => Some(Err(BoltzError::WebSocket(e.to_string()))),
+        })
+    });
+
+    Ok((Box::pin(write), Box::pin(read)))
 }
 
 #[cfg(test)]

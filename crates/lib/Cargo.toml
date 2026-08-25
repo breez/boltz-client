@@ -72,6 +72,10 @@ async-trait.workspace = true
 # Non-Wasm dependencies
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+# SOCKS5 for the proxied WebSocket path. `tokio-tungstenite-wasm` owns its
+# socket and takes no proxy, so that path dials tungstenite directly.
+tokio-socks = "0.5.2"
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 
 # WASM dependencies
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]

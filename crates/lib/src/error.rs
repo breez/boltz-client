@@ -14,6 +14,11 @@ pub enum BoltzError {
     #[error("WebSocket error: {0}")]
     WebSocket(String),
 
+    /// The client was configured in a way it cannot honour, so no operation
+    /// would succeed. Not retryable until the caller changes the config.
+    #[error("Invalid config: {0}")]
+    InvalidConfig(String),
+
     #[error("Signing error: {0}")]
     Signing(String),
 

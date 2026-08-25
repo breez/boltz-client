@@ -25,6 +25,20 @@ pub fn regtest_config() -> BoltzConfig {
         solana_rpc_url: boltz_client::DEFAULT_SOLANA_RPC_URL.to_string(),
         lz_scan_api_url: boltz_client::DEFAULT_LZ_SCAN_API_URL.to_string(),
         delivery_poll_interval_secs: Some(boltz_client::DEFAULT_DELIVERY_POLL_INTERVAL_SECS),
+        proxy: None,
+    }
+}
+
+/// A regtest config reaching the backend by its container name and routed
+/// through `proxy`.
+///
+/// The host cannot resolve that name, so the call can only succeed through
+/// the proxy: a direct connection fails at DNS rather than quietly working.
+pub fn proxied_config(proxy: platform_utils::ProxyConfig, api_url: &str) -> BoltzConfig {
+    BoltzConfig {
+        api_url: api_url.to_string(),
+        proxy: Some(proxy),
+        ..regtest_config()
     }
 }
 

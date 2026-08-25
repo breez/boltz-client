@@ -1,7 +1,9 @@
 #![cfg(feature = "regtest")]
 
 mod docker;
+mod proxy;
 mod setup;
+mod socks5;
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -40,7 +42,7 @@ async fn test_api_get_pairs() {
     let config = regtest_config();
     let client = BoltzApiClient::new(
         &config,
-        Box::new(platform_utils::DefaultHttpClient::new(None)),
+        Box::new(platform_utils::DefaultHttpClient::new(None).expect("http client")),
     );
 
     let pairs = client.get_reverse_swap_pairs().await.unwrap();
@@ -61,7 +63,7 @@ async fn test_api_get_contracts() {
     let config = regtest_config();
     let client = BoltzApiClient::new(
         &config,
-        Box::new(platform_utils::DefaultHttpClient::new(None)),
+        Box::new(platform_utils::DefaultHttpClient::new(None).expect("http client")),
     );
 
     let contracts = client.get_contracts().await.unwrap();
@@ -107,7 +109,7 @@ async fn test_api_create_reverse_swap() {
     let config = regtest_config();
     let client = BoltzApiClient::new(
         &config,
-        Box::new(platform_utils::DefaultHttpClient::new(None)),
+        Box::new(platform_utils::DefaultHttpClient::new(None).expect("http client")),
     );
     let km = EvmKeyManager::from_seed(&regtest_seed()).unwrap();
 
@@ -138,7 +140,7 @@ async fn test_api_get_swap_status() {
     let config = regtest_config();
     let client = BoltzApiClient::new(
         &config,
-        Box::new(platform_utils::DefaultHttpClient::new(None)),
+        Box::new(platform_utils::DefaultHttpClient::new(None).expect("http client")),
     );
     let km = EvmKeyManager::from_seed(&regtest_seed()).unwrap();
 
@@ -166,7 +168,7 @@ async fn test_ws_receives_status_updates() {
     let config = regtest_config();
     let client = BoltzApiClient::new(
         &config,
-        Box::new(platform_utils::DefaultHttpClient::new(None)),
+        Box::new(platform_utils::DefaultHttpClient::new(None).expect("http client")),
     );
     let km = EvmKeyManager::from_seed(&regtest_seed()).unwrap();
 
@@ -184,7 +186,7 @@ async fn test_ws_receives_status_updates() {
 
     // Connect WS and subscribe — should receive initial status
     let (ws_tx, mut rx) = mpsc::channel(32);
-    let ws = SwapStatusSubscriber::connect(&config.ws_url(), ws_tx)
+    let ws = SwapStatusSubscriber::connect(&config.ws_url(), ws_tx, config.proxy.clone())
         .await
         .unwrap();
     ws.subscribe(&swap.id).await.unwrap();
@@ -214,7 +216,7 @@ async fn test_rbtc_swap_lifecycle() {
     let config = regtest_config();
     let client = BoltzApiClient::new(
         &config,
-        Box::new(platform_utils::DefaultHttpClient::new(None)),
+        Box::new(platform_utils::DefaultHttpClient::new(None).expect("http client")),
     );
     let km = EvmKeyManager::from_seed(&regtest_seed()).unwrap();
 
@@ -232,7 +234,7 @@ async fn test_rbtc_swap_lifecycle() {
 
     // Subscribe WS
     let (ws_tx, mut rx) = mpsc::channel(32);
-    let ws = SwapStatusSubscriber::connect(&config.ws_url(), ws_tx)
+    let ws = SwapStatusSubscriber::connect(&config.ws_url(), ws_tx, config.proxy.clone())
         .await
         .unwrap();
     ws.subscribe(&swap.id).await.unwrap();
