@@ -74,13 +74,20 @@ impl From<reqwest::Error> for HttpError {
 
 mod client;
 
-pub use client::ReqwestHttpClient;
+pub use client::{ReqwestHttpClient, read_capped_bytes, read_capped_text};
 
 /// Default HTTP client type.
 pub type DefaultHttpClient = ReqwestHttpClient;
 
 /// Default request timeout in seconds.
 pub const REQUEST_TIMEOUT: u64 = 60;
+
+/// Maximum response body the client will buffer.
+///
+/// A response is refused once it passes this, so a hostile peer cannot drive an
+/// unbounded allocation by streaming quickly enough to stay inside
+/// [`REQUEST_TIMEOUT`].
+pub const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 
 /// Response from an HTTP request.
 #[derive(Debug, Clone)]
