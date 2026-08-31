@@ -640,7 +640,7 @@ mod tests {
             s: [0xbb; 32],
         };
         let signed = attach_signature(&entry, &sig);
-        assert!(signed["signature"]["type"].as_str() == Some("secp256k1"));
+        assert_eq!(signed["signature"]["type"].as_str(), Some("secp256k1"));
         let sig_data = signed["signature"]["data"].as_str().unwrap();
         assert!(sig_data.starts_with("0x"));
         assert!(sig_data.ends_with("1c")); // v=28 = 0x1c
@@ -702,7 +702,7 @@ mod tests {
         });
 
         let signed = AlchemyGasClient::sign_prepared_response(&prepared, &signer).unwrap();
-        assert!(signed["signature"]["type"].as_str() == Some("secp256k1"));
+        assert_eq!(signed["signature"]["type"].as_str(), Some("secp256k1"));
         assert!(
             signed["signature"]["data"]
                 .as_str()
@@ -748,7 +748,7 @@ mod tests {
 
         // Both entries should have signatures
         for entry in data {
-            assert!(entry["signature"]["type"].as_str() == Some("secp256k1"));
+            assert_eq!(entry["signature"]["type"].as_str(), Some("secp256k1"));
         }
     }
 
