@@ -135,7 +135,7 @@ impl ReqwestHttpClient {
                 builder = builder.proxy(reqwest::Proxy::all(proxy.reqwest_url())?);
             }
             builder
-                .tcp_keepalive(Some(Duration::from_mins(1)))
+                .tcp_keepalive(Some(Duration::from_secs(60)))
                 .http2_keep_alive_interval(Duration::from_secs(30))
                 .http2_keep_alive_timeout(Duration::from_secs(10))
                 .http2_keep_alive_while_idle(true)
